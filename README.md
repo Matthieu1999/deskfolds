@@ -41,8 +41,17 @@ notification area. To start it with Windows, use its tray menu:
 | Keep a panel open | Click its name (a blue dot shows it is pinned); click again to unpin |
 | Launch a shortcut | Click it |
 | Open the menu | Right-click a panel, or click the tray icon |
-| Move panels | Menu > **Unlock panels**, drag them by the title bar, then menu > **Lock panels** (positions are saved to the config) |
-| Change panels and shortcuts | Menu > **Edit config**, save, then menu > **Reload config** |
+| Add a shortcut | Drag a file, folder or shortcut onto a panel (a closed panel opens). It is **moved** into `Documents\deskfolds\<panel>\`; hold **Ctrl** to keep it where it is and only add a link. Works even while locked |
+| Edit panels | Menu > **Unlock panels**: every panel opens with a blue border |
+| Move a panel | While unlocked, drag it by its name |
+| Reorder or move shortcuts | While unlocked, drag a shortcut within the panel or onto another panel |
+| Take a shortcut out | While unlocked, drag it onto the desktop or an Explorer window: the file goes there |
+| Rename or remove a shortcut | While unlocked, right-click it. **Remove from folder** puts a moved file back on the desktop; a link is just removed |
+| Finish editing | Menu > **Lock panels** (positions are saved to the config) |
+| Change anything else | Menu > **Edit config**, save, then menu > **Reload config** |
+
+deskfolds never deletes a file: it only moves files, and never overwrites one
+(a name already taken becomes "name (2)").
 
 ## Configuration
 

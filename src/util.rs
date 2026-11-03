@@ -3,18 +3,21 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::MAX_PATH;
+use windows_sys::Win32::Foundation::{MAX_PATH, RECT};
+use windows_sys::Win32::Graphics::Gdi::HFONT;
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN};
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, SearchPathW};
 use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows_sys::Win32::System::Registry::{
     HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
 };
-use windows_sys::Win32::UI::Controls::{ILD_TRANSPARENT, ImageList_GetIcon};
+use windows_sys::Win32::UI::Controls::{EM_SETSEL, ILD_TRANSPARENT, ImageList_GetIcon};
 use windows_sys::Win32::UI::Shell::{
     SHFILEINFOW, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SHGetImageList, SHIL_EXTRALARGE,
     SHIL_JUMBO, SHIL_LARGE, SHIL_SMALL, ShellExecuteW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow, HICON, SW_SHOWNORMAL};
+use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::core::GUID;
 
 const IID_IIMAGELIST: GUID = GUID::from_u128(0x46eb5926_582e_4017_9fdf_e8998daa0950);
@@ -25,7 +28,77 @@ pub fn wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(Some(0)).collect()
 }
 
-fn expand_env(s: &str) -> String {
+pub fn error_box(text: &str) {
+    let text = wide(text);
+    let title = wide("deskfolds");
+    unsafe { MessageBoxW(null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING) };
+}
+
+/// Shows a one-line text box over `rect` (screen pixels). Enter confirms,
+/// Esc or clicking elsewhere cancels.
+pub fn prompt_text(rect: RECT, initial: &str, font: HFONT) -> Option<String> {
+    let class = wide("EDIT");
+    let text = wide(initial);
+    unsafe {
+        let edit = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            class.as_ptr(),
+            text.as_ptr(),
+            WS_POPUP | WS_BORDER | WS_VISIBLE | ES_AUTOHSCROLL as u32,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            null_mut(),
+            null_mut(),
+            GetModuleHandleW(null()),
+            null(),
+        );
+        if edit.is_null() {
+            return None;
+        }
+        SendMessageW(edit, WM_SETFONT, font as usize, 1);
+        SetForegroundWindow(edit);
+        SetFocus(edit);
+        SendMessageW(edit, EM_SETSEL, 0, -1);
+
+        let mut confirmed = false;
+        let mut msg: MSG = std::mem::zeroed();
+        loop {
+            if GetMessageW(&mut msg, null_mut(), 0, 0) <= 0 {
+                PostQuitMessage(0);
+                break;
+            }
+            if msg.hwnd == edit && msg.message == WM_KEYDOWN {
+                if msg.wParam == VK_RETURN as usize {
+                    confirmed = true;
+                    break;
+                }
+                if msg.wParam == VK_ESCAPE as usize {
+                    break;
+                }
+            }
+            let click = matches!(msg.message, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_NCLBUTTONDOWN);
+            if click && msg.hwnd != edit {
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+            if GetForegroundWindow() != edit {
+                break;
+            }
+        }
+
+        let len = GetWindowTextLengthW(edit);
+        let mut buf = vec![0u16; len as usize + 1];
+        GetWindowTextW(edit, buf.as_mut_ptr(), buf.len() as i32);
+        DestroyWindow(edit);
+        let value = String::from_utf16_lossy(&buf[..len as usize]).trim().to_string();
+        (confirmed && !value.is_empty()).then_some(value)
+    }
+}
+
+pub fn expand_env(s: &str) -> String {
     let src = wide(s);
     let mut buf = vec![0u16; 1024];
     let n = unsafe { ExpandEnvironmentStringsW(src.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
@@ -44,7 +117,7 @@ fn is_uri(s: &str) -> bool {
 }
 
 /// Expands environment variables and finds bare program names in PATH.
-fn resolve(path: &str) -> String {
+pub fn resolve(path: &str) -> String {
     let expanded = expand_env(path.trim());
     if is_uri(&expanded) || Path::new(&expanded).exists() {
         return expanded;

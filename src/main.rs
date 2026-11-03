@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod config;
+mod dragdrop;
 mod panel;
 mod util;
 
@@ -8,13 +9,12 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::rc::Rc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
-use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Ole::OleInitialize;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows_sys::Win32::UI::Shell::{
@@ -22,8 +22,8 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use panel::{LOCKED, WM_APP_SHOW_MENU};
-use util::wide;
+use panel::{LOCKED, WM_APP_RELOAD, WM_APP_SHOW_MENU};
+use util::{error_box, wide};
 
 const MAIN_CLASS: &str = "deskfolds.main";
 const WM_APP_TRAY: u32 = WM_APP + 1;
@@ -37,20 +37,13 @@ const ID_AUTOSTART: usize = 103;
 const ID_QUIT: usize = 104;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
-static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 thread_local! {
     static PANELS: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) };
 }
 
 fn config_path() -> &'static PathBuf {
-    CONFIG_PATH.get_or_init(config::config_path)
-}
-
-fn error_box(text: &str) {
-    let text = wide(text);
-    let title = wide("deskfolds");
-    unsafe { MessageBoxW(null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING) };
+    config::path()
 }
 
 /// The window that draws the desktop icons. Panels owned by it survive "Show desktop".
@@ -84,7 +77,8 @@ fn rebuild_panels(main: HWND) {
             let created: Vec<HWND> = cfg
                 .panels
                 .into_iter()
-                .map(|p| panel::create(p, settings.clone(), desktop, main))
+                .enumerate()
+                .map(|(i, p)| panel::create(i, p, settings.clone(), desktop, main))
                 .filter(|h| !h.is_null())
                 .collect();
             PANELS.with(|p| *p.borrow_mut() = created);
@@ -105,21 +99,23 @@ fn panel_positions() -> Vec<(i32, i32)> {
     })
 }
 
-fn redraw_panels() {
-    PANELS.with(|p| {
-        for &h in p.borrow().iter() {
-            unsafe { InvalidateRect(h, null(), 0) };
-        }
-    });
-}
-
-fn toggle_lock() {
-    let locked = LOCKED.load(Ordering::Relaxed);
-    if !locked && let Err(e) = config::save_positions(config_path(), &panel_positions()) {
+fn save_positions() {
+    if let Err(e) = config::save_positions(config_path(), &panel_positions()) {
         error_box(&format!("Positions were not saved.\n\n{e}"));
     }
+}
+
+/// Unlocking opens every panel for editing; locking saves positions and closes them.
+fn toggle_lock() {
+    let locked = LOCKED.load(Ordering::Relaxed);
+    if !locked {
+        save_positions();
+    }
     LOCKED.store(!locked, Ordering::Relaxed);
-    redraw_panels();
+    for hwnd in PANELS.with(|p| p.borrow().clone()) {
+        panel::set_editing(hwnd, locked);
+        unsafe { InvalidateRect(hwnd, null(), 0) };
+    }
 }
 
 fn add_tray_icon(main: HWND) {
@@ -193,6 +189,14 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 show_menu(hwnd);
                 0
             }
+            WM_APP_RELOAD => {
+                // Shortcuts changed in the config file. Keep unsaved moves of unlocked panels.
+                if !LOCKED.load(Ordering::Relaxed) {
+                    save_positions();
+                }
+                rebuild_panels(hwnd);
+                0
+            }
             WM_TIMER if wparam == DESKTOP_RETRY_TIMER => {
                 KillTimer(hwnd, DESKTOP_RETRY_TIMER);
                 rebuild_panels(hwnd);
@@ -234,7 +238,8 @@ fn main() {
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return;
         }
-        CoInitializeEx(null(), COINIT_APARTMENTTHREADED as _);
+        // OLE, not just COM: drag and drop needs it.
+        OleInitialize(null());
 
         let taskbar_created = wide("TaskbarCreated");
         TASKBAR_CREATED.store(RegisterWindowMessageW(taskbar_created.as_ptr()), Ordering::Relaxed);

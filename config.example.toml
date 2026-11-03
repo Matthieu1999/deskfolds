@@ -37,6 +37,11 @@ hover = "#2E2E2E"
 border = "#3A3A3A"
 accent = "#4CC2FF"            # border and pin marker
 
+# Files dragged into a panel are moved into storage_dir\<panel title>\.
+# Empty = Documents\deskfolds. Hold Ctrl while dropping to keep the file where
+# it is and only add a link to it.
+storage_dir = ""
+
 [[panel]]
 title = "Apps"
 x = 40
