@@ -8,30 +8,36 @@ const DEFAULT_CONFIG: &str = include_str!("../config.example.toml");
 #[derive(Deserialize, Clone)]
 #[serde(default)]
 pub struct Settings {
-    pub opacity: f32,
+    pub hover_open: bool,
+    pub open_delay_ms: u32,
+    pub close_delay_ms: u32,
+    pub animation_ms: u32,
     pub collapse_after_launch: bool,
-    pub collapse_on_leave: bool,
     pub font_size: i32,
     pub icon_size: i32,
-    pub background: String,
-    pub title_background: String,
+    pub tint: String,
+    pub tint_opacity: f32,
     pub text: String,
     pub hover: String,
+    pub border: String,
     pub accent: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            opacity: 0.95,
+            hover_open: true,
+            open_delay_ms: 150,
+            close_delay_ms: 400,
+            animation_ms: 200,
             collapse_after_launch: true,
-            collapse_on_leave: false,
             font_size: 13,
             icon_size: 32,
-            background: "#1F1F1F".into(),
-            title_background: "#2B2B2B".into(),
+            tint: "#FFFFFF".into(),
+            tint_opacity: 0.10,
             text: "#F2F2F2".into(),
-            hover: "#3D3D3D".into(),
+            hover: "#2E2E2E".into(),
+            border: "#3A3A3A".into(),
             accent: "#4CC2FF".into(),
         }
     }
@@ -48,6 +54,9 @@ pub struct Panel {
     pub width: i32,
     #[serde(default = "default_columns")]
     pub columns: i32,
+    /// Optional file whose icon is shown next to the name instead of a folder.
+    #[serde(default)]
+    pub icon: Option<String>,
     #[serde(default, rename = "item")]
     pub items: Vec<Item>,
 }
@@ -96,7 +105,10 @@ pub fn load(path: &Path) -> Result<Config, String> {
     let mut config: Config = toml::from_str(&text).map_err(|e| format!("Invalid config {}:\n\n{e}", path.display()))?;
 
     let s = &mut config.settings;
-    s.opacity = s.opacity.clamp(0.2, 1.0);
+    s.tint_opacity = s.tint_opacity.clamp(0.0, 1.0);
+    s.open_delay_ms = s.open_delay_ms.clamp(1, 5000);
+    s.close_delay_ms = s.close_delay_ms.clamp(1, 10000);
+    s.animation_ms = s.animation_ms.min(2000);
     s.font_size = s.font_size.clamp(8, 40);
     s.icon_size = s.icon_size.clamp(16, 128);
     for p in &mut config.panels {
