@@ -1,0 +1,76 @@
+# deskfolds configuration
+#
+# Each [[panel]] is a fold on the desktop. Click its title bar to open it,
+# click a shortcut to launch it. Panels are locked in place: they never move
+# unless you unlock them from the tray icon.
+#
+# Positions (x, y) are screen pixels from the top-left corner of the main
+# monitor (negative values reach monitors on the left/top). The easiest way
+# to set them: tray icon > "Unlock panels", drag panels by their title bar,
+# then "Lock panels" to save the positions back into this file.
+#
+# Sizes (width, font_size, icon_size) are in pixels at 100 % scaling and are
+# scaled automatically with the monitor's DPI.
+#
+# Shortcut paths can be programs, documents, folders, .lnk shortcuts or URIs
+# (https://..., ms-settings:...). Environment variables like %USERPROFILE%
+# are expanded. Bare program names (notepad.exe) are searched in PATH.
+
+[settings]
+opacity = 0.95                # 0.2 to 1.0
+collapse_after_launch = true  # fold the panel after launching a shortcut
+collapse_on_leave = false     # fold the panel when the mouse leaves it
+font_size = 13
+icon_size = 32
+background = "#1F1F1F"
+title_background = "#2B2B2B"
+text = "#F2F2F2"
+hover = "#3D3D3D"
+accent = "#4CC2FF"            # border shown while panels are unlocked
+
+[[panel]]
+title = "Apps"
+x = 40
+y = 40
+width = 300
+columns = 4
+
+[[panel.item]]
+name = "Notepad"
+path = "notepad.exe"
+
+[[panel.item]]
+name = "Calculator"
+path = "calc.exe"
+
+[[panel.item]]
+name = "Paint"
+path = "mspaint.exe"
+
+[[panel.item]]
+name = "Explorer"
+path = "explorer.exe"
+
+[[panel]]
+title = "Folders"
+x = 360
+y = 40
+width = 300
+columns = 4
+
+[[panel.item]]
+name = "Documents"
+path = "%USERPROFILE%\\Documents"
+
+[[panel.item]]
+name = "Downloads"
+path = "%USERPROFILE%\\Downloads"
+
+[[panel.item]]
+name = "Desktop"
+path = "%USERPROFILE%\\Desktop"
+
+[[panel.item]]
+name = "Settings"
+path = "ms-settings:"
+icon = "%SystemRoot%\\ImmersiveControlPanel\\SystemSettings.exe"
