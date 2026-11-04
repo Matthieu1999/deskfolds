@@ -34,7 +34,7 @@ unless you unlock them.
 - Windows 11, or Windows 10 version 1903 or later. deskfolds is tested on
   Windows 11.
 - To build it: [Rust](https://rustup.rs) (1.88 or later) and Microsoft's C++
-  build tools. Step 1 below installs both.
+  build tools. Step 1 below installs them, along with Git.
 
 There is no ready-made download yet: you build deskfolds from its source code.
 It takes a few minutes the first time.
@@ -122,8 +122,9 @@ and on again from it.
    cargo build --release
    ```
 
-3. Start `target\release\deskfolds.exe` again. Your folders and settings are
-   kept.
+3. Start `target\release\deskfolds.exe` again. If you run a copy of
+   `deskfolds.exe` from another folder, copy the new one over it first.
+   Your folders and settings are kept.
 
 ### Uninstall
 
