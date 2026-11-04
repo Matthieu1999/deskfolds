@@ -2,6 +2,7 @@
 
 mod config;
 mod dragdrop;
+mod layout;
 mod panel;
 mod settings;
 mod store;
@@ -16,7 +17,7 @@ use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, L
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Ole::OleInitialize;
 use windows_sys::Win32::System::Threading::CreateMutexW;
-use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
+use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, SetProcessDpiAwarenessContext};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows_sys::Win32::UI::Shell::{
     ExtractIconExW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -24,7 +25,7 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use panel::{LOCKED, WM_APP_SHOW_MENU};
+use panel::{LOCKED, WM_APP_PUSH, WM_APP_SHOW_MENU};
 use store::{Change, Store, WM_APP_CONFLICT, WM_APP_REFRESH};
 use ui::{Ask, MenuEntry};
 use util::{error_box, wide};
@@ -52,6 +53,8 @@ thread_local! {
     static ASKING: Cell<bool> = const { Cell::new(false) };
     /// Ignore the button release that ends a double-click on the tray icon.
     static SKIP_CLICK: Cell<bool> = const { Cell::new(false) };
+    /// (open folder, folder it pushes down), from the last push update.
+    static STACKS: RefCell<Vec<(HWND, HWND)>> = const { RefCell::new(Vec::new()) };
 }
 
 fn main_window() -> HWND {
@@ -144,6 +147,8 @@ fn apply_changes(main: HWND, changes: &[Change]) {
                 panel::update(hwnd, p, &settings);
             }
         }
+        // The gap or the push setting may have changed.
+        update_pushes();
     }
 }
 
@@ -174,14 +179,106 @@ pub fn toggle_lock() {
     set_locked(!LOCKED.load(Ordering::Relaxed));
 }
 
-/// Creates "New folder" at a free spot and returns its id.
+fn scale(v: i32, dpi: u32) -> i32 {
+    (v as f32 * dpi as f32 / 96.0).round() as i32
+}
+
+/// Creates "New folder" at a free spot on the main screen and returns its id.
 pub fn new_folder() -> u32 {
-    let taken: Vec<(i32, i32)> = store::with(|s| s.panels.iter().map(|p| (p.x, p.y)).collect());
-    let (x, y) = panel::free_spot(&taken);
+    let (width, font, gap) = store::with(|s| (s.settings.new_folder_width, s.settings.font_size, s.settings.gap));
+    let taken: Vec<layout::Rect> = panels().into_iter().filter_map(panel::geometry).map(|g| g.label).collect();
+    let dpi = unsafe { GetDpiForSystem() }.max(96);
+    let area = panel::primary_work_area();
+    let (x, y) = layout::free_spot(&taken, scale(width, dpi), scale(font + 20, dpi), area, scale(gap.max(8), dpi));
     store::change(|s| {
         let title = s.unique_title("New folder");
-        s.add_panel(&title, x, y)
+        s.add_panel(&title, x, y, width)
     })
+}
+
+/// Pushes the folders stacked under open ones down by how far those reach,
+/// and puts the others back.
+fn update_pushes() {
+    panel::pushes_handled();
+    let (push_below, gap) = store::with(|s| (s.settings.push_below, s.settings.gap));
+    let list: Vec<(HWND, panel::Geometry)> =
+        panels().into_iter().filter_map(|h| panel::geometry(h).map(|g| (h, g))).filter(|(_, g)| !g.moving).collect();
+    let mut offsets = vec![0; list.len()];
+    let mut stacks = Vec::new();
+    if push_below {
+        let labels: Vec<layout::Rect> = list.iter().map(|(_, g)| g.label).collect();
+        for (i, (opener, g)) in list.iter().enumerate() {
+            if g.extra <= 0 && !g.open_down {
+                continue;
+            }
+            // An open folder of the "fit" style is wider than its label.
+            let mut column = labels.clone();
+            column[i].w = g.open_w;
+            for j in layout::stacked_below(&column, i, scale(gap, g.dpi)) {
+                offsets[j] += g.extra;
+                if g.open_down {
+                    stacks.push((*opener, list[j].0));
+                }
+            }
+        }
+    }
+    for ((hwnd, _), push) in list.iter().zip(offsets) {
+        panel::set_push(*hwnd, push);
+    }
+    STACKS.with(|s| *s.borrow_mut() = stacks);
+}
+
+/// The cursor is on a folder that this open folder pushes down.
+pub fn cursor_in_stack(opener: HWND) -> bool {
+    let mut pt = POINT { x: 0, y: 0 };
+    unsafe { GetCursorPos(&mut pt) };
+    let pushed: Vec<HWND> = STACKS.with(|s| s.borrow().iter().filter(|(o, _)| *o == opener).map(|(_, p)| *p).collect());
+    pushed.into_iter().any(|h| {
+        let mut r = unsafe { std::mem::zeroed() };
+        let found = unsafe { GetWindowRect(h, &mut r) } != 0;
+        found && pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom
+    })
+}
+
+/// The labels of every other folder, for snapping a moved one.
+pub fn other_labels(except: HWND) -> Vec<(HWND, layout::Rect)> {
+    panels().into_iter().filter(|&h| h != except).filter_map(|h| panel::geometry(h).map(|g| (h, g.label))).collect()
+}
+
+/// Lights up the folders a moved folder snaps to, and only those.
+pub fn show_snap_targets(moving: HWND, targets: &[HWND]) {
+    for hwnd in panels().into_iter().filter(|&h| h != moving) {
+        panel::set_snap_target(hwnd, targets.contains(&hwnd));
+    }
+}
+
+/// A folder is about to be moved: fold every folder (but the one selected in
+/// Settings), so it moves by its label and nothing is pushed meanwhile.
+pub fn fold_for_move(moving: HWND) {
+    for hwnd in panels() {
+        panel::close_now(hwnd, hwnd == moving);
+    }
+    update_pushes();
+}
+
+/// Puts every folder in a row, a column or a grid from the top left of the
+/// main screen, in the order of the Folders list. A backup is made first.
+pub fn arrange(how: layout::Arrange) {
+    let (gap, order) = store::with(|s| (s.settings.gap, s.panels.iter().map(|p| p.id).collect::<Vec<_>>()));
+    let mut ids = Vec::new();
+    let mut sizes = Vec::new();
+    let mut dpi = 96;
+    for id in order {
+        if let Some(g) = panel_window(id).and_then(panel::geometry) {
+            ids.push(id);
+            sizes.push((g.label.w, g.label.h));
+            dpi = g.dpi;
+        }
+    }
+    let spots = layout::arrange(&sizes, panel::primary_work_area(), scale(gap, dpi), how);
+    let positions: Vec<(u32, i32, i32)> = ids.into_iter().zip(spots).map(|(id, (x, y))| (id, x, y)).collect();
+    store::with(|s| s.backup_now());
+    store::change(|s| s.set_positions(&positions));
 }
 
 /// Loads config.toml again, after it was edited by hand.
@@ -363,6 +460,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             }
             WM_APP_CONFLICT => {
                 check_config_file();
+                0
+            }
+            WM_APP_PUSH => {
+                update_pushes();
                 0
             }
             WM_DISPLAYCHANGE => {

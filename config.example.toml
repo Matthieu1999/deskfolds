@@ -16,8 +16,8 @@
 # shows a folder anymore, it is shown on the nearest one until its monitor
 # comes back; its saved position is kept.
 #
-# Sizes (width, font_size, icon_size) are in pixels at 100 % scaling and are
-# scaled automatically with the monitor's DPI.
+# Sizes (width, font_size, icon_size, gap, cell_width) are in pixels at 100 %
+# scaling and are scaled automatically with the monitor's DPI.
 #
 # Shortcut paths can be programs, documents, folders, .lnk shortcuts or URIs
 # (https://..., ms-settings:...). Environment variables like %USERPROFILE%
@@ -49,6 +49,29 @@ accent = "#4CC2FF"            # border and pin marker
 # dropping to keep the file where it is and only add a link to it.
 storage_dir = ""
 
+# Folder titles. A closed folder is as wide as the folder, and its name wraps
+# onto up to title_lines lines (1 to 3) before it ends with "...".
+# title_style: "centered", "left", "icon_above" (the icon above the name) or
+# "fit" (the label is only as wide as the name, on one line).
+title_style = "centered"
+title_lines = 2
+show_count = false            # the number of shortcuts next to the name
+item_lines = 1                # lines for a shortcut's name under its icon (1 or 2)
+
+# Arranging folders. While unlocked, a moved folder snaps to the edges of the
+# other folders and of the screen, gap pixels away (hold Alt to place it
+# freely). An opening folder pushes the folders stacked right under it down
+# (push_below = false: it covers them), and opens upwards when there is no
+# room below (open_upwards = false: always downwards).
+snap = true
+gap = 8
+push_below = true
+open_upwards = true
+unlocked_open_all = false     # while unlocked: true = every folder open, false = open on hover
+cell_width = 72               # column width of panels with fit_columns = true
+new_folder_width = 300        # width of new folders
+
+# A panel with fit_columns = true is columns x cell_width wide (plus 12 px).
 [[panel]]
 title = "Apps"
 x = 40

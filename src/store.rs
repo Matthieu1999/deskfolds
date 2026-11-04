@@ -225,6 +225,17 @@ fn sync_settings(t: &mut Table, s: &Settings) {
     ] {
         put(t, key, V::Str(value), value.eq_ignore_ascii_case(default));
     }
+    put(t, "title_style", V::Str(&s.title_style), s.title_style == d.title_style);
+    put(t, "title_lines", V::Int(s.title_lines as i64), s.title_lines == d.title_lines);
+    put(t, "show_count", V::Bool(s.show_count), s.show_count == d.show_count);
+    put(t, "item_lines", V::Int(s.item_lines as i64), s.item_lines == d.item_lines);
+    put(t, "snap", V::Bool(s.snap), s.snap == d.snap);
+    put(t, "gap", V::Int(s.gap as i64), s.gap == d.gap);
+    put(t, "push_below", V::Bool(s.push_below), s.push_below == d.push_below);
+    put(t, "open_upwards", V::Bool(s.open_upwards), s.open_upwards == d.open_upwards);
+    put(t, "unlocked_open_all", V::Bool(s.unlocked_open_all), s.unlocked_open_all == d.unlocked_open_all);
+    put(t, "cell_width", V::Int(s.cell_width as i64), s.cell_width == d.cell_width);
+    put(t, "new_folder_width", V::Int(s.new_folder_width as i64), s.new_folder_width == d.new_folder_width);
 }
 
 fn sync_panel(t: &mut Table, p: &Panel) {
@@ -233,6 +244,7 @@ fn sync_panel(t: &mut Table, p: &Panel) {
     put(t, "y", V::Int(p.y as i64), false);
     put(t, "width", V::Int(p.width as i64), p.width == DEFAULT_WIDTH);
     put(t, "columns", V::Int(p.columns as i64), p.columns == DEFAULT_COLUMNS);
+    put(t, "fit_columns", V::Bool(p.fit_columns), !p.fit_columns);
     put_opt(t, "icon", p.icon.as_deref());
     put_opt(t, "storage", p.storage.as_deref());
 }
@@ -613,7 +625,7 @@ impl Store {
         title
     }
 
-    pub fn add_panel(&mut self, title: &str, x: i32, y: i32) -> u32 {
+    pub fn add_panel(&mut self, title: &str, x: i32, y: i32, width: i32) -> u32 {
         let id = self.new_id();
         let storage = self.new_storage_dir(title);
         self.panels.push(Panel {
@@ -621,10 +633,11 @@ impl Store {
             title: title.to_string(),
             x,
             y,
-            width: DEFAULT_WIDTH,
+            width: width.clamp(config::MIN_WIDTH, 4000),
             columns: DEFAULT_COLUMNS,
             icon: None,
             storage: Some(storage),
+            fit_columns: false,
             items: Vec::new(),
         });
         self.push(Change::Added(id));
@@ -691,6 +704,16 @@ impl Store {
         }
         if self.panels[i] != before {
             self.push(Change::Panel(id));
+        }
+    }
+
+    /// Moves several panels at once (Arrange): one change, saved once.
+    pub fn set_positions(&mut self, positions: &[(u32, i32, i32)]) {
+        for &(id, x, y) in positions {
+            self.update_panel(id, |p| {
+                p.x = x;
+                p.y = y;
+            });
         }
     }
 
@@ -835,7 +858,8 @@ mod tests {
         for p in &mut store.panels {
             p.storage = None;
         }
-        assert_eq!(saved_text(&mut store), config::DEFAULT_CONFIG);
+        // Line endings depend on how Git checked the example out.
+        assert_eq!(saved_text(&mut store).replace("\r\n", "\n"), config::DEFAULT_CONFIG.replace("\r\n", "\n"));
     }
 
     #[test]
@@ -846,7 +870,7 @@ mod tests {
         store.update_panel(apps, |p| p.title = "Tools".into());
         store.move_item(docs, apps, 1).unwrap();
         store.update_settings(|s| s.font_size = 15);
-        let new = store.add_panel("Games", 10, 20);
+        let new = store.add_panel("Games", 10, 20, 300);
         store.delete_panel(folders, false);
 
         let text = saved_text(&mut store);
@@ -864,8 +888,8 @@ mod tests {
     #[test]
     fn new_panels_never_share_a_storage_folder() {
         let mut store = store_from("");
-        let a = store.add_panel("Games", 0, 0);
-        let b = store.add_panel("Games", 0, 0);
+        let a = store.add_panel("Games", 0, 0, 300);
+        let b = store.add_panel("Games", 0, 0, 300);
         assert_ne!(store.storage_of(a), store.storage_of(b));
         assert_eq!(store.unique_title("Games"), "Games (2)");
     }
@@ -942,7 +966,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("deskfolds-rename-{}", std::process::id()));
         let mut store = store_from(&format!("[settings]
 storage_dir = '{}'", base.display()));
-        let id = store.add_panel("New folder", 0, 0);
+        let id = store.add_panel("New folder", 0, 0, 300);
         store.update_panel(id, |p| p.title = "Tools".into());
         assert_eq!(store.storage_of(id), base.join("Tools"));
         // Once it holds files, renaming keeps the folder.
@@ -950,6 +974,26 @@ storage_dir = '{}'", base.display()));
         store.update_panel(id, |p| p.title = "Games".into());
         assert_eq!(store.storage_of(id), base.join("Tools"));
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn layout_settings_are_written_only_once_changed() {
+        let mut store = store_from("[settings]\nfont_size = 13\n\n[[panel]]\ntitle = \"Apps\"\n\n[[panel]]\ntitle = \"Folders\"\n");
+        let (apps, folders) = (store.panels[0].id, store.panels[1].id);
+        store.update_settings(|s| {
+            s.push_below = false;
+            s.title_style = "left".into();
+            s.gap = 12;
+        });
+        store.update_panel(apps, |p| p.fit_columns = true);
+        store.set_positions(&[(apps, 5, 6), (folders, 300, 6)]);
+        let text = saved_text(&mut store);
+        assert!(!text.contains("snap =") && !text.contains("title_lines ="), "{text}");
+        let config = config::parse(&text).unwrap();
+        let s = &config.settings;
+        assert_eq!((s.push_below, s.title_style.as_str(), s.gap), (false, "left", 12));
+        assert!(config.panels[0].fit_columns && !config.panels[1].fit_columns);
+        assert_eq!((config.panels[1].x, config.panels[1].y), (300, 6));
     }
 
     #[test]

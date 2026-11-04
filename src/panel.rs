@@ -1,7 +1,8 @@
-//! A panel is a small glass folder glued to the desktop. Closed, it is a
-//! compact label (icon + name). Hovering it, or clicking it, unrolls a card of
-//! shortcuts. It stays below every other window, never takes focus, and cannot
-//! move while panels are locked.
+//! A panel is a small glass folder glued to the desktop. Closed, it is a label
+//! as wide as the folder, with its icon and name (a long name wraps onto more
+//! lines). Hovering it, or clicking it, unrolls a card of shortcuts: downwards,
+//! or upwards when there is no room below. It stays below every other window,
+//! never takes focus, and cannot move while panels are locked.
 //!
 //! A panel shows a copy of its data from the store. Every change it makes
 //! (a drop, a move, a resize, a rename) goes through the store, which then
@@ -23,12 +24,13 @@ use windows_sys::Win32::System::SystemServices::{MK_CONTROL, MK_LBUTTON};
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_MENU,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::config::{MIN_WIDTH, Panel, Settings, parse_color};
+use crate::config::{MIN_WIDTH, PANEL_PAD, Panel, Settings, TitleStyle, parse_color};
 use crate::dragdrop::{self, DropHandler};
+use crate::layout;
 use crate::store::{self, WM_APP_REFRESH};
 use crate::ui::{self, MenuEntry};
 use crate::util::{error_box, launch, load_icon, prompt_text, resolve, wide};
@@ -43,6 +45,12 @@ const ANIM_FRAME_MS: u32 = 15;
 const DRAG_OPEN_DELAY_MS: u32 = 300;
 /// Width of the resize grip on the right edge of an unlocked panel.
 const GRIP: i32 = 7;
+/// Size of the folder icon above the name, in the "icon above" title style.
+const BIG_ICON: i32 = 24;
+/// Room kept at the right of the title for the pin marker.
+const PIN_ROOM: i32 = 14;
+/// A moved folder snaps to an edge closer than this.
+const SNAP_REACH: i32 = 10;
 const ID_RENAME: usize = 1;
 const ID_REMOVE: usize = 2;
 const ID_SETTINGS: usize = 3;
@@ -54,12 +62,29 @@ pub static LOCKED: AtomicBool = AtomicBool::new(true);
 
 /// Posted to the main window to open the menu at the cursor. wparam: the panel id, or 0.
 pub const WM_APP_SHOW_MENU: u32 = WM_APP + 2;
+/// Posted to the main window when a panel grew, shrank or moved: the folders
+/// stacked under open ones are pushed down again.
+pub const WM_APP_PUSH: u32 = WM_APP + 3;
 
 thread_local! {
     /// The shortcut being dragged out of a panel, by id.
     static INTERNAL_DRAG: Cell<Option<u32>> = const { Cell::new(None) };
     /// Set when that drag was dropped on one of our windows.
     static INTERNAL_DROP_DONE: Cell<bool> = const { Cell::new(false) };
+    /// A WM_APP_PUSH is waiting in the queue.
+    static PUSH_POSTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Asks the main window to update the pushes, once however often it is asked.
+fn request_pushes(main: HWND) {
+    if !PUSH_POSTED.replace(true) {
+        unsafe { PostMessageW(main, WM_APP_PUSH, 0, 0) };
+    }
+}
+
+/// The main window is handling WM_APP_PUSH.
+pub fn pushes_handled() {
+    PUSH_POSTED.set(false);
 }
 
 /// The shortcut being dragged out of a panel right now, if any.
@@ -84,9 +109,22 @@ pub struct PanelState {
     cfg: Panel,
     settings: Settings,
     main: HWND,
-    /// Where the panel is shown: its saved position, or the nearest visible
+    /// Where the label is shown: its saved position, or the nearest visible
     /// spot if no monitor shows that position anymore.
     pos: (i32, i32),
+    /// Pushed down by an open folder above it, in pixels.
+    push: i32,
+    /// Where the window is: the label position, pushed down, or moved up while
+    /// it opens upwards.
+    shown: (i32, i32),
+    /// Opening upwards: chosen when it starts opening, kept until it is closed.
+    up: bool,
+    /// What the main window last heard about: position, size, upwards.
+    last_reach: Option<((i32, i32), i32, i32, bool)>,
+    /// Being moved by its name: pushes leave it alone.
+    moving: bool,
+    /// Lit up as the folder that a moved folder snaps to.
+    snap_target: bool,
     /// Target state: open or closed. `progress` animates towards it.
     open: bool,
     pinned: bool,
@@ -107,12 +145,34 @@ pub struct PanelState {
     resizing: Option<(i32, i32)>,
     hover: Option<usize>,
     tracking_mouse: bool,
+    /// Also tracking the mouse over the name, which is the move handle while unlocked.
+    tracking_nc: bool,
     dpi: u32,
     font: HFONT,
     title_font: HFONT,
+    /// The name on one line, and split into lines for the folder's width.
     title_text_w: i32,
+    title_lines: Vec<String>,
+    /// Line heights of the title font and of the shortcut font.
+    line_h: i32,
+    item_line_h: i32,
+    /// Width of the shortcut count, drawn in a small badge.
+    count_w: i32,
     title_icon: HICON,
     icons: Vec<HICON>,
+}
+
+/// Where a panel's label is and how far the panel reaches below it now.
+pub struct Geometry {
+    pub label: layout::Rect,
+    /// Width of the panel when open (wider than the label in the "fit" style).
+    pub open_w: i32,
+    /// How far it reaches below its label now (0 while it opens upwards).
+    pub extra: i32,
+    /// Open or opening downwards.
+    pub open_down: bool,
+    pub dpi: u32,
+    pub moving: bool,
 }
 
 enum Hit {
@@ -149,22 +209,67 @@ impl PanelState {
         (v as f32 * self.dpi as f32 / 96.0).round() as i32
     }
 
+    fn style(&self) -> TitleStyle {
+        self.settings.title_style()
+    }
+
+    /// The panel's width in pixels: its own, or columns × cell width.
+    fn width_px(&self) -> i32 {
+        self.scale(self.cfg.shown_width(&self.settings))
+    }
+
+    fn label_icon(&self) -> i32 {
+        self.scale(if self.style() == TitleStyle::IconAbove { BIG_ICON } else { 16 })
+    }
+
+    /// Width of the shortcut count badge, or 0 when it is not shown.
+    fn badge_w(&self) -> i32 {
+        if self.settings.show_count { self.count_w + self.scale(12) } else { 0 }
+    }
+
+    /// Room for the name, which wraps inside it.
+    fn title_wrap_width(&self) -> i32 {
+        let w = self.width_px();
+        let badge = if self.settings.show_count { self.badge_w() + self.scale(6) } else { 0 };
+        let room = match self.style() {
+            TitleStyle::IconAbove => w - self.scale(24),
+            _ => w - self.scale(12 + 16 + 8 + 12 + PIN_ROOM) - badge,
+        };
+        room.max(self.scale(24))
+    }
+
     fn layout(&self) -> Layout {
         let s = &self.settings;
-        let pad = self.scale(6);
+        let pad = self.scale(PANEL_PAD);
         let cols = self.cfg.columns.max(1);
         let icon = self.scale(s.icon_size);
         let line = self.scale(s.font_size * 3 / 2);
+        let lines = self.title_lines.len().max(1) as i32;
+        let title_h = match self.style() {
+            TitleStyle::Fit => self.scale(s.font_size + 20),
+            TitleStyle::IconAbove => self.scale(10 + BIG_ICON + 4 + 8) + lines * self.line_h,
+            _ => self.scale(s.font_size + 20) + (lines - 1) * self.line_h,
+        };
         Layout {
-            title_h: self.scale(s.font_size + 20),
+            title_h,
             pad,
-            label_icon: self.scale(16),
-            cell_w: (self.scale(self.cfg.width) - pad * 2) / cols,
-            cell_h: self.scale(8) + icon + self.scale(4) + line + self.scale(4),
+            label_icon: self.label_icon(),
+            cell_w: (self.width_px() - pad * 2) / cols,
+            cell_h: self.scale(8) + icon + self.scale(4) + line + (s.item_lines.clamp(1, 2) - 1) * self.item_line_h + self.scale(4),
             icon,
             // An empty panel keeps one row for its "drop shortcuts here" hint.
             rows: ((self.cfg.items.len() as i32 + cols - 1) / cols).max(1),
         }
+    }
+
+    /// Top of the name in the window: at the bottom while it opens upwards.
+    fn title_top(&self, l: &Layout) -> i32 {
+        if self.up { self.size().1 - l.title_h } else { 0 }
+    }
+
+    /// Top of the first row of shortcuts: they unroll from the name.
+    fn content_top(&self, l: &Layout) -> i32 {
+        if self.up { self.size().1 - l.title_h - l.rows * l.cell_h } else { l.title_h }
     }
 
     /// Where a file dropped at this client point would be inserted.
@@ -182,16 +287,46 @@ impl PanelState {
             .unwrap_or(count)
     }
 
-    /// Size of the closed label: icon + name, like a small tag.
+    /// Size of the closed label: as wide as the folder, or as the name in the "fit" style.
     fn closed_size(&self) -> (i32, i32) {
         let l = self.layout();
-        let w = self.scale(12) + l.label_icon + self.scale(8) + self.title_text_w + self.scale(14);
-        (w.min(self.scale(self.cfg.width)), l.title_h)
+        if self.style() != TitleStyle::Fit {
+            return (self.width_px(), l.title_h);
+        }
+        let badge = if self.settings.show_count { self.badge_w() + self.scale(6) } else { 0 };
+        let w = self.scale(12) + l.label_icon + self.scale(8) + self.title_text_w + badge + self.scale(14);
+        (w.min(self.width_px()), l.title_h)
     }
 
     fn open_size(&self) -> (i32, i32) {
         let l = self.layout();
-        (self.scale(self.cfg.width), l.title_h + l.rows * l.cell_h + l.pad)
+        (self.width_px(), l.title_h + l.rows * l.cell_h + l.pad)
+    }
+
+    /// Where the window goes now.
+    fn window_pos(&self) -> (i32, i32) {
+        let y = self.pos.1 + self.push;
+        if self.up {
+            let (h, closed_h) = (self.size().1, self.closed_size().1);
+            (self.pos.0, y + closed_h - h)
+        } else {
+            (self.pos.0, y)
+        }
+    }
+
+    /// An open folder that moved or changed size picks its direction again.
+    fn choose_direction(&mut self) {
+        if self.open {
+            self.up = self.settings.open_upwards && self.needs_up();
+        }
+    }
+
+    /// Opening now would go past the bottom of the screen, and there is more room above.
+    fn needs_up(&self) -> bool {
+        let (w, closed_h) = self.closed_size();
+        let open_h = self.open_size().1;
+        let top = self.pos.1 + self.push;
+        layout::opens_up(top, closed_h, open_h, work_area_at(self.pos.0 + w / 2, top + closed_h / 2))
     }
 
     fn size(&self) -> (i32, i32) {
@@ -206,16 +341,17 @@ impl PanelState {
         let col = i as i32 % cols;
         let row = i as i32 / cols;
         let left = l.pad + col * l.cell_w;
-        let top = l.title_h + row * l.cell_h;
+        let top = self.content_top(l) + row * l.cell_h;
         RECT { left, top, right: left + l.cell_w, bottom: top + l.cell_h }
     }
 
     fn hit(&self, x: i32, y: i32) -> Hit {
         let l = self.layout();
-        if !locked() && self.progress >= 1.0 && x >= self.size().0 - self.scale(GRIP) {
+        if !locked() && self.progress >= 1.0 && !self.cfg.fit_columns && x >= self.size().0 - self.scale(GRIP) {
             return Hit::Grip;
         }
-        if y < l.title_h {
+        let top = self.title_top(&l);
+        if y >= top && y < top + l.title_h {
             return Hit::Title;
         }
         if self.progress >= 1.0 {
@@ -262,18 +398,7 @@ impl PanelState {
         };
         self.font = make_font(FW_NORMAL as i32);
         self.title_font = make_font(FW_SEMIBOLD as i32);
-        self.title_text_w = unsafe {
-            let dc = GetDC(null_mut());
-            let old = SelectObject(dc, self.title_font);
-            let text = wide(&self.cfg.title);
-            let mut size = SIZE { cx: 0, cy: 0 };
-            GetTextExtentPoint32W(dc, text.as_ptr(), text.len() as i32 - 1, &mut size);
-            SelectObject(dc, old);
-            ReleaseDC(null_mut(), dc);
-            size.cx
-        };
-        let label_icon = self.scale(16);
-        self.title_icon = load_icon(self.cfg.icon.as_deref().unwrap_or(DEFAULT_PANEL_ICON), label_icon);
+        self.title_icon = load_icon(self.cfg.icon.as_deref().unwrap_or(DEFAULT_PANEL_ICON), self.label_icon());
         let size = self.scale(self.settings.icon_size);
         self.icons = self
             .cfg
@@ -281,6 +406,31 @@ impl PanelState {
             .iter()
             .map(|item| load_icon(item.icon.as_deref().unwrap_or(&item.path), size))
             .collect();
+        self.measure();
+    }
+
+    /// Measures the text and splits the name into lines for the current width.
+    fn measure(&mut self) {
+        unsafe {
+            let dc = GetDC(null_mut());
+            let old = SelectObject(dc, self.font);
+            let mut tm: TEXTMETRICW = std::mem::zeroed();
+            GetTextMetricsW(dc, &mut tm);
+            self.item_line_h = tm.tmHeight;
+            self.count_w = text_width(dc, &self.cfg.items.len().to_string());
+            SelectObject(dc, self.title_font);
+            GetTextMetricsW(dc, &mut tm);
+            self.line_h = tm.tmHeight;
+            self.title_text_w = text_width(dc, &self.cfg.title);
+            let room = self.title_wrap_width();
+            self.title_lines = if self.style() == TitleStyle::Fit {
+                vec![self.cfg.title.clone()]
+            } else {
+                layout::wrap(&self.cfg.title, room, self.settings.title_lines.clamp(1, 3) as usize, |t| text_width(dc, t))
+            };
+            SelectObject(dc, old);
+            ReleaseDC(null_mut(), dc);
+        }
     }
 
     fn free_resources(&mut self) {
@@ -327,23 +477,27 @@ pub fn visible_position(x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
     }
 }
 
-/// A free spot for a new panel on the main monitor, away from the given panels.
-pub fn free_spot(taken: &[(i32, i32)]) -> (i32, i32) {
-    let area = unsafe { monitor_work_area(MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY)) }
-        .unwrap_or(RECT { left: 0, top: 0, right: 1920, bottom: 1080 });
-    let (step_x, step_y) = (260, 70);
-    let mut y = area.top + 40;
-    while y + step_y < area.bottom {
-        let mut x = area.left + 40;
-        while x + step_x < area.right {
-            if !taken.iter().any(|&(tx, ty)| (tx - x).abs() < step_x - 20 && (ty - y).abs() < step_y - 10) {
-                return (x, y);
-            }
-            x += step_x;
-        }
-        y += step_y;
-    }
-    (area.left + 40, area.top + 40)
+fn to_rect(r: RECT) -> layout::Rect {
+    layout::Rect { x: r.left, y: r.top, w: r.right - r.left, h: r.bottom - r.top }
+}
+
+/// The work area (the screen without the taskbar) of the monitor at this point.
+pub fn work_area_at(x: i32, y: i32) -> layout::Rect {
+    let area = unsafe { monitor_work_area(MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST)) };
+    to_rect(area.unwrap_or(RECT { left: 0, top: 0, right: 1920, bottom: 1080 }))
+}
+
+/// The work area of the main monitor.
+pub fn primary_work_area() -> layout::Rect {
+    let area = unsafe { monitor_work_area(MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY)) };
+    to_rect(area.unwrap_or(RECT { left: 0, top: 0, right: 1920, bottom: 1080 }))
+}
+
+unsafe fn text_width(dc: HDC, text: &str) -> i32 {
+    let w = wide(text);
+    let mut size = SIZE { cx: 0, cy: 0 };
+    unsafe { GetTextExtentPoint32W(dc, w.as_ptr(), w.len() as i32 - 1, &mut size) };
+    size.cx
 }
 
 pub fn register_class() {
@@ -409,11 +563,17 @@ fn enable_glass(hwnd: HWND, settings: &Settings) {
 }
 
 /// Creates a panel owned by the desktop window, so "Show desktop" leaves it visible.
-/// While panels are unlocked, it starts open so its shortcuts can be edited.
+/// While panels are unlocked, it starts open if every folder opens then.
 pub fn create(cfg: &Panel, settings: &Settings, desktop: HWND, main: HWND) -> HWND {
-    let editing = !locked();
+    let editing = !locked() && settings.unlocked_open_all;
     let state = Box::new(PanelState {
         pos: (cfg.x, cfg.y),
+        push: 0,
+        shown: (cfg.x, cfg.y),
+        up: false,
+        last_reach: None,
+        moving: false,
+        snap_target: false,
         cfg: cfg.clone(),
         settings: settings.clone(),
         main,
@@ -431,10 +591,15 @@ pub fn create(cfg: &Panel, settings: &Settings, desktop: HWND, main: HWND) -> HW
         resizing: None,
         hover: None,
         tracking_mouse: false,
+        tracking_nc: false,
         dpi: 96,
         font: null_mut(),
         title_font: null_mut(),
         title_text_w: 0,
+        title_lines: Vec::new(),
+        line_h: 0,
+        item_line_h: 0,
+        count_w: 0,
         title_icon: null_mut(),
         icons: Vec::new(),
     });
@@ -487,8 +652,10 @@ pub fn update(hwnd: HWND, cfg: &Panel, settings: &Settings) {
         || st.cfg.items.len() != cfg.items.len()
         || st.cfg.items.iter().zip(&cfg.items).any(|(a, b)| a.path != b.path || a.icon != b.icon)
         || st.settings.font_size != settings.font_size
-        || st.settings.icon_size != settings.icon_size;
+        || st.settings.icon_size != settings.icon_size
+        || st.settings.title_style() != settings.title_style();
     let glass = st.settings.tint != settings.tint || st.settings.tint_opacity != settings.tint_opacity;
+    let open_all_changed = st.settings.unlocked_open_all != settings.unlocked_open_all;
     if st.cfg.title != cfg.title {
         let title = wide(&cfg.title);
         unsafe { SetWindowTextW(hwnd, title.as_ptr()) };
@@ -500,12 +667,23 @@ pub fn update(hwnd: HWND, cfg: &Panel, settings: &Settings) {
     }
     if resources {
         st.load_resources();
+    } else {
+        st.measure();
     }
     if glass {
         enable_glass(hwnd, &st.settings);
     }
     st.place();
+    st.choose_direction();
     apply_size(hwnd, st);
+    // Switched between "all open" and "open on hover" while unlocked.
+    if open_all_changed && !locked() {
+        if st.settings.unlocked_open_all {
+            set_open(hwnd, st, true);
+        } else if !st.highlighted {
+            set_open(hwnd, st, false);
+        }
+    }
 }
 
 /// Moves the panel back on screen after the monitors changed, or back to its
@@ -513,6 +691,7 @@ pub fn update(hwnd: HWND, cfg: &Panel, settings: &Settings) {
 pub fn reposition(hwnd: HWND) {
     let Some(st) = state(hwnd) else { return };
     st.place();
+    st.choose_direction();
     apply_size(hwnd, st);
 }
 
@@ -521,15 +700,74 @@ pub fn id_of(hwnd: HWND) -> Option<u32> {
     state(hwnd).map(|st| st.cfg.id)
 }
 
-/// Unlocked panels stay open so their shortcuts can be dragged; locking closes them.
+/// Unlocking opens every panel if the settings say so (otherwise they open on
+/// hover, as when locked); locking closes them.
 pub fn set_editing(hwnd: HWND, editing: bool) {
     let Some(st) = state(hwnd) else { return };
     if editing {
-        set_open(hwnd, st, true);
+        if st.settings.unlocked_open_all {
+            set_open(hwnd, st, true);
+        }
     } else if !st.highlighted {
         set_open(hwnd, st, false);
     }
     unsafe { InvalidateRect(hwnd, null(), 0) };
+}
+
+pub fn geometry(hwnd: HWND) -> Option<Geometry> {
+    let st = state(hwnd)?;
+    let (w, h) = st.closed_size();
+    let now_h = st.size().1;
+    Some(Geometry {
+        label: layout::Rect { x: st.pos.0, y: st.pos.1, w, h },
+        open_w: st.open_size().0,
+        extra: if st.up { 0 } else { (now_h - h).max(0) },
+        open_down: st.open && !st.up,
+        dpi: st.dpi,
+        moving: st.moving,
+    })
+}
+
+/// Moves the panel down by `push` pixels (0 puts it back), unless it is being moved.
+pub fn set_push(hwnd: HWND, push: i32) {
+    let Some(st) = state(hwnd) else { return };
+    if st.moving || st.push == push {
+        return;
+    }
+    st.push = push;
+    let (x, y) = st.window_pos();
+    st.shown = (x, y);
+    unsafe { SetWindowPos(hwnd, HWND_BOTTOM, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE) };
+}
+
+/// Closes the panel at once, without animation, before a folder is moved. The
+/// one selected in Settings stays open unless it is the one being moved.
+pub fn close_now(hwnd: HWND, moving: bool) {
+    let Some(st) = state(hwnd) else { return };
+    if (st.highlighted && !moving) || (!st.open && st.progress <= 0.0) {
+        return;
+    }
+    unsafe {
+        KillTimer(hwnd, OPEN_TIMER);
+        KillTimer(hwnd, CLOSE_TIMER);
+        KillTimer(hwnd, ANIM_TIMER);
+    }
+    st.open = false;
+    st.open_pending = false;
+    st.pinned = false;
+    st.hover = None;
+    st.progress = 0.0;
+    st.up = false;
+    apply_size(hwnd, st);
+}
+
+/// Lights the panel up as the one a moved folder snaps to.
+pub fn set_snap_target(hwnd: HWND, on: bool) {
+    let Some(st) = state(hwnd) else { return };
+    if st.snap_target != on {
+        st.snap_target = on;
+        unsafe { InvalidateRect(hwnd, null(), 0) };
+    }
 }
 
 /// The folder selected in the settings window stays open and outlined.
@@ -541,7 +779,7 @@ pub fn set_highlight(hwnd: HWND, on: bool) {
     st.highlighted = on;
     if on {
         set_open(hwnd, st, true);
-    } else if locked() && !st.pinned && !st.tracking_mouse {
+    } else if (locked() || !st.settings.unlocked_open_all) && !st.pinned && !st.tracking_mouse && !st.tracking_nc {
         set_open(hwnd, st, false);
     }
     unsafe { InvalidateRect(hwnd, null(), 0) };
@@ -615,7 +853,7 @@ fn on_drag_leave(hwnd: HWND) {
     unsafe {
         KillTimer(hwnd, DRAG_OPEN_TIMER);
         st.drag_open_pending = false;
-        if st.drag_opened && !st.pinned && !st.highlighted && locked() {
+        if st.drag_opened && !st.pinned && !st.highlighted && (locked() || !st.settings.unlocked_open_all) {
             SetTimer(hwnd, CLOSE_TIMER, st.settings.close_delay_ms, None);
         }
         InvalidateRect(hwnd, null(), 0);
@@ -726,12 +964,20 @@ fn state_ptr(hwnd: HWND) -> *mut PanelState {
     unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PanelState }
 }
 
-fn apply_size(hwnd: HWND, st: &PanelState) {
+fn apply_size(hwnd: HWND, st: &mut PanelState) {
     let (w, h) = st.size();
+    let (x, y) = st.window_pos();
+    st.shown = (x, y);
     unsafe {
-        SetWindowPos(hwnd, HWND_BOTTOM, st.pos.0, st.pos.1, w, h, SWP_NOACTIVATE);
+        SetWindowPos(hwnd, HWND_BOTTOM, x, y, w, h, SWP_NOACTIVATE);
         InvalidateRect(hwnd, null(), 0);
         UpdateWindow(hwnd);
+    }
+    // Folders stacked under this one follow how far it reaches.
+    let reach = (st.pos, w, h, st.up);
+    if st.last_reach != Some(reach) {
+        st.last_reach = Some(reach);
+        request_pushes(st.main);
     }
 }
 
@@ -747,6 +993,9 @@ fn set_open(hwnd: HWND, st: &mut PanelState, open: bool) {
     if st.open == open {
         return;
     }
+    if open && st.progress <= 0.0 {
+        st.up = st.settings.open_upwards && st.needs_up();
+    }
     st.open = open;
     st.hover = None;
     if open {
@@ -754,6 +1003,7 @@ fn set_open(hwnd: HWND, st: &mut PanelState, open: bool) {
     }
     if st.settings.animation_ms == 0 {
         st.progress = if open { 1.0 } else { 0.0 };
+        st.up &= open;
         apply_size(hwnd, st);
     } else {
         st.anim_from = st.progress;
@@ -771,6 +1021,7 @@ fn animate(hwnd: HWND, st: &mut PanelState) {
     st.progress = st.anim_from + (target - st.anim_from) * p;
     if p >= 1.0 {
         st.progress = target;
+        st.up &= st.open;
         unsafe { KillTimer(hwnd, ANIM_TIMER) };
     }
     apply_size(hwnd, st);
@@ -796,6 +1047,59 @@ fn cursor_x() -> i32 {
     let mut pt = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut pt) };
     pt.x
+}
+
+/// The cursor is over the window (its name or its shortcuts).
+fn cursor_inside(hwnd: HWND) -> bool {
+    let mut pt = POINT { x: 0, y: 0 };
+    let mut r: RECT = unsafe { std::mem::zeroed() };
+    let found = unsafe { GetCursorPos(&mut pt) != 0 && GetWindowRect(hwnd, &mut r) != 0 };
+    found
+        && pt.x >= r.left
+        && pt.x < r.right
+        && pt.y >= r.top
+        && pt.y < r.bottom
+}
+
+/// The mouse is over the panel: stop closing, and open after the hover delay.
+fn on_hover(hwnd: HWND, st: &mut PanelState, locked: bool) {
+    unsafe { KillTimer(hwnd, CLOSE_TIMER) };
+    if (locked || !st.settings.unlocked_open_all) && st.settings.hover_open && !st.open && !st.open_pending && !st.moving {
+        st.open_pending = true;
+        unsafe { SetTimer(hwnd, OPEN_TIMER, st.settings.open_delay_ms, None) };
+    }
+}
+
+/// The mouse left the panel: close after the delay, unless it is held open.
+fn on_leave(hwnd: HWND, st: &mut PanelState, locked: bool) {
+    st.open_pending = false;
+    unsafe { KillTimer(hwnd, OPEN_TIMER) };
+    let hover_closes = (locked || !st.settings.unlocked_open_all) && st.settings.hover_open;
+    if hover_closes && st.open && !st.pinned && !st.highlighted {
+        unsafe { SetTimer(hwnd, CLOSE_TIMER, st.settings.close_delay_ms, None) };
+    }
+}
+
+/// While a folder is moved: snaps its label to the nearest edge and lights up
+/// the folders it snaps to. Alt moves it freely.
+fn snap_moving(hwnd: HWND, st: &PanelState, r: &mut RECT) {
+    let dy = st.shown.1 - st.pos.1;
+    let (w, h) = st.closed_size();
+    let mut targets = Vec::new();
+    if st.settings.snap && unsafe { GetKeyState(VK_MENU as i32) } >= 0 {
+        let label = layout::Rect { x: r.left, y: r.top - dy, w, h };
+        let others = crate::other_labels(hwnd);
+        let rects: Vec<layout::Rect> = others.iter().map(|o| o.1).collect();
+        let area = work_area_at(label.x + w / 2, label.y + h / 2);
+        let snapped = layout::snap(label, &rects, area, st.scale(st.settings.gap), st.scale(SNAP_REACH));
+        let (ww, wh) = (r.right - r.left, r.bottom - r.top);
+        r.left = snapped.x;
+        r.top = snapped.y + dy;
+        r.right = r.left + ww;
+        r.bottom = r.top + wh;
+        targets = snapped.with.iter().map(|&i| others[i].0).collect();
+    }
+    crate::show_snap_targets(hwnd, &targets);
 }
 
 /// Ends a resize with the grip and saves the new width.
@@ -834,8 +1138,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 pos.hwndInsertAfter = HWND_BOTTOM;
                 pos.flags &= !SWP_NOZORDER;
                 if locked {
-                    pos.x = st.pos.0;
-                    pos.y = st.pos.1;
+                    pos.x = st.shown.0;
+                    pos.y = st.shown.1;
                 }
                 return 0;
             }
@@ -849,18 +1153,57 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 }
                 return HTCLIENT as LRESULT;
             }
+            WM_NCLBUTTONDOWN if !locked && wparam == HTCAPTION as usize => {
+                // About to be moved by its name: the folders fold, so it moves by its
+                // label and nothing is pushed around meanwhile. DefWindowProc moves it.
+                crate::fold_for_move(hwnd);
+            }
+            WM_ENTERSIZEMOVE => {
+                st.moving = !locked;
+                return 0;
+            }
+            WM_MOVING if st.moving => {
+                snap_moving(hwnd, st, &mut *(lparam as *mut RECT));
+                return 1;
+            }
             WM_EXITSIZEMOVE => {
-                // Moved by its name while unlocked: save where it was put.
+                // Moved by its name while unlocked: save where its label was put.
                 let mut r: RECT = std::mem::zeroed();
                 GetWindowRect(hwnd, &mut r);
-                st.pos = (r.left, r.top);
-                let id = st.cfg.id;
+                let dy = st.shown.1 - st.pos.1;
+                st.moving = false;
+                st.pos = (r.left, r.top - dy);
+                st.shown = (r.left, r.top);
+                let (id, (x, y), main) = (st.cfg.id, st.pos, st.main);
+                crate::show_snap_targets(hwnd, &[]);
                 store::change(|s| {
                     s.update_panel(id, |p| {
-                        p.x = r.left;
-                        p.y = r.top;
+                        p.x = x;
+                        p.y = y;
                     })
                 });
+                request_pushes(main);
+                return 0;
+            }
+            WM_NCMOUSEMOVE => {
+                // While unlocked the name is the move handle, outside the client area.
+                if !st.tracking_nc {
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE | TME_NONCLIENT,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    TrackMouseEvent(&mut tme);
+                    st.tracking_nc = true;
+                }
+                on_hover(hwnd, st, locked);
+            }
+            WM_NCMOUSELEAVE => {
+                st.tracking_nc = false;
+                if !cursor_inside(hwnd) {
+                    on_leave(hwnd, st, locked);
+                }
                 return 0;
             }
             WM_SETCURSOR => {
@@ -909,11 +1252,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     TrackMouseEvent(&mut tme);
                     st.tracking_mouse = true;
                 }
-                KillTimer(hwnd, CLOSE_TIMER);
-                if locked && st.settings.hover_open && !st.open && !st.open_pending {
-                    st.open_pending = true;
-                    SetTimer(hwnd, OPEN_TIMER, st.settings.open_delay_ms, None);
-                }
+                on_hover(hwnd, st, locked);
                 let (x, y) = mouse();
                 let hover = match st.hit(x, y) {
                     Hit::Item(i) => Some(i),
@@ -928,18 +1267,23 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             WM_MOUSELEAVE => {
                 st.tracking_mouse = false;
                 st.hover = None;
-                st.open_pending = false;
-                KillTimer(hwnd, OPEN_TIMER);
                 InvalidateRect(hwnd, null(), 0);
-                if locked && st.open && !st.pinned && !st.highlighted && st.settings.hover_open {
-                    SetTimer(hwnd, CLOSE_TIMER, st.settings.close_delay_ms, None);
+                // Moving onto the name while unlocked is not leaving.
+                if !cursor_inside(hwnd) {
+                    on_leave(hwnd, st, locked);
                 }
                 return 0;
             }
             WM_TIMER => {
                 match wparam {
                     OPEN_TIMER => set_open(hwnd, st, true),
-                    CLOSE_TIMER => set_open(hwnd, st, false),
+                    CLOSE_TIMER => {
+                        // Held open while the mouse is on a folder it pushed down: the
+                        // folder under the mouse never moves.
+                        if !crate::cursor_in_stack(hwnd) {
+                            set_open(hwnd, st, false);
+                        }
+                    }
                     ANIM_TIMER => animate(hwnd, st),
                     DRAG_OPEN_TIMER => {
                         KillTimer(hwnd, DRAG_OPEN_TIMER);
@@ -1068,12 +1412,12 @@ unsafe fn draw_text(hdc: HDC, text: &str, r: &RECT, flags: u32) {
 
 /// GDI draws with alpha 0. On the glass that would be invisible, so every
 /// pixel GDI touched gets an alpha equal to its brightness: grays become
-/// light on the glass. Icons already carry their own alpha. Rows below the
+/// light on the glass. Icons already carry their own alpha. Rows outside the
 /// title fade in with the opening animation.
-fn fix_alpha(pixels: &mut [u32], w: usize, title_h: usize, fade: f32) {
+fn fix_alpha(pixels: &mut [u32], w: usize, title: std::ops::Range<usize>, fade: f32) {
     let f = (fade.clamp(0.0, 1.0) * 255.0) as u32;
     for (y, row) in pixels.chunks_mut(w).enumerate() {
-        let scale = if y < title_h { 255 } else { f };
+        let scale = if title.contains(&y) { 255 } else { f };
         for p in row {
             let (mut a, r, g, b) = (*p >> 24, (*p >> 16) & 0xFF, (*p >> 8) & 0xFF, *p & 0xFF);
             if a == 0 {
@@ -1082,6 +1426,95 @@ fn fix_alpha(pixels: &mut [u32], w: usize, title_h: usize, fade: f32) {
             let s = |c: u32| c * scale / 255;
             *p = (s(a) << 24) | (s(r) << 16) | (s(g) << 8) | s(b);
         }
+    }
+}
+
+/// The number of shortcuts in a small rounded badge, starting at x, centered on cy.
+unsafe fn draw_badge(dc: HDC, st: &PanelState, x: i32, cy: i32, color: u32) {
+    let h = st.item_line_h + st.scale(2);
+    let r = RECT { left: x, top: cy - h / 2, right: x + st.badge_w(), bottom: cy - h / 2 + h };
+    unsafe {
+        fill_round(dc, &r, h, color);
+        let old = SelectObject(dc, st.font);
+        draw_text(dc, &st.cfg.items.len().to_string(), &r, DT_CENTER | DT_VCENTER);
+        SelectObject(dc, old);
+    }
+}
+
+/// The folder's icon and name, the shortcut count and the pin marker, in the
+/// title band starting at `top`.
+unsafe fn draw_title(dc: HDC, st: &PanelState, l: &Layout, top: i32, w: i32, accent: u32, badge: u32) {
+    let s = |v: i32| st.scale(v);
+    let count = st.settings.show_count;
+    let icon = l.label_icon;
+    let draw_icon = |x: i32, y: i32| {
+        if !st.title_icon.is_null() {
+            unsafe { DrawIconEx(dc, x, y, st.title_icon, icon, icon, 0, null_mut(), DI_NORMAL) };
+        }
+    };
+    unsafe {
+        let old_font = SelectObject(dc, st.title_font);
+        let pin_at = match st.style() {
+            TitleStyle::IconAbove => {
+                let (ix, iy) = ((w - icon) / 2, top + s(10));
+                draw_icon(ix, iy);
+                if count {
+                    draw_badge(dc, st, ix + icon - s(6), iy + s(4), badge);
+                }
+                let y0 = iy + icon + s(4);
+                for (k, line) in st.title_lines.iter().enumerate() {
+                    let y = y0 + k as i32 * st.line_h;
+                    let r = RECT { left: s(12), top: y, right: w - s(12), bottom: y + st.line_h };
+                    draw_text(dc, line, &r, DT_CENTER | DT_TOP);
+                }
+                (w - s(14), top + s(14))
+            }
+            TitleStyle::Fit => {
+                let cy = top + l.title_h / 2;
+                draw_icon(s(12), cy - icon / 2);
+                let text_left = s(12) + icon + s(8);
+                let pin_space = if st.pinned { s(18) } else { 0 };
+                let badge_space = if count { st.badge_w() + s(6) } else { 0 };
+                let right = w - s(8) - pin_space - badge_space;
+                let r = RECT { left: text_left, top, right, bottom: top + l.title_h };
+                draw_text(dc, &st.cfg.title, &r, DT_LEFT | DT_VCENTER);
+                if count {
+                    draw_badge(dc, st, text_left + st.title_text_w.min(right - text_left) + s(6), cy, badge);
+                }
+                (w - s(16), cy)
+            }
+            style => {
+                // Icon, lines and count as one group, centered or on the left.
+                let room = st.title_wrap_width();
+                let block_w = st.title_lines.iter().map(|t| text_width(dc, t)).max().unwrap_or(0).min(room);
+                let badge_space = if count { s(6) + st.badge_w() } else { 0 };
+                let group_w = icon + s(8) + block_w + badge_space;
+                let min_x = s(12);
+                let max_x = w - s(12 + PIN_ROOM) - group_w;
+                let gx = if style == TitleStyle::Centered { ((w - group_w) / 2).min(max_x).max(min_x) } else { min_x };
+                let cy = top + l.title_h / 2;
+                draw_icon(gx, cy - icon / 2);
+                let tx = gx + icon + s(8);
+                let y0 = cy - st.title_lines.len() as i32 * st.line_h / 2;
+                let align = if style == TitleStyle::Centered { DT_CENTER } else { DT_LEFT };
+                for (k, line) in st.title_lines.iter().enumerate() {
+                    let y = y0 + k as i32 * st.line_h;
+                    let r = RECT { left: tx, top: y, right: tx + block_w, bottom: y + st.line_h };
+                    draw_text(dc, line, &r, align | DT_TOP);
+                }
+                if count {
+                    draw_badge(dc, st, tx + block_w + s(6), cy, badge);
+                }
+                (w - s(16), cy)
+            }
+        };
+        if st.pinned {
+            let d = s(7);
+            let (cx, cy) = pin_at;
+            let dot = RECT { left: cx - d / 2, top: cy - d / 2, right: cx + d / 2 + 1, bottom: cy + d / 2 + 1 };
+            fill_round(dc, &dot, d, accent);
+        }
+        SelectObject(dc, old_font);
     }
 }
 
@@ -1121,8 +1554,14 @@ fn paint(hwnd: HWND, st: &PanelState, locked: bool) {
         SetTextColor(mem, text);
         let radius = st.scale(8);
 
-        // Border, in the accent color while it can be edited or is selected in Settings.
-        let pen = CreatePen(PS_SOLID, if outlined { st.scale(2) } else { 1 }, if outlined { accent } else { border });
+        // Border: in the accent color while it can be edited or is selected in
+        // Settings, and thicker on the folder a moved one snaps to.
+        if st.snap_target {
+            // A blue glow on the glass: half the accent's brightness.
+            fill_round(mem, &RECT { left: 0, top: 0, right: w, bottom: h }, radius * 2, (accent >> 1) & 0x7F7F7F);
+        }
+        let pen_w = if st.snap_target { st.scale(4) } else if outlined { st.scale(2) } else { 1 };
+        let pen = CreatePen(PS_SOLID, pen_w, if outlined || st.snap_target { accent } else { border });
         let old_pen = SelectObject(mem, pen);
         let old_brush = SelectObject(mem, GetStockObject(NULL_BRUSH));
         RoundRect(mem, 0, 0, w, h, radius * 2, radius * 2);
@@ -1130,31 +1569,18 @@ fn paint(hwnd: HWND, st: &PanelState, locked: bool) {
         SelectObject(mem, old_pen);
         DeleteObject(pen);
 
-        // Title: folder icon + name, and a pin marker while pinned.
-        let icon_left = st.scale(12);
-        if !st.title_icon.is_null() {
-            let top = (l.title_h - l.label_icon) / 2;
-            DrawIconEx(mem, icon_left, top, st.title_icon, l.label_icon, l.label_icon, 0, null_mut(), DI_NORMAL);
-        }
-        let old_font = SelectObject(mem, st.title_font);
-        let text_left = icon_left + l.label_icon + st.scale(8);
-        let pin_space = if st.pinned { st.scale(18) } else { 0 };
-        let title_rect = RECT { left: text_left, top: 0, right: w - st.scale(8) - pin_space, bottom: l.title_h };
-        draw_text(mem, &st.cfg.title, &title_rect, DT_LEFT | DT_VCENTER);
-        if st.pinned {
-            let d = st.scale(7);
-            let cx = w - st.scale(16);
-            let cy = l.title_h / 2;
-            let dot = RECT { left: cx - d / 2, top: cy - d / 2, right: cx + d / 2 + 1, bottom: cy + d / 2 + 1 };
-            fill_round(mem, &dot, d, accent);
-        }
+        let title_top = st.title_top(&l);
+        draw_title(mem, st, &l, title_top, w, accent, hover);
+        let old_font = SelectObject(mem, st.font);
 
         if st.progress > 0.0 {
-            SelectObject(mem, st.font);
             for (i, item) in st.cfg.items.iter().enumerate() {
                 let r = st.item_rect(&l, i);
                 if r.top >= h {
                     break;
+                }
+                if r.bottom <= 0 {
+                    continue;
                 }
                 if st.hover == Some(i) {
                     let inset = RECT { left: r.left + 1, top: r.top + 1, right: r.right - 1, bottom: r.bottom - 1 };
@@ -1168,10 +1594,19 @@ fn paint(hwnd: HWND, st: &PanelState, locked: bool) {
                 }
                 let label_top = icon_top + l.icon + st.scale(4);
                 let label = RECT { left: r.left + st.scale(2), top: label_top, right: r.right - st.scale(2), bottom: r.bottom };
-                draw_text(mem, &item.name, &label, DT_CENTER | DT_TOP);
+                if st.settings.item_lines >= 2 {
+                    let lines = layout::wrap(&item.name, label.right - label.left, 2, |t| text_width(mem, t));
+                    for (k, line) in lines.iter().enumerate() {
+                        let top = label_top + k as i32 * st.item_line_h;
+                        draw_text(mem, line, &RECT { top, bottom: top + st.item_line_h, ..label }, DT_CENTER | DT_TOP);
+                    }
+                } else {
+                    draw_text(mem, &item.name, &label, DT_CENTER | DT_TOP);
+                }
             }
             if st.cfg.items.is_empty() {
-                let hint = RECT { left: l.pad, top: l.title_h, right: w - l.pad, bottom: l.title_h + l.cell_h };
+                let top = st.content_top(&l);
+                let hint = RECT { left: l.pad, top, right: w - l.pad, bottom: top + l.cell_h };
                 SetTextColor(mem, 0x9A9A9A);
                 draw_text(mem, "Drop shortcuts here", &hint, DT_CENTER | DT_VCENTER);
                 SetTextColor(mem, text);
@@ -1188,8 +1623,8 @@ fn paint(hwnd: HWND, st: &PanelState, locked: bool) {
                 fill_round(mem, &bar, st.scale(2), accent);
             }
             // Resize grip on the right edge while unlocked.
-            if !locked && st.progress >= 1.0 {
-                let mid = (l.title_h + h) / 2;
+            if !locked && st.progress >= 1.0 && !st.cfg.fit_columns {
+                let mid = if st.up { (h - l.title_h) / 2 } else { (l.title_h + h) / 2 };
                 let grip = RECT { left: w - st.scale(5), top: mid - st.scale(12), right: w - st.scale(3), bottom: mid + st.scale(12) };
                 fill_round(mem, &grip, st.scale(2), accent);
             }
@@ -1197,7 +1632,8 @@ fn paint(hwnd: HWND, st: &PanelState, locked: bool) {
 
         GdiFlush();
         let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, (w * h) as usize);
-        fix_alpha(pixels, w as usize, l.title_h as usize, ease_out_cubic(st.progress));
+        let band = title_top.max(0) as usize..(title_top + l.title_h).max(0) as usize;
+        fix_alpha(pixels, w as usize, band, ease_out_cubic(st.progress));
 
         BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
         SelectObject(mem, old_font);
@@ -1215,14 +1651,18 @@ mod tests {
     #[test]
     fn gdi_pixels_get_alpha_from_brightness() {
         let mut px = [0x00F0F0F0, 0x80402010, 0x00000000];
-        fix_alpha(&mut px, 3, 1, 1.0);
+        fix_alpha(&mut px, 3, 0..1, 1.0);
         assert_eq!(px, [0xF0F0F0F0, 0x80402010, 0x00000000]);
     }
 
     #[test]
     fn rows_below_title_fade() {
         let mut px = [0x00FFFFFF, 0x00FFFFFF];
-        fix_alpha(&mut px, 1, 1, 0.0);
+        fix_alpha(&mut px, 1, 0..1, 0.0);
         assert_eq!(px, [0xFFFFFFFF, 0x00000000]);
+        // Opening upwards, the title is the bottom row.
+        let mut px = [0x00FFFFFF, 0x00FFFFFF];
+        fix_alpha(&mut px, 1, 1..2, 0.0);
+        assert_eq!(px, [0x00000000, 0xFFFFFFFF]);
     }
 }
