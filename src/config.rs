@@ -1,13 +1,14 @@
-use std::fs;
-use std::path::{Path, PathBuf};
+//! The config file format. Reading and writing it is done by `store`, which
+//! owns the data while the app runs.
+
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use serde::Deserialize;
-use toml_edit::{ArrayOfTables, DocumentMut, Table, value};
 
-const DEFAULT_CONFIG: &str = include_str!("../config.example.toml");
+pub const DEFAULT_CONFIG: &str = include_str!("../config.example.toml");
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct Settings {
     pub hover_open: bool,
@@ -23,7 +24,7 @@ pub struct Settings {
     pub hover: String,
     pub border: String,
     pub accent: String,
-    /// Where files dropped into a panel are moved. Empty = Documents\deskfolds.
+    /// Where new folders keep the files dropped into them. Empty = Documents\deskfolds.
     pub storage_dir: String,
 }
 
@@ -48,8 +49,23 @@ impl Default for Settings {
     }
 }
 
-#[derive(Deserialize, Clone)]
+impl Settings {
+    /// Brings every value into the range the app supports.
+    pub fn clamp(&mut self) {
+        self.tint_opacity = self.tint_opacity.clamp(0.0, 1.0);
+        self.open_delay_ms = self.open_delay_ms.min(5000);
+        self.close_delay_ms = self.close_delay_ms.clamp(1, 10000);
+        self.animation_ms = self.animation_ms.min(2000);
+        self.font_size = self.font_size.clamp(8, 40);
+        self.icon_size = self.icon_size.clamp(16, 128);
+    }
+}
+
+#[derive(Deserialize, Clone, PartialEq)]
 pub struct Panel {
+    /// Runtime id, never written to the file.
+    #[serde(skip)]
+    pub id: u32,
     pub title: String,
     #[serde(default)]
     pub x: i32,
@@ -62,12 +78,26 @@ pub struct Panel {
     /// Optional file whose icon is shown next to the name instead of a folder.
     #[serde(default)]
     pub icon: Option<String>,
+    /// Folder holding the files dropped into this panel. Chosen once and never
+    /// renamed, so renaming the panel does not split its files.
+    #[serde(default)]
+    pub storage: Option<String>,
     #[serde(default, rename = "item")]
     pub items: Vec<Item>,
 }
 
-#[derive(Deserialize, Clone)]
+impl Panel {
+    pub fn clamp(&mut self) {
+        self.columns = self.columns.clamp(1, 20);
+        self.width = self.width.clamp(MIN_WIDTH, 4000);
+    }
+}
+
+#[derive(Deserialize, Clone, PartialEq)]
 pub struct Item {
+    /// Runtime id, never written to the file.
+    #[serde(skip)]
+    pub id: u32,
     pub name: String,
     pub path: String,
     #[serde(default)]
@@ -85,127 +115,40 @@ pub struct Config {
     pub panels: Vec<Panel>,
 }
 
+pub const DEFAULT_WIDTH: i32 = 300;
+pub const DEFAULT_COLUMNS: i32 = 4;
+pub const MIN_WIDTH: i32 = 80;
+
 fn default_width() -> i32 {
-    300
+    DEFAULT_WIDTH
 }
 
 fn default_columns() -> i32 {
-    4
+    DEFAULT_COLUMNS
 }
 
-/// The config file, `%APPDATA%\deskfolds\config.toml`.
-pub fn path() -> &'static PathBuf {
-    static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
+/// The deskfolds folder in `%APPDATA%`.
+pub fn app_dir() -> &'static PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
         let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-        base.join("deskfolds").join("config.toml")
+        base.join("deskfolds")
     })
 }
 
-/// Loads the config, writing the default one first if the file does not exist.
-pub fn load(path: &Path) -> Result<Config, String> {
-    if !path.exists() {
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
-        }
-        fs::write(path, DEFAULT_CONFIG).map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
-    }
-    let text = fs::read_to_string(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
-    let mut config: Config = toml::from_str(&text).map_err(|e| format!("Invalid config {}:\n\n{e}", path.display()))?;
+/// The config file, `%APPDATA%\deskfolds\config.toml`.
+pub fn path() -> PathBuf {
+    app_dir().join("config.toml")
+}
 
-    let s = &mut config.settings;
-    s.tint_opacity = s.tint_opacity.clamp(0.0, 1.0);
-    s.open_delay_ms = s.open_delay_ms.clamp(1, 5000);
-    s.close_delay_ms = s.close_delay_ms.clamp(1, 10000);
-    s.animation_ms = s.animation_ms.min(2000);
-    s.font_size = s.font_size.clamp(8, 40);
-    s.icon_size = s.icon_size.clamp(16, 128);
-    for p in &mut config.panels {
-        p.columns = p.columns.clamp(1, 20);
-        p.width = p.width.clamp(80, 4000);
+/// Parses a config file's text and brings its values into range.
+pub fn parse(text: &str) -> Result<Config, String> {
+    let mut config: Config = toml::from_str(text).map_err(|e| e.to_string())?;
+    config.settings.clamp();
+    for panel in &mut config.panels {
+        panel.clamp();
     }
     Ok(config)
-}
-
-/// Writes panel positions back into the config file, keeping its comments and layout.
-pub fn save_positions(path: &Path, positions: &[(i32, i32)]) -> Result<(), String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
-    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("Invalid config: {e}"))?;
-    let panels = doc
-        .get_mut("panel")
-        .and_then(|item| item.as_array_of_tables_mut())
-        .ok_or("No [[panel]] entries in the config file")?;
-    if panels.len() != positions.len() {
-        return Err("The config file changed since it was loaded. Reload it, then move the panels again.".into());
-    }
-    for (table, (x, y)) in panels.iter_mut().zip(positions) {
-        table["x"] = toml_edit::value(*x as i64);
-        table["y"] = toml_edit::value(*y as i64);
-    }
-    fs::write(path, doc.to_string()).map_err(|e| format!("Cannot write {}: {e}", path.display()))
-}
-
-/// The `[[panel.item]]` tables of every panel, in order.
-pub type PanelItems = Vec<Vec<Table>>;
-
-/// Lets `edit` add, remove or reorder the items of any panel, then writes the
-/// file back. Comments and formatting of the untouched parts are kept.
-pub fn edit_items(path: &Path, edit: impl FnOnce(&mut PanelItems) -> Result<(), String>) -> Result<(), String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
-    let mut doc: DocumentMut = text.parse().map_err(|e| format!("Invalid config: {e}"))?;
-    let panels = doc
-        .get_mut("panel")
-        .and_then(|item| item.as_array_of_tables_mut())
-        .ok_or("No [[panel]] entries in the config file")?;
-
-    let mut items: PanelItems = panels
-        .iter()
-        .map(|p| p.get("item").and_then(|i| i.as_array_of_tables()).map(|a| a.iter().cloned().collect()).unwrap_or_default())
-        .collect();
-    edit(&mut items)?;
-
-    for (panel, tables) in panels.iter_mut().zip(items) {
-        let mut array = ArrayOfTables::new();
-        for table in tables {
-            array.push(table);
-        }
-        panel.insert("item", toml_edit::Item::ArrayOfTables(array));
-    }
-    renumber_tables(&mut doc);
-    fs::write(path, doc.to_string()).map_err(|e| format!("Cannot write {}: {e}", path.display()))
-}
-
-/// Table headers are printed in position order: renumber them so moved and new
-/// items are written under the panel they belong to, in their new order.
-fn renumber_tables(doc: &mut DocumentMut) {
-    let mut position = 0;
-    let mut next = || {
-        position += 1;
-        Some(position)
-    };
-    if let Some(settings) = doc.get_mut("settings").and_then(|i| i.as_table_mut()) {
-        settings.set_position(next());
-    }
-    let Some(panels) = doc.get_mut("panel").and_then(|i| i.as_array_of_tables_mut()) else { return };
-    for panel in panels.iter_mut() {
-        panel.set_position(next());
-        if let Some(items) = panel.get_mut("item").and_then(|i| i.as_array_of_tables_mut()) {
-            for item in items.iter_mut() {
-                item.set_position(next());
-            }
-        }
-    }
-}
-
-pub fn new_item(name: &str, path: &str) -> Table {
-    let mut table = Table::new();
-    table["name"] = value(name);
-    table["path"] = value(path);
-    table
-}
-
-pub fn item_path(table: &Table) -> String {
-    table.get("path").and_then(|p| p.as_str()).unwrap_or_default().to_string()
 }
 
 /// Parses "#RRGGBB" into a GDI COLORREF (0x00BBGGRR).
@@ -220,55 +163,33 @@ pub fn parse_color(s: &str, fallback: u32) -> u32 {
     }
 }
 
+/// Formats a GDI COLORREF as "#RRGGBB".
+pub fn format_color(color: u32) -> String {
+    format!("#{:02X}{:02X}{:02X}", color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn default_config_parses() {
-        let config: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        let config = parse(DEFAULT_CONFIG).unwrap();
         assert_eq!(config.panels.len(), 2);
         assert_eq!(config.panels[0].items.len(), 4);
     }
 
     #[test]
-    fn color_is_converted_to_bgr() {
+    fn colors_round_trip_through_bgr() {
         assert_eq!(parse_color("#112233", 0), 0x332211);
         assert_eq!(parse_color("bad", 7), 7);
+        assert_eq!(format_color(0x332211), "#112233");
     }
 
     #[test]
-    fn items_are_added_moved_and_reordered_under_the_right_panel() {
-        let path = std::env::temp_dir().join(format!("deskfolds-items-{}.toml", std::process::id()));
-        fs::write(&path, DEFAULT_CONFIG).unwrap();
-        edit_items(&path, |items| {
-            items[0].insert(1, new_item("Steam", "C:\\Games\\Steam.lnk"));
-            let docs = items[1].remove(0);
-            items[0].push(docs);
-            items[1].swap(0, 1);
-            Ok(())
-        })
-        .unwrap();
-        let text = fs::read_to_string(&path).unwrap();
-        fs::remove_file(&path).unwrap();
-        let config: Config = toml::from_str(&text).unwrap();
-        let names = |p: usize| config.panels[p].items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>();
-        assert_eq!(names(0), ["Notepad", "Steam", "Calculator", "Paint", "Explorer", "Documents"]);
-        assert_eq!(names(1), ["Desktop", "Downloads", "Settings"]);
-        assert_eq!(config.panels[0].items[1].path, "C:\\Games\\Steam.lnk");
-        assert!(text.contains("# deskfolds configuration"));
-    }
-
-    #[test]
-    fn positions_are_saved_without_losing_comments() {
-        let path = std::env::temp_dir().join(format!("deskfolds-test-{}.toml", std::process::id()));
-        fs::write(&path, DEFAULT_CONFIG).unwrap();
-        save_positions(&path, &[(100, 200), (-50, 300)]).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
-        fs::remove_file(&path).unwrap();
-        let config: Config = toml::from_str(&text).unwrap();
-        assert_eq!((config.panels[0].x, config.panels[0].y), (100, 200));
-        assert_eq!((config.panels[1].x, config.panels[1].y), (-50, 300));
-        assert!(text.contains("# deskfolds configuration"));
+    fn out_of_range_values_are_clamped() {
+        let config = parse("[settings]\nfont_size = 2\n[[panel]]\ntitle = \"A\"\ncolumns = 0\nwidth = 1").unwrap();
+        assert_eq!(config.settings.font_size, 8);
+        assert_eq!((config.panels[0].columns, config.panels[0].width), (1, MIN_WIDTH));
     }
 }

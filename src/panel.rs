@@ -2,30 +2,36 @@
 //! compact label (icon + name). Hovering it, or clicking it, unrolls a card of
 //! shortcuts. It stays below every other window, never takes focus, and cannot
 //! move while panels are locked.
+//!
+//! A panel shows a copy of its data from the store. Every change it makes
+//! (a drop, a move, a resize, a rename) goes through the store, which then
+//! updates the panel in place.
 
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::path::Path;
 use std::ptr::{null, null_mut};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-use windows_sys::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE};
-use windows_sys::Win32::System::SystemServices::{MK_CONTROL, MK_LBUTTON};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows_sys::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE};
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
+use windows_sys::Win32::System::SystemServices::{MK_CONTROL, MK_LBUTTON};
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::config::{self, Panel, Settings, item_path, new_item, parse_color};
-use crate::dragdrop::{self, display_name, is_stored, move_into, panel_dir, storage_root};
-use crate::util::{error_box, expand_env, launch, load_icon, prompt_text, resolve, wide};
+use crate::config::{MIN_WIDTH, Panel, Settings, parse_color};
+use crate::dragdrop::{self, DropHandler};
+use crate::store::{self, WM_APP_REFRESH};
+use crate::ui::{self, MenuEntry};
+use crate::util::{error_box, launch, load_icon, prompt_text, resolve, wide};
 
 const CLASS_NAME: &str = "deskfolds.panel";
 const OPEN_TIMER: usize = 1;
@@ -35,37 +41,57 @@ const DRAG_OPEN_TIMER: usize = 4;
 const ANIM_FRAME_MS: u32 = 15;
 /// Dragging a file over a closed panel opens it after this delay.
 const DRAG_OPEN_DELAY_MS: u32 = 300;
+/// Width of the resize grip on the right edge of an unlocked panel.
+const GRIP: i32 = 7;
 const ID_RENAME: usize = 1;
 const ID_REMOVE: usize = 2;
-
-thread_local! {
-    /// Set while one of our shortcuts is being dragged: (panel index, item index).
-    static INTERNAL_DRAG: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
-    /// Set when that drag was dropped on one of our panels.
-    static INTERNAL_DROP_DONE: Cell<bool> = const { Cell::new(false) };
-}
+const ID_SETTINGS: usize = 3;
 /// Icon shown next to the name when the panel sets none: any folder works.
-const DEFAULT_PANEL_ICON: &str = "%SystemRoot%";
+pub const DEFAULT_PANEL_ICON: &str = "%SystemRoot%";
 
-/// Shared by all panels: while false, panels can be dragged by their title bar.
+/// Shared by all panels: while false, panels can be moved, resized and edited.
 pub static LOCKED: AtomicBool = AtomicBool::new(true);
 
-/// Posted to the main window to open the tray menu at the cursor.
+/// Posted to the main window to open the menu at the cursor. wparam: the panel id, or 0.
 pub const WM_APP_SHOW_MENU: u32 = WM_APP + 2;
-/// Posted to the main window after the config file changed: rebuild the panels.
-pub const WM_APP_RELOAD: u32 = WM_APP + 3;
+
+thread_local! {
+    /// The shortcut being dragged out of a panel, by id.
+    static INTERNAL_DRAG: Cell<Option<u32>> = const { Cell::new(None) };
+    /// Set when that drag was dropped on one of our windows.
+    static INTERNAL_DROP_DONE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The shortcut being dragged out of a panel right now, if any.
+pub fn internal_drag() -> Option<u32> {
+    INTERNAL_DRAG.get()
+}
+
+/// Tells the drag source that one of our windows handled the drop itself.
+pub fn finish_internal_drop() {
+    INTERNAL_DROP_DONE.set(true);
+}
+
+/// True while a shortcut is being dragged out of a panel. Panels must not be
+/// rebuilt then: the drag loop still uses the one it started from.
+pub fn dragging() -> bool {
+    INTERNAL_DRAG.get().is_some()
+}
+
+static DROP_HANDLER: DropHandler = DropHandler { over: on_drag_over, leave: on_drag_leave, drop: on_drop };
 
 pub struct PanelState {
-    /// Position of this panel in the config file.
-    index: usize,
     cfg: Panel,
-    settings: Rc<Settings>,
-    menu_target: HWND,
-    pub x: i32,
-    pub y: i32,
+    settings: Settings,
+    main: HWND,
+    /// Where the panel is shown: its saved position, or the nearest visible
+    /// spot if no monitor shows that position anymore.
+    pos: (i32, i32),
     /// Target state: open or closed. `progress` animates towards it.
     open: bool,
     pinned: bool,
+    /// Selected in the settings window: kept open and outlined.
+    highlighted: bool,
     progress: f32,
     anim_from: f32,
     anim_start: u64,
@@ -75,8 +101,10 @@ pub struct PanelState {
     drag_open_pending: bool,
     /// Where a dragged file would be inserted, shown as a bar.
     drop_insert: Option<usize>,
-    /// Mouse pressed on an item while unlocked: (x, y, item) of the press.
+    /// Mouse pressed on an item while unlocked: (x, y, item index).
     press: Option<(i32, i32, usize)>,
+    /// Resizing with the grip: (cursor x when it started, width then).
+    resizing: Option<(i32, i32)>,
     hover: Option<usize>,
     tracking_mouse: bool,
     dpi: u32,
@@ -90,6 +118,7 @@ pub struct PanelState {
 enum Hit {
     Title,
     Item(usize),
+    Grip,
     Nothing,
 }
 
@@ -111,6 +140,10 @@ fn lerp(a: i32, b: i32, t: f32) -> i32 {
     a + ((b - a) as f32 * t).round() as i32
 }
 
+fn locked() -> bool {
+    LOCKED.load(Ordering::Relaxed)
+}
+
 impl PanelState {
     fn scale(&self, v: i32) -> i32 {
         (v as f32 * self.dpi as f32 / 96.0).round() as i32
@@ -119,7 +152,7 @@ impl PanelState {
     fn layout(&self) -> Layout {
         let s = &self.settings;
         let pad = self.scale(6);
-        let cols = self.cfg.columns;
+        let cols = self.cfg.columns.max(1);
         let icon = self.scale(s.icon_size);
         let line = self.scale(s.font_size * 3 / 2);
         Layout {
@@ -169,8 +202,9 @@ impl PanelState {
     }
 
     fn item_rect(&self, l: &Layout, i: usize) -> RECT {
-        let col = i as i32 % self.cfg.columns;
-        let row = i as i32 / self.cfg.columns;
+        let cols = self.cfg.columns.max(1);
+        let col = i as i32 % cols;
+        let row = i as i32 / cols;
         let left = l.pad + col * l.cell_w;
         let top = l.title_h + row * l.cell_h;
         RECT { left, top, right: left + l.cell_w, bottom: top + l.cell_h }
@@ -178,6 +212,9 @@ impl PanelState {
 
     fn hit(&self, x: i32, y: i32) -> Hit {
         let l = self.layout();
+        if !locked() && self.progress >= 1.0 && x >= self.size().0 - self.scale(GRIP) {
+            return Hit::Grip;
+        }
         if y < l.title_h {
             return Hit::Title;
         }
@@ -190,6 +227,13 @@ impl PanelState {
             }
         }
         Hit::Nothing
+    }
+
+    /// Shows the panel at its saved position, or on the nearest screen if that
+    /// position is on no monitor anymore. The saved position is not changed.
+    fn place(&mut self) {
+        let (w, h) = self.closed_size();
+        self.pos = visible_position(self.cfg.x, self.cfg.y, w, h);
     }
 
     /// (Re)creates fonts and icons for the current DPI.
@@ -264,6 +308,44 @@ impl Drop for PanelState {
     }
 }
 
+fn monitor_work_area(monitor: HMONITOR) -> Option<RECT> {
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    (unsafe { GetMonitorInfoW(monitor, &mut info) } != 0).then_some(info.rcWork)
+}
+
+/// Where a label of size (w, h) saved at (x, y) is shown: there if a monitor
+/// shows its middle, otherwise inside the nearest monitor's work area.
+pub fn visible_position(x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
+    let middle = POINT { x: x + w / 2, y: y + h / 2 };
+    unsafe {
+        if !MonitorFromPoint(middle, MONITOR_DEFAULTTONULL).is_null() {
+            return (x, y);
+        }
+        let Some(area) = monitor_work_area(MonitorFromPoint(middle, MONITOR_DEFAULTTONEAREST)) else { return (x, y) };
+        (x.clamp(area.left, (area.right - w).max(area.left)), y.clamp(area.top, (area.bottom - h).max(area.top)))
+    }
+}
+
+/// A free spot for a new panel on the main monitor, away from the given panels.
+pub fn free_spot(taken: &[(i32, i32)]) -> (i32, i32) {
+    let area = unsafe { monitor_work_area(MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY)) }
+        .unwrap_or(RECT { left: 0, top: 0, right: 1920, bottom: 1080 });
+    let (step_x, step_y) = (260, 70);
+    let mut y = area.top + 40;
+    while y + step_y < area.bottom {
+        let mut x = area.left + 40;
+        while x + step_x < area.right {
+            if !taken.iter().any(|&(tx, ty)| (tx - x).abs() < step_x - 20 && (ty - y).abs() < step_y - 10) {
+                return (x, y);
+            }
+            x += step_x;
+        }
+        y += step_y;
+    }
+    (area.left + 40, area.top + 40)
+}
+
 pub fn register_class() {
     let class = wide(CLASS_NAME);
     let wc = WNDCLASSW {
@@ -328,17 +410,16 @@ fn enable_glass(hwnd: HWND, settings: &Settings) {
 
 /// Creates a panel owned by the desktop window, so "Show desktop" leaves it visible.
 /// While panels are unlocked, it starts open so its shortcuts can be edited.
-pub fn create(index: usize, cfg: Panel, settings: Rc<Settings>, desktop: HWND, menu_target: HWND) -> HWND {
-    let editing = !LOCKED.load(Ordering::Relaxed);
+pub fn create(cfg: &Panel, settings: &Settings, desktop: HWND, main: HWND) -> HWND {
+    let editing = !locked();
     let state = Box::new(PanelState {
-        index,
-        x: cfg.x,
-        y: cfg.y,
-        cfg,
-        settings,
-        menu_target,
+        pos: (cfg.x, cfg.y),
+        cfg: cfg.clone(),
+        settings: settings.clone(),
+        main,
         open: editing,
         pinned: false,
+        highlighted: false,
         progress: if editing { 1.0 } else { 0.0 },
         anim_from: 0.0,
         anim_start: 0,
@@ -347,6 +428,7 @@ pub fn create(index: usize, cfg: Panel, settings: Rc<Settings>, desktop: HWND, m
         drag_open_pending: false,
         drop_insert: None,
         press: None,
+        resizing: None,
         hover: None,
         tracking_mouse: false,
         dpi: 96,
@@ -356,7 +438,6 @@ pub fn create(index: usize, cfg: Panel, settings: Rc<Settings>, desktop: HWND, m
         title_icon: null_mut(),
         icons: Vec::new(),
     });
-    let (x, y) = (state.x, state.y);
     let title = wide(&state.cfg.title);
     let class = wide(CLASS_NAME);
     unsafe {
@@ -367,8 +448,8 @@ pub fn create(index: usize, cfg: Panel, settings: Rc<Settings>, desktop: HWND, m
             class.as_ptr(),
             title.as_ptr(),
             WS_POPUP,
-            x,
-            y,
+            cfg.x,
+            cfg.y,
             100,
             30,
             desktop,
@@ -390,32 +471,86 @@ pub fn create(index: usize, cfg: Panel, settings: Rc<Settings>, desktop: HWND, m
         );
         st.dpi = GetDpiForWindow(hwnd).max(96);
         st.load_resources();
+        st.place();
         apply_size(hwnd, st);
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        dragdrop::register(hwnd);
+        dragdrop::register(hwnd, &DROP_HANDLER);
         hwnd
     }
 }
 
+/// Shows new data for this panel, keeping its open and pinned state.
+pub fn update(hwnd: HWND, cfg: &Panel, settings: &Settings) {
+    let Some(st) = state(hwnd) else { return };
+    let resources = st.cfg.title != cfg.title
+        || st.cfg.icon != cfg.icon
+        || st.cfg.items.len() != cfg.items.len()
+        || st.cfg.items.iter().zip(&cfg.items).any(|(a, b)| a.path != b.path || a.icon != b.icon)
+        || st.settings.font_size != settings.font_size
+        || st.settings.icon_size != settings.icon_size;
+    let glass = st.settings.tint != settings.tint || st.settings.tint_opacity != settings.tint_opacity;
+    if st.cfg.title != cfg.title {
+        let title = wide(&cfg.title);
+        unsafe { SetWindowTextW(hwnd, title.as_ptr()) };
+    }
+    st.cfg = cfg.clone();
+    st.settings = settings.clone();
+    if st.hover.is_some_and(|i| i >= st.cfg.items.len()) {
+        st.hover = None;
+    }
+    if resources {
+        st.load_resources();
+    }
+    if glass {
+        enable_glass(hwnd, &st.settings);
+    }
+    st.place();
+    apply_size(hwnd, st);
+}
+
+/// Moves the panel back on screen after the monitors changed, or back to its
+/// saved position once its monitor is there again.
+pub fn reposition(hwnd: HWND) {
+    let Some(st) = state(hwnd) else { return };
+    st.place();
+    apply_size(hwnd, st);
+}
+
+/// The id of the panel shown by this window.
+pub fn id_of(hwnd: HWND) -> Option<u32> {
+    state(hwnd).map(|st| st.cfg.id)
+}
+
 /// Unlocked panels stay open so their shortcuts can be dragged; locking closes them.
 pub fn set_editing(hwnd: HWND, editing: bool) {
-    let ptr = state_ptr(hwnd);
-    if ptr.is_null() {
-        return;
+    let Some(st) = state(hwnd) else { return };
+    if editing {
+        set_open(hwnd, st, true);
+    } else if !st.highlighted {
+        set_open(hwnd, st, false);
     }
-    let st = unsafe { &mut *ptr };
-    set_open(hwnd, st, editing);
     unsafe { InvalidateRect(hwnd, null(), 0) };
 }
 
-fn request_reload(st: &PanelState) {
-    unsafe { PostMessageW(st.menu_target, WM_APP_RELOAD, 0, 0) };
+/// The folder selected in the settings window stays open and outlined.
+pub fn set_highlight(hwnd: HWND, on: bool) {
+    let Some(st) = state(hwnd) else { return };
+    if st.highlighted == on {
+        return;
+    }
+    st.highlighted = on;
+    if on {
+        set_open(hwnd, st, true);
+    } else if locked() && !st.pinned && !st.tracking_mouse {
+        set_open(hwnd, st, false);
+    }
+    unsafe { InvalidateRect(hwnd, null(), 0) };
 }
 
 /// The effect a drop would have: our own shortcuts move between panels; files
 /// from elsewhere move in, unless Ctrl is held (or moving is not offered), which
 /// adds a link and leaves the original where it is.
-fn choose_effect(keys: u32, allowed: u32) -> u32 {
+pub fn choose_effect(keys: u32, allowed: u32) -> u32 {
     if INTERNAL_DRAG.get().is_some() {
         return allowed & (DROPEFFECT_MOVE | DROPEFFECT_LINK);
     }
@@ -428,18 +563,37 @@ fn choose_effect(keys: u32, allowed: u32) -> u32 {
     }
 }
 
+/// Adds dropped files to a panel at `index`, or moves our own dragged shortcut
+/// there. Returns the effect for the drag source: none when deskfolds moved the
+/// file itself, so the source never deletes anything.
+pub fn drop_files(panel_id: u32, index: usize, files: Vec<String>, effect: u32) -> u32 {
+    if effect == 0 {
+        return 0;
+    }
+    if let Some(item) = internal_drag() {
+        // One of our shortcuts: the panels are updated once the drag loop has ended.
+        finish_internal_drop();
+        if let Err(e) = store::change(|s| s.move_item(item, panel_id, index)) {
+            error_box(&e);
+        }
+        return 0;
+    }
+    let link = effect != DROPEFFECT_MOVE;
+    let errors = store::change(|s| s.add_files(panel_id, index, &files, link));
+    if !errors.is_empty() {
+        error_box(&format!("Some files could not be moved, so they were added as links:\n\n{}", errors.join("\n")));
+    }
+    if link { effect } else { 0 }
+}
+
 fn client_point(hwnd: HWND, screen: POINT) -> (i32, i32) {
     let mut pt = screen;
     unsafe { ScreenToClient(hwnd, &mut pt) };
     (pt.x, pt.y)
 }
 
-pub fn on_drag_over(hwnd: HWND, screen: POINT, keys: u32, allowed: u32) -> u32 {
-    let ptr = state_ptr(hwnd);
-    if ptr.is_null() {
-        return 0;
-    }
-    let st = unsafe { &mut *ptr };
+fn on_drag_over(hwnd: HWND, screen: POINT, keys: u32, allowed: u32) -> u32 {
+    let Some(st) = state(hwnd) else { return 0 };
     unsafe { KillTimer(hwnd, CLOSE_TIMER) };
     // OLE calls this repeatedly even when the mouse is still: start the timer once.
     if !st.open && !st.drag_open_pending {
@@ -455,224 +609,127 @@ pub fn on_drag_over(hwnd: HWND, screen: POINT, keys: u32, allowed: u32) -> u32 {
     choose_effect(keys, allowed)
 }
 
-pub fn on_drag_leave(hwnd: HWND) {
-    let ptr = state_ptr(hwnd);
-    if ptr.is_null() {
-        return;
-    }
-    let st = unsafe { &mut *ptr };
+fn on_drag_leave(hwnd: HWND) {
+    let Some(st) = state(hwnd) else { return };
     st.drop_insert = None;
     unsafe {
         KillTimer(hwnd, DRAG_OPEN_TIMER);
         st.drag_open_pending = false;
-        if st.drag_opened && !st.pinned && LOCKED.load(Ordering::Relaxed) {
+        if st.drag_opened && !st.pinned && !st.highlighted && locked() {
             SetTimer(hwnd, CLOSE_TIMER, st.settings.close_delay_ms, None);
         }
         InvalidateRect(hwnd, null(), 0);
     }
 }
 
-/// Handles files dropped on a panel and returns the effect for the drag source.
-pub fn on_drop(hwnd: HWND, files: Vec<String>, screen: POINT, keys: u32, allowed: u32) -> u32 {
-    let ptr = state_ptr(hwnd);
-    if ptr.is_null() {
-        return 0;
-    }
-    let st = unsafe { &mut *ptr };
+fn on_drop(hwnd: HWND, files: Vec<String>, screen: POINT, keys: u32, allowed: u32) -> u32 {
+    let Some(st) = state(hwnd) else { return 0 };
     let effect = choose_effect(keys, allowed);
     let (x, y) = client_point(hwnd, screen);
     let index = st.insert_index(x, y);
+    let panel_id = st.cfg.id;
     st.drop_insert = None;
     st.drag_opened = false;
+    st.drag_open_pending = false;
     unsafe {
         KillTimer(hwnd, DRAG_OPEN_TIMER);
-        st.drag_open_pending = false;
         InvalidateRect(hwnd, null(), 0);
     }
-    if effect == 0 {
-        return 0;
-    }
-    let panel = st.index;
-    let dir = panel_dir(&storage_root(&st.settings.storage_dir), &st.cfg.title);
-
-    if let Some((from_panel, from_item)) = INTERNAL_DRAG.get() {
-        // One of our shortcuts: reorder it, or move it to this panel. The panels
-        // are rebuilt once the drag loop has ended, not while it runs.
-        INTERNAL_DROP_DONE.set(true);
-        let root = storage_root(&st.settings.storage_dir);
-        let result = config::edit_items(config::path(), |items| {
-            if from_panel >= items.len() || from_item >= items[from_panel].len() || panel >= items.len() {
-                return Err("The config file changed. Reload it and try again.".into());
-            }
-            let mut table = items[from_panel].remove(from_item);
-            let path = item_path(&table);
-            if from_panel != panel && is_stored(&path, &root) {
-                let moved = move_into(Path::new(&expand_env(&path)), &dir)?;
-                table["path"] = toml_edit::value(moved.to_string_lossy().as_ref());
-            }
-            let mut at = index;
-            if from_panel == panel && from_item < at {
-                at -= 1;
-            }
-            let at = at.min(items[panel].len());
-            items[panel].insert(at, table);
-            Ok(())
-        });
-        if let Err(e) = result {
-            error_box(&e);
-        }
-        return 0;
-    }
-
-    let link = effect != DROPEFFECT_MOVE;
-    let mut errors = Vec::new();
-    let result = config::edit_items(config::path(), |items| {
-        let list = items.get_mut(panel).ok_or("The config file changed. Reload it and try again.")?;
-        let start = index.min(list.len());
-        for (at, file) in (start..).zip(&files) {
-            let src = Path::new(file);
-            let name = display_name(src);
-            let path = if link {
-                file.clone()
-            } else {
-                match move_into(src, &dir) {
-                    Ok(dest) => dest.to_string_lossy().to_string(),
-                    // Could not move it (e.g. a shared desktop file): keep a link instead.
-                    Err(e) => {
-                        errors.push(e);
-                        file.clone()
-                    }
-                }
-            };
-            list.insert(at, new_item(&name, &path));
-        }
-        Ok(())
-    });
-    match result {
-        Err(e) => error_box(&e),
-        Ok(()) if !errors.is_empty() => {
-            error_box(&format!("Some files could not be moved, so they were added as links:\n\n{}", errors.join("\n")))
-        }
-        Ok(()) => {}
-    }
-    request_reload(st);
-    // We moved the files ourselves: the source must not delete anything.
-    if link { effect } else { 0 }
+    drop_files(panel_id, index, files, effect)
 }
 
 /// Drags a shortcut out of a panel with the shell's drag loop. Must be the last
-/// thing the caller does: the panels may be rebuilt right after.
-fn drag_item_out(hwnd: HWND, st: &mut PanelState, item: usize) {
-    let path = resolve(&st.cfg.items[item].path);
+/// thing the caller does with the panel: it may be updated right after.
+fn drag_item_out(hwnd: HWND, st: &PanelState, index: usize) {
+    let item = st.cfg.items[index].clone();
+    let path = resolve(&item.path);
     if !Path::new(&path).exists() {
         return;
     }
-    let root = storage_root(&st.settings.storage_dir);
-    let stored = is_stored(&path, &root);
+    let panel_id = st.cfg.id;
+    let main = st.main;
+    let stored = store::with(|s| s.is_stored(panel_id, &item));
     // Files we keep can be moved anywhere. A link must never move the original
     // (it could be a program in Program Files), unless it sits on the desktop.
     let on_desktop = dragdrop::desktop_dir().is_some_and(|d| Path::new(&path).parent() == Some(d.as_path()));
     let allowed = if stored || on_desktop { DROPEFFECT_MOVE | DROPEFFECT_COPY | DROPEFFECT_LINK } else { DROPEFFECT_LINK };
-    let panel = st.index;
-    let menu_target = st.menu_target;
 
-    INTERNAL_DRAG.set(Some((panel, item)));
+    INTERNAL_DRAG.set(Some(item.id));
     INTERNAL_DROP_DONE.set(false);
     let dropped = dragdrop::drag_file_out(hwnd, &path, allowed);
     INTERNAL_DRAG.set(None);
-    let reload = || unsafe { PostMessageW(menu_target, WM_APP_RELOAD, 0, 0) };
-    if INTERNAL_DROP_DONE.replace(false) {
-        reload();
-        return;
-    }
-    let Some(effect) = dropped else { return };
-    // Out of the panel: the file went where it was dropped, or a shortcut to it
-    // was created there. A copy (Ctrl) leaves the shortcut in the panel.
-    let gone = !Path::new(&path).exists();
-    let out = gone || effect & DROPEFFECT_LINK != 0 || (on_desktop && !stored && dragdrop::cursor_over_desktop());
-    if out {
-        if let Err(e) = remove_item(panel, item) {
+    if !INTERNAL_DROP_DONE.replace(false)
+        && let Some(effect) = dropped
+    {
+        // Out of the panel: the file went where it was dropped, or a shortcut to it
+        // was created there. A copy (Ctrl) leaves the shortcut in the panel.
+        let gone = !Path::new(&path).exists();
+        let out = gone || effect & DROPEFFECT_LINK != 0 || (on_desktop && !stored && dragdrop::cursor_over_desktop());
+        if out && let Err(e) = store::change(|s| s.remove_item(item.id, false)) {
             error_box(&e);
         }
-        reload();
     }
-}
-
-fn remove_item(panel: usize, item: usize) -> Result<(), String> {
-    config::edit_items(config::path(), |items| {
-        if let Some(list) = items.get_mut(panel)
-            && item < list.len()
-        {
-            list.remove(item);
-        }
-        Ok(())
-    })
+    // Updates were held back during the drag: apply them now.
+    unsafe { PostMessageW(main, WM_APP_REFRESH, 0, 0) };
 }
 
 /// Right-click menu on a shortcut while unlocked.
-fn item_menu(hwnd: HWND, st: &mut PanelState, item: usize) {
-    let rename = wide("Rename");
-    let remove = wide("Remove from folder");
-    let choice = unsafe {
-        let menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING, ID_RENAME, rename.as_ptr());
-        AppendMenuW(menu, MF_STRING, ID_REMOVE, remove.as_ptr());
-        let mut pt = POINT { x: 0, y: 0 };
-        GetCursorPos(&mut pt);
-        SetForegroundWindow(st.menu_target);
-        let choice = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, st.menu_target, null());
-        DestroyMenu(menu);
-        choice as usize
+fn item_menu(hwnd: HWND, st: &PanelState, index: usize) {
+    let item = st.cfg.items[index].clone();
+    let (panel_id, main, font) = (st.cfg.id, st.main, st.font);
+    // Where the rename box goes: over the shortcut's name.
+    let l = st.layout();
+    let r = st.item_rect(&l, index);
+    let mut origin = POINT { x: r.left, y: r.top + st.scale(8) + l.icon + st.scale(2) };
+    unsafe { ClientToScreen(hwnd, &mut origin) };
+    let (height, width) = (st.scale(st.settings.font_size + 10), l.cell_w.max(st.scale(120)));
+    let rect = RECT {
+        left: origin.x - (width - l.cell_w) / 2,
+        top: origin.y,
+        right: origin.x + (width + l.cell_w) / 2,
+        bottom: origin.y + height,
     };
-    let panel = st.index;
-    match choice {
+
+    let entries: [MenuEntry; 4] = [
+        (ID_RENAME, "Rename", 0),
+        (ID_REMOVE, "Remove from folder", 0),
+        ui::SEPARATOR,
+        (ID_SETTINGS, "Folder settings…", 0),
+    ];
+    let mut at = POINT { x: 0, y: 0 };
+    unsafe { GetCursorPos(&mut at) };
+    // The panel may be updated while the menu or the rename box is open: from
+    // here on, only the copied values are used.
+    match ui::popup_menu(main, &entries, at) {
         ID_RENAME => {
-            let l = st.layout();
-            let r = st.item_rect(&l, item);
-            let mut origin = POINT { x: r.left, y: r.top + st.scale(8) + l.icon + st.scale(2) };
-            unsafe { ClientToScreen(hwnd, &mut origin) };
-            let height = st.scale(st.settings.font_size + 10);
-            let width = l.cell_w.max(st.scale(120));
-            let rect = RECT { left: origin.x - (width - l.cell_w) / 2, top: origin.y, right: origin.x + (width + l.cell_w) / 2, bottom: origin.y + height };
-            let Some(name) = prompt_text(rect, &st.cfg.items[item].name, st.font) else { return };
-            let result = config::edit_items(config::path(), |items| {
-                if let Some(table) = items.get_mut(panel).and_then(|l| l.get_mut(item)) {
-                    table["name"] = toml_edit::value(name.as_str());
-                }
-                Ok(())
-            });
-            if let Err(e) = result {
-                error_box(&e);
+            if let Some(name) = prompt_text(rect, &item.name, font) {
+                store::change(|s| s.update_item(item.id, |it| it.name = name));
             }
-            request_reload(st);
         }
         ID_REMOVE => {
             // A file we keep goes back to the desktop; a link is just removed.
-            let path = expand_env(&st.cfg.items[item].path);
-            if is_stored(&path, &storage_root(&st.settings.storage_dir)) && Path::new(&path).exists() {
-                let Some(desktop) = dragdrop::desktop_dir() else { return };
-                if let Err(e) = move_into(Path::new(&path), &desktop) {
-                    error_box(&e);
-                    return;
-                }
-            }
-            if let Err(e) = remove_item(panel, item) {
+            if let Err(e) = store::change(|s| s.remove_item(item.id, true)) {
                 error_box(&e);
             }
-            request_reload(st);
         }
+        ID_SETTINGS => crate::settings::open(Some(panel_id), false),
         _ => {}
     }
 }
 
-pub fn state_ptr(hwnd: HWND) -> *mut PanelState {
+fn state<'a>(hwnd: HWND) -> Option<&'a mut PanelState> {
+    let ptr = state_ptr(hwnd);
+    (!ptr.is_null()).then(|| unsafe { &mut *ptr })
+}
+
+fn state_ptr(hwnd: HWND) -> *mut PanelState {
     unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PanelState }
 }
 
 fn apply_size(hwnd: HWND, st: &PanelState) {
     let (w, h) = st.size();
     unsafe {
-        SetWindowPos(hwnd, HWND_BOTTOM, st.x, st.y, w, h, SWP_NOACTIVATE);
+        SetWindowPos(hwnd, HWND_BOTTOM, st.pos.0, st.pos.1, w, h, SWP_NOACTIVATE);
         InvalidateRect(hwnd, null(), 0);
         UpdateWindow(hwnd);
     }
@@ -735,6 +792,20 @@ fn push_other_panels_down(keep: HWND) {
     }
 }
 
+fn cursor_x() -> i32 {
+    let mut pt = POINT { x: 0, y: 0 };
+    unsafe { GetCursorPos(&mut pt) };
+    pt.x
+}
+
+/// Ends a resize with the grip and saves the new width.
+fn finish_resize(st: &mut PanelState) {
+    if st.resizing.take().is_some() {
+        let (id, width) = (st.cfg.id, st.cfg.width);
+        store::change(|s| s.update_panel(id, |p| p.width = width));
+    }
+}
+
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         if msg == WM_NCCREATE {
@@ -752,7 +823,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
         let st = &mut *ptr;
-        let locked = LOCKED.load(Ordering::Relaxed);
+        let locked = locked();
         let mouse = || ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
 
         match msg {
@@ -763,8 +834,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 pos.hwndInsertAfter = HWND_BOTTOM;
                 pos.flags &= !SWP_NOZORDER;
                 if locked {
-                    pos.x = st.x;
-                    pos.y = st.y;
+                    pos.x = st.pos.0;
+                    pos.y = st.pos.1;
                 }
                 return 0;
             }
@@ -779,10 +850,17 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 return HTCLIENT as LRESULT;
             }
             WM_EXITSIZEMOVE => {
+                // Moved by its name while unlocked: save where it was put.
                 let mut r: RECT = std::mem::zeroed();
                 GetWindowRect(hwnd, &mut r);
-                st.x = r.left;
-                st.y = r.top;
+                st.pos = (r.left, r.top);
+                let id = st.cfg.id;
+                store::change(|s| {
+                    s.update_panel(id, |p| {
+                        p.x = r.left;
+                        p.y = r.top;
+                    })
+                });
                 return 0;
             }
             WM_SETCURSOR => {
@@ -790,6 +868,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 GetCursorPos(&mut pt);
                 ScreenToClient(hwnd, &mut pt);
                 let cursor = match st.hit(pt.x, pt.y) {
+                    _ if st.resizing.is_some() => IDC_SIZEWE,
+                    Hit::Grip => IDC_SIZEWE,
                     Hit::Title if !locked => IDC_SIZEALL,
                     Hit::Title | Hit::Item(_) => IDC_HAND,
                     Hit::Nothing => IDC_ARROW,
@@ -798,6 +878,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 return 1;
             }
             WM_MOUSEMOVE => {
+                if let Some((start_x, start_width)) = st.resizing {
+                    let delta = ((cursor_x() - start_x) as f32 * 96.0 / st.dpi as f32).round() as i32;
+                    let width = (start_width + delta).clamp(MIN_WIDTH, 4000);
+                    if width != st.cfg.width {
+                        st.cfg.width = width;
+                        apply_size(hwnd, st);
+                    }
+                    return 0;
+                }
                 // Unlocked: pressing a shortcut and moving starts dragging it out.
                 if let Some((px, py, item)) = st.press
                     && !locked
@@ -842,7 +931,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 st.open_pending = false;
                 KillTimer(hwnd, OPEN_TIMER);
                 InvalidateRect(hwnd, null(), 0);
-                if locked && st.open && !st.pinned && st.settings.hover_open {
+                if locked && st.open && !st.pinned && !st.highlighted && st.settings.hover_open {
                     SetTimer(hwnd, CLOSE_TIMER, st.settings.close_delay_ms, None);
                 }
                 return 0;
@@ -866,14 +955,24 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             WM_LBUTTONDOWN => {
                 let (x, y) = mouse();
-                st.press = match st.hit(x, y) {
-                    Hit::Item(i) if !locked => Some((x, y, i)),
-                    _ => None,
-                };
+                st.press = None;
+                match st.hit(x, y) {
+                    Hit::Grip => {
+                        st.resizing = Some((cursor_x(), st.cfg.width));
+                        SetCapture(hwnd);
+                    }
+                    Hit::Item(i) if !locked => st.press = Some((x, y, i)),
+                    _ => {}
+                }
                 return 0;
             }
             WM_LBUTTONUP => {
                 st.press = None;
+                if st.resizing.is_some() {
+                    // Sends WM_CAPTURECHANGED, which saves the new width.
+                    ReleaseCapture();
+                    return 0;
+                }
                 let (x, y) = mouse();
                 if !locked {
                     // Editing: shortcuts are dragged, not launched.
@@ -894,12 +993,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     Hit::Item(i) => {
                         let item = st.cfg.items[i].clone();
                         launch(&item.path, &item.args);
-                        if st.settings.collapse_after_launch && !st.pinned {
+                        if st.settings.collapse_after_launch && !st.pinned && !st.highlighted {
                             set_open(hwnd, st, false);
                         }
                     }
-                    Hit::Nothing => {}
+                    Hit::Grip | Hit::Nothing => {}
                 }
+                return 0;
+            }
+            WM_CAPTURECHANGED => {
+                finish_resize(st);
                 return 0;
             }
             WM_RBUTTONUP => {
@@ -907,13 +1010,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 match st.hit(x, y) {
                     Hit::Item(i) if !locked => item_menu(hwnd, st, i),
                     _ => {
-                        PostMessageW(st.menu_target, WM_APP_SHOW_MENU, 0, 0);
+                        PostMessageW(st.main, WM_APP_SHOW_MENU, st.cfg.id as usize, 0);
                     }
                 }
                 return 0;
             }
             WM_NCRBUTTONUP => {
-                PostMessageW(st.menu_target, WM_APP_SHOW_MENU, 0, 0);
+                PostMessageW(st.main, WM_APP_SHOW_MENU, st.cfg.id as usize, 0);
                 return 0;
             }
             WM_DESTROY => dragdrop::revoke(hwnd),
@@ -922,8 +1025,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 st.load_resources();
                 if !locked {
                     let suggested = &*(lparam as *const RECT);
-                    st.x = suggested.left;
-                    st.y = suggested.top;
+                    st.pos = (suggested.left, suggested.top);
                 }
                 apply_size(hwnd, st);
                 return 0;
@@ -990,6 +1092,7 @@ fn paint(hwnd: HWND, st: &PanelState, locked: bool) {
     let border = parse_color(&s.border, 0x3A3A3A);
     let accent = parse_color(&s.accent, 0xFFC24C);
     let l = st.layout();
+    let outlined = !locked || st.highlighted;
 
     unsafe {
         let mut ps: PAINTSTRUCT = std::mem::zeroed();
@@ -1018,8 +1121,8 @@ fn paint(hwnd: HWND, st: &PanelState, locked: bool) {
         SetTextColor(mem, text);
         let radius = st.scale(8);
 
-        // Border, in the accent color while panels can be moved.
-        let pen = CreatePen(PS_SOLID, if locked { 1 } else { st.scale(2) }, if locked { border } else { accent });
+        // Border, in the accent color while it can be edited or is selected in Settings.
+        let pen = CreatePen(PS_SOLID, if outlined { st.scale(2) } else { 1 }, if outlined { accent } else { border });
         let old_pen = SelectObject(mem, pen);
         let old_brush = SelectObject(mem, GetStockObject(NULL_BRUSH));
         RoundRect(mem, 0, 0, w, h, radius * 2, radius * 2);
@@ -1083,6 +1186,12 @@ fn paint(hwnd: HWND, st: &PanelState, locked: bool) {
                 let x = if at < count { r.left } else { r.right };
                 let bar = RECT { left: x - st.scale(1), top: r.top + st.scale(6), right: x + st.scale(2), bottom: r.bottom - st.scale(6) };
                 fill_round(mem, &bar, st.scale(2), accent);
+            }
+            // Resize grip on the right edge while unlocked.
+            if !locked && st.progress >= 1.0 {
+                let mid = (l.title_h + h) / 2;
+                let grip = RECT { left: w - st.scale(5), top: mid - st.scale(12), right: w - st.scale(3), bottom: mid + st.scale(12) };
+                fill_round(mem, &grip, st.scale(2), accent);
             }
         }
 
