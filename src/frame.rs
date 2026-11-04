@@ -39,6 +39,11 @@ struct State {
     /// The tab goes under the frame when there is no room above it.
     tab_below: bool,
     moving: bool,
+    /// The window rectangle last given while moving: a different one at the
+    /// end means the move was cancelled (Esc).
+    last_rect: Option<RECT>,
+    /// What was drawn last, so an unchanged frame is not drawn again.
+    drawn: Option<(Rect, String, Option<Rect>, u32, bool, u32)>,
 }
 
 impl State {
@@ -91,9 +96,14 @@ pub fn show(block: Rect, text: &str, slot: Option<Rect>, dpi: u32) {
         return;
     }
     let mut hwnd = FRAME.get();
+    // Gone with its owner (Explorer restarted): make a new one.
+    if !hwnd.is_null() && unsafe { IsWindow(hwnd) } == 0 {
+        hwnd = null_mut();
+        FRAME.set(null_mut());
+    }
     if hwnd.is_null() {
         let desktop = unsafe { FindWindowW(wide("Progman").as_ptr(), null()) };
-        let st = Box::new(State { block, text: String::new(), slot: None, dpi, tab_below: false, moving: false });
+        let st = Box::new(State { block, text: String::new(), slot: None, dpi, tab_below: false, moving: false, last_rect: None, drawn: None });
         let class = wide(CLASS);
         hwnd = unsafe {
             CreateWindowExW(
@@ -127,9 +137,15 @@ pub fn show(block: Rect, text: &str, slot: Option<Rect>, dpi: u32) {
     // No room above for the tab: put it under the frame.
     let area = crate::panel::work_area_at(block.x + block.w / 2, block.y + block.h / 2);
     st.tab_below = block.y - st.s(FRAME_PAD) - st.s(TAB_H) / 2 < area.y;
-    render(hwnd, st, true);
+    let key = (block, st.text.clone(), slot, dpi, st.tab_below, accent());
+    if st.drawn.as_ref() != Some(&key) {
+        render(hwnd, st, true);
+        st.drawn = Some(key);
+    }
     unsafe {
-        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        if IsWindowVisible(hwnd) == 0 {
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
     }
     keep_below();
 }
@@ -137,7 +153,7 @@ pub fn show(block: Rect, text: &str, slot: Option<Rect>, dpi: u32) {
 /// Removes the frame (locked, or no arrangement).
 pub fn hide() {
     let hwnd = FRAME.replace(null_mut());
-    if !hwnd.is_null() {
+    if !hwnd.is_null() && unsafe { IsWindow(hwnd) } != 0 {
         unsafe { DestroyWindow(hwnd) };
     }
 }
@@ -176,6 +192,17 @@ fn render(hwnd: HWND, st: &State, place: bool) {
         info.bmiHeader.biCompression = BI_RGB;
         let mut bits: *mut c_void = null_mut();
         let bmp = CreateDIBSection(mem, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+        if mem.is_null() || bmp.is_null() || bits.is_null() {
+            // Out of memory or GDI handles: no frame this time.
+            if !bmp.is_null() {
+                DeleteObject(bmp);
+            }
+            if !mem.is_null() {
+                DeleteDC(mem);
+            }
+            ReleaseDC(null_mut(), screen);
+            return;
+        }
         let old_bmp = SelectObject(mem, bmp);
 
         // Dashed outline in the accent color.
@@ -240,7 +267,7 @@ fn render(hwnd: HWND, st: &State, place: bool) {
 
         // Alpha: the tab and the lines are solid, the inside a faint tint that
         // still takes the mouse, the corners outside the outline clear.
-        let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, (w * h) as usize);
+        let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, w as usize * h as usize);
         let tint = 0x16u32;
         let (r, g, b) = (accent & 0xFF, (accent >> 8) & 0xFF, (accent >> 16) & 0xFF);
         let faint = (tint << 24) | ((r * tint / 255) << 16) | ((g * tint / 255) << 8) | (b * tint / 255);
@@ -302,7 +329,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 }
                 return DefWindowProcW(hwnd, msg, wparam, lparam);
             }
-            _ => {}
+            WM_NCDESTROY | WM_ENTERSIZEMOVE | WM_MOVING | WM_EXITSIZEMOVE => {}
+            // Everything else needs no state (and may arrive while it is in use).
+            _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
         }
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State;
         if ptr.is_null() {
@@ -318,6 +347,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             WM_ENTERSIZEMOVE => {
                 st.moving = true;
                 st.slot = None;
+                st.last_rect = None;
                 arrange::begin_frame_drag(st.block);
                 return 0;
             }
@@ -333,16 +363,27 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 r.bottom += dy;
                 st.block.x = x;
                 st.block.y = y;
+                st.last_rect = Some(*r);
                 if text != st.text {
                     st.text = text;
+                    st.drawn = None;
                     render(hwnd, st, false);
                 }
                 return 1;
             }
             WM_EXITSIZEMOVE => {
                 st.moving = false;
+                st.drawn = None;
+                let mut now: RECT = std::mem::zeroed();
+                GetWindowRect(hwnd, &mut now);
+                let moved = st.last_rect.take().is_some_and(|r| (r.left, r.top) == (now.left, now.top));
                 let block = st.block;
-                arrange::end_frame_drag(block);
+                // Esc puts the window back, and a click does not move it: save nothing then.
+                if moved {
+                    arrange::end_frame_drag(block);
+                } else {
+                    arrange::cancel_drag();
+                }
                 return 0;
             }
             _ => {}

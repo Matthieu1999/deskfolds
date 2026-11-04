@@ -21,14 +21,14 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Ole::OleInitialize;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, SetProcessDpiAwarenessContext};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, IsWindowEnabled};
 use windows_sys::Win32::UI::Shell::{
     ExtractIconExW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use panel::{LOCKED, WM_APP_PUSH, WM_APP_SHOW_MENU};
+use panel::{LOCKED, WM_APP_ARRANGE, WM_APP_PUSH, WM_APP_SHOW_MENU};
 use store::{Change, Store, WM_APP_CONFLICT, WM_APP_REFRESH};
 use ui::{Ask, MenuEntry};
 use util::{error_box, wide};
@@ -103,6 +103,8 @@ fn rebuild_panels(main: HWND) {
     let created: Vec<HWND> =
         list.iter().map(|p| panel::create(p, &settings, desktop, main)).filter(|h| !h.is_null()).collect();
     PANELS.with(|p| *p.borrow_mut() = created);
+    // The frame belonged to the old desktop window (Explorer restarted).
+    frame::hide();
     arrange::rearrange();
 }
 
@@ -304,6 +306,16 @@ pub fn show_snap_targets(moving: HWND, targets: &[HWND]) {
     }
 }
 
+/// A move of a folder or of the frame ended: with "all folders open while
+/// unlocked", the folders folded for the move open again.
+pub fn after_move() {
+    if !LOCKED.load(Ordering::Relaxed) && store::with(|s| s.settings.unlocked_open_all) {
+        for hwnd in panels() {
+            panel::set_editing(hwnd, true);
+        }
+    }
+}
+
 /// A folder (or the arrangement's frame, with a null `moving`) is about to be
 /// moved: fold every folder but the one selected in Settings, so it moves by
 /// its label and nothing is pushed meanwhile.
@@ -367,6 +379,14 @@ fn open_settings(panel: Option<u32>) {
 }
 
 fn quit(main: HWND) {
+    // A dialog of the settings window is open: its code still uses the window
+    // once the dialog returns, so quitting now would pull it away. Show it instead.
+    if let Some(w) = settings::owner()
+        && unsafe { IsWindowEnabled(w) } == 0
+    {
+        unsafe { SetForegroundWindow(w) };
+        return;
+    }
     if store::with(|s| s.has_conflict()) {
         resolve_conflict();
     }
@@ -499,6 +519,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 update_pushes();
                 0
             }
+            WM_APP_ARRANGE => {
+                arrange::rearrange();
+                0
+            }
             WM_DISPLAYCHANGE => {
                 reposition_panels();
                 0
@@ -536,9 +560,12 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
 /// gets its own.
 fn instance_name() -> String {
     const NAME: &str = "Local\\deskfolds.single-instance";
-    let usual = dragdrop::roaming_app_data().map(|d| d.join("deskfolds"));
+    // Compared after resolving links, mapped drives and short names.
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().to_lowercase();
+    let usual = dragdrop::roaming_app_data();
     let ours = config::app_dir();
-    if usual.as_ref().is_none_or(|d| d.to_string_lossy().eq_ignore_ascii_case(&ours.to_string_lossy())) {
+    let our_root = ours.parent().map(canon);
+    if usual.as_deref().is_none_or(|d| Some(canon(d)) == our_root) {
         return NAME.into();
     }
     let mut h = std::collections::hash_map::DefaultHasher::new();

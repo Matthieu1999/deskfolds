@@ -144,6 +144,11 @@ fn place(settings: &Settings, sizes: &[(i32, i32)], screen: Screen) -> Placed {
     let spec = settings.arrange_spec();
     let slots = layout::slots(sizes, &spec, screen.work, gap);
     let (x, y) = layout::origin(slots.w, slots.h, &spec, screen.work, gap);
+    // Never past the screen: a large offset, or an arrangement bigger than the
+    // screen, starts at its edge instead of piling folders up there.
+    let a = screen.work;
+    let x = x.min(a.right() - slots.w).max(a.x);
+    let y = y.min(a.bottom() - slots.h).max(a.y);
     Placed {
         block: Rect { x, y, w: slots.w, h: slots.h },
         pos: slots.pos.iter().map(|&(px, py)| (x + px, y + py)).collect(),
@@ -197,6 +202,13 @@ pub fn rearrange() {
         .collect();
     if !moves.is_empty() {
         store::change(|s| s.set_positions(&moves));
+    }
+    // A folder shown somewhere else (dropped back in its own slot, or a move
+    // cancelled with Esc) goes back to its slot even when nothing is saved.
+    for (m, &(x, y)) in members.iter().zip(&placed.pos) {
+        if (m.2.x, m.2.y) != (x, y) {
+            panel::set_label(m.1, x, y);
+        }
     }
     ROWS.with(|r| *r.borrow_mut() = members.iter().map(|m| m.1).zip(placed.heights.iter().copied()).collect());
     let spec = settings.arrange_spec();
@@ -267,6 +279,7 @@ pub fn frame_moving(block: Rect, free: bool) -> ((i32, i32), String) {
 pub fn end_frame_drag(block: Rect) {
     BUSY.set(false);
     FRAME_DRAG.set(None);
+    crate::after_move();
     let settings = store::with(|s| s.settings.clone());
     if let Some(screen) = screen_at(block.x + block.w / 2, block.y + block.h / 2) {
         let gap = scale(settings.gap, screen.dpi);
@@ -283,15 +296,28 @@ pub fn end_frame_drag(block: Rect) {
     rearrange();
 }
 
+/// A move of the frame or of a folder was cancelled (Esc, or a click that did
+/// not move): nothing is saved and the folders go back to their slots.
+pub fn cancel_drag() {
+    BUSY.set(false);
+    DROP.set(None);
+    FRAME_DRAG.set(None);
+    crate::after_move();
+    rearrange();
+}
+
 // ---- Dragging a folder over the arrangement ----
 
 /// A folder (`id`, its label at `label`) is being moved, the mouse at `cursor`.
 /// Over the frame, it takes the nearest place in the arrangement and the
-/// others make room; outside, the others close the gap. Returns true while it
-/// is over the frame (then it does not snap to other folders).
-pub fn folder_moving(id: u32, label: Rect, cursor: POINT) -> bool {
-    let (settings, others, _) = members(Some(id));
-    if others.is_empty() {
+/// others make room; outside (or with `free`, Alt held), the others close the
+/// gap. Returns true while it is over the frame (then it does not snap to
+/// other folders).
+pub fn folder_moving(id: u32, label: Rect, cursor: POINT, free: bool) -> bool {
+    let (settings, others, list) = members(Some(id));
+    let arranged = list.iter().any(|p| p.id == id && p.arranged);
+    // No arrangement to join, and not leaving one.
+    if others.is_empty() && !arranged {
         return false;
     }
     let Some(screen) = screen_for(&settings.arrange_screen) else { return false };
@@ -302,10 +328,11 @@ pub fn folder_moving(id: u32, label: Rect, cursor: POINT) -> bool {
     let with_it = place(&settings, &sizes, screen);
     let pad = scale(FRAME_PAD + 6, dpi);
     let b = with_it.block;
-    let inside = cursor.x >= b.x - pad && cursor.x < b.right() + pad && cursor.y >= b.y - pad && cursor.y < b.bottom() + pad;
+    let over = cursor.x >= b.x - pad && cursor.x < b.right() + pad && cursor.y >= b.y - pad && cursor.y < b.bottom() + pad;
+    let inside = over && !free;
     let spec = settings.arrange_spec();
     let text = tab_text(spec.anchor, spec.offset, false);
-    let Some(screen) = screen_for(&settings.arrange_screen) else { return false };
+    let screen = with_it.screen;
     if inside {
         let k = layout::nearest_slot(&with_it.pos, (label.x, label.y));
         let mut order: Vec<(u32, Option<HWND>, (i32, i32))> = others.iter().map(|m| (m.0, Some(m.1), (m.2.w, m.2.h))).collect();
@@ -326,7 +353,11 @@ pub fn folder_moving(id: u32, label: Rect, cursor: POINT) -> bool {
         for (m, &(x, y)) in others.iter().zip(&placed.pos) {
             panel::set_label(m.1, x, y);
         }
-        frame::show(placed.block, &text, None, dpi);
+        if others.is_empty() {
+            frame::hide();
+        } else {
+            frame::show(placed.block, &text, None, dpi);
+        }
         DROP.set(Some(None));
     }
     inside
@@ -336,6 +367,7 @@ pub fn folder_moving(id: u32, label: Rect, cursor: POINT) -> bool {
 /// at its new place, out of it where it is, or just moved.
 pub fn folder_dropped(id: u32, x: i32, y: i32) {
     BUSY.set(false);
+    crate::after_move();
     match DROP.take() {
         Some(Some(order)) => store::change(|s| {
             s.set_arranged(&[id], true);

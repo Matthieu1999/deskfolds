@@ -208,31 +208,33 @@ fn fitting(lengths: impl Iterator<Item = i32>, room: i32, gap: i32) -> usize {
 
 /// The slots for folders of these closed sizes, in this order. Each column is
 /// as wide as its widest folder and each row as tall as its tallest one. An
-/// incomplete last row (or column) follows the anchor: at the end it keeps to
-/// the columns (rows) above, in the middle it is centered.
+/// incomplete last row (or column) follows the anchor: on the left, centered
+/// or on the right as a group. A grid wider than the screen gets fewer columns.
 pub fn slots(sizes: &[(i32, i32)], spec: &Spec, area: Rect, gap: i32) -> Slots {
     let n = sizes.len();
     if n == 0 {
         return Slots { pos: Vec::new(), heights: Vec::new(), w: 0, h: 0 };
     }
-    let (cols, rows, by_column) = match spec.shape {
-        Shape::Row => {
-            let cols = fitting(sizes.iter().map(|s| s.0), area.w - 2 * gap, gap);
-            (cols, n.div_ceil(cols), false)
-        }
-        Shape::Column => {
-            let rows = fitting(sizes.iter().map(|s| s.1), area.h - 2 * gap, gap);
-            (n.div_ceil(rows), rows, true)
-        }
-        Shape::Grid if spec.by_rows => {
-            let rows = spec.count.clamp(1, n);
-            (n.div_ceil(rows), rows, true)
-        }
-        Shape::Grid => {
-            let cols = spec.count.clamp(1, n);
-            (cols, n.div_ceil(cols), false)
-        }
+    let (mut count, by_column) = match spec.shape {
+        Shape::Row => (fitting(sizes.iter().map(|s| s.0), area.w - 2 * gap, gap), false),
+        Shape::Column => (fitting(sizes.iter().map(|s| s.1), area.h - 2 * gap, gap), true),
+        Shape::Grid => (spec.count.clamp(1, n), spec.by_rows),
     };
+    // Fewer columns (or rows) while the real grid is wider (taller) than the screen.
+    loop {
+        let s = grid(sizes, spec, count, by_column, gap);
+        let too_big = if by_column { s.h > area.h - 2 * gap } else { s.w > area.w - 2 * gap };
+        if !too_big || count == 1 {
+            return s;
+        }
+        count -= 1;
+    }
+}
+
+/// The slots of a grid of `count` columns (or rows, `by_column`).
+fn grid(sizes: &[(i32, i32)], spec: &Spec, count: usize, by_column: bool, gap: i32) -> Slots {
+    let n = sizes.len();
+    let (cols, rows) = if by_column { (n.div_ceil(count), count) } else { (count, n.div_ceil(count)) };
     let cell = |i: usize| if by_column { (i / rows, i % rows) } else { (i % cols, i / cols) };
     let mut col_w = vec![0; cols];
     let mut row_h = vec![0; rows];
@@ -257,18 +259,19 @@ pub fn slots(sizes: &[(i32, i32)], spec: &Spec, area: Rect, gap: i32) -> Slots {
     let h = ys[rows - 1] + row_h[rows - 1];
     let mut pos: Vec<(i32, i32)> = (0..n).map(|i| (xs[cell(i).0], ys[cell(i).1])).collect();
     let (fx, fy) = (fraction(spec.anchor.0), fraction(spec.anchor.1));
+    // The incomplete last row moves as a group, so its folders never overlap.
     if !by_column && !n.is_multiple_of(cols) && fx > 0.0 {
         let used = n % cols;
         let shift = ((w - (xs[used - 1] + col_w[used - 1])) as f32 * fx).round() as i32;
-        for (k, p) in pos[n - used..].iter_mut().enumerate() {
-            p.0 = if fx >= 1.0 { xs[cols - used + k] } else { p.0 + shift };
+        for p in pos[n - used..].iter_mut() {
+            p.0 += shift;
         }
     }
     if by_column && !n.is_multiple_of(rows) && fy > 0.0 {
         let used = n % rows;
         let shift = ((h - (ys[used - 1] + row_h[used - 1])) as f32 * fy).round() as i32;
-        for (k, p) in pos[n - used..].iter_mut().enumerate() {
-            p.1 = if fy >= 1.0 { ys[rows - used + k] } else { p.1 + shift };
+        for p in pos[n - used..].iter_mut() {
+            p.1 += shift;
         }
     }
     let heights = (0..n).map(|i| row_h[cell(i).1]).collect();
@@ -409,7 +412,7 @@ mod tests {
         assert_eq!(snap(corner, &[], SCREEN, 8, 10), Snap { x: 8, y: 1040 - 36 - 8, with: vec![] });
     }
 
-    fn grid(count: usize, by_rows: bool, anchor: (usize, usize)) -> Spec {
+    fn grid_spec(count: usize, by_rows: bool, anchor: (usize, usize)) -> Spec {
         Spec { shape: Shape::Grid, count, by_rows, anchor, offset: (0, 0) }
     }
 
@@ -417,32 +420,49 @@ mod tests {
 
     #[test]
     fn a_grid_of_columns_fills_rows_first() {
-        let s = slots(&[(100, 40); 9], &grid(3, false, (0, 0)), AREA, 8);
+        let s = slots(&[(100, 40); 9], &grid_spec(3, false, (0, 0)), AREA, 8);
         assert_eq!((s.w, s.h, s.pos[1], s.pos[3]), (316, 136, (108, 0), (0, 48)));
     }
 
     #[test]
     fn a_grid_of_rows_fills_columns_first() {
-        let s = slots(&[(100, 40); 9], &grid(2, true, (0, 0)), AREA, 8);
+        let s = slots(&[(100, 40); 9], &grid_spec(2, true, (0, 0)), AREA, 8);
         assert_eq!((s.h, s.pos[1], s.pos[2]), (88, (0, 48), (108, 0)));
     }
 
     #[test]
     fn an_incomplete_last_row_follows_the_anchor() {
-        let centered = slots(&[(100, 40); 8], &grid(3, false, (1, 0)), AREA, 8);
+        let centered = slots(&[(100, 40); 8], &grid_spec(3, false, (1, 0)), AREA, 8);
         assert_eq!((centered.pos[6], centered.pos[7]), ((54, 96), (162, 96)));
-        let right = slots(&[(100, 40); 8], &grid(3, false, (2, 0)), AREA, 8);
+        let right = slots(&[(100, 40); 8], &grid_spec(3, false, (2, 0)), AREA, 8);
         assert_eq!(right.pos[6], (108, 96));
-        // Filled by columns, at the bottom: the last column keeps to the rows.
+        // Unequal widths on the right: the last row moves as a group and does not overlap.
+        let mixed = slots(&[(300, 40), (200, 40), (200, 40), (300, 40), (200, 40)], &grid_spec(3, false, (2, 0)), AREA, 8);
+        assert_eq!((mixed.pos[3].0, mixed.pos[4].0), (208, 516));
+        assert!(mixed.pos[3].0 + 300 + 8 <= mixed.pos[4].0);
+        // Filled by columns, at the bottom: the last column moves down as a group.
         let mut sizes = vec![(100, 40); 5];
         sizes[0].1 = 60;
-        let bottom = slots(&sizes, &grid(2, true, (0, 2)), AREA, 8);
-        assert_eq!(bottom.pos[4], (216, bottom.pos[1].1));
+        let bottom = slots(&sizes, &grid_spec(2, true, (0, 2)), AREA, 8);
+        assert_eq!(bottom.pos[4], (216, 48));
+        assert!(bottom.pos[4].1 + 40 <= bottom.h);
+    }
+
+    #[test]
+    fn a_grid_wider_than_the_screen_gets_fewer_columns() {
+        let s = slots(&[(300, 40); 8], &grid_spec(8, false, (0, 0)), AREA, 8);
+        assert!(s.w <= AREA.w - 16, "{}", s.w);
+        assert_eq!((s.pos[2], s.pos[3]), ((616, 0), (0, 48)));
+        // A row is checked with the real widths too: wide folders after narrow ones.
+        let row = Spec { shape: Shape::Row, ..grid_spec(1, false, (0, 0)) };
+        let mut sizes = vec![(150, 40); 6];
+        sizes.extend([(400, 40); 6]);
+        assert!(slots(&sizes, &row, AREA, 8).w <= AREA.w - 16);
     }
 
     #[test]
     fn each_column_is_as_wide_as_its_widest_folder() {
-        let s = slots(&[(100, 40), (150, 60), (100, 40), (100, 40)], &grid(2, false, (0, 0)), AREA, 8);
+        let s = slots(&[(100, 40), (150, 60), (100, 40), (100, 40)], &grid_spec(2, false, (0, 0)), AREA, 8);
         assert_eq!((s.pos[1].0, s.w), (108, 258));
         // The first row is as tall as its tallest folder, for each of its folders.
         assert_eq!(s.heights, [60, 60, 40, 40]);
@@ -450,7 +470,7 @@ mod tests {
 
     #[test]
     fn rows_and_columns_wrap_at_the_screen_edge() {
-        let row = Spec { shape: Shape::Row, ..grid(1, false, (0, 0)) };
+        let row = Spec { shape: Shape::Row, ..grid_spec(1, false, (0, 0)) };
         let s = slots(&[(250, 33); 12], &row, AREA, 8);
         // 4 × 250 + 3 gaps is wider than 1000 - 2 × 8.
         assert_eq!((s.pos[2], s.pos[3]), ((516, 0), (0, 41)));
@@ -461,7 +481,7 @@ mod tests {
 
     #[test]
     fn the_anchor_and_offset_place_the_arrangement() {
-        let top_right = Spec { anchor: (2, 0), ..grid(3, false, (0, 0)) };
+        let top_right = Spec { anchor: (2, 0), ..grid_spec(3, false, (0, 0)) };
         assert_eq!(origin(316, 136, &top_right, AREA, 8), (676, 8));
         let centered = Spec { anchor: (1, 1), offset: (10, -5), ..top_right };
         assert_eq!(origin(316, 136, &centered, AREA, 8), (352, 227));
@@ -472,7 +492,7 @@ mod tests {
         assert_eq!(anchor_of(680, 10, 316, 136, AREA, 8), ((2, 0), (4, 2)));
         for (x, y) in [(3, 400), (345, 230), (700, 500), (120, 15)] {
             let (anchor, offset) = anchor_of(x, y, 316, 136, AREA, 8);
-            let spec = Spec { anchor, offset, ..grid(3, false, (0, 0)) };
+            let spec = Spec { anchor, offset, ..grid_spec(3, false, (0, 0)) };
             assert_eq!(origin(316, 136, &spec, AREA, 8), (x, y));
         }
     }

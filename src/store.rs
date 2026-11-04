@@ -339,7 +339,12 @@ impl Store {
                     notices.push(e);
                 }
             }
-            Err(e) => notices.push(format!("Cannot read config.toml: {e}")),
+            Err(e) => {
+                notices.push(format!("Cannot read config.toml: {e}"));
+                // It is there but unreadable (not UTF-8, locked): the first save
+                // must ask before replacing it, like after a hand edit.
+                store.file_hash = Some(u64::MAX);
+            }
         }
         store.changes.clear();
         (store, notices)

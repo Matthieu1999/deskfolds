@@ -119,16 +119,30 @@ fn is_uri(s: &str) -> bool {
 /// Expands environment variables and finds bare program names in PATH.
 pub fn resolve(path: &str) -> String {
     let expanded = expand_env(path.trim());
-    if is_uri(&expanded) || Path::new(&expanded).exists() {
+    if is_uri(&expanded) || Path::new(&expanded).is_absolute() {
         return expanded;
     }
+    // A bare name ("notepad.exe") is looked up in the Windows folders and PATH
+    // only, never in the current folder or next to deskfolds, where a file of
+    // the same name could have been put.
+    let search = wide(&safe_search_path());
     let name = wide(&expanded);
     let mut buf = vec![0u16; MAX_PATH as usize * 4];
-    let n = unsafe { SearchPathW(null(), name.as_ptr(), null(), buf.len() as u32, buf.as_mut_ptr(), null_mut()) };
+    let n = unsafe { SearchPathW(search.as_ptr(), name.as_ptr(), null(), buf.len() as u32, buf.as_mut_ptr(), null_mut()) };
     if n > 0 && (n as usize) < buf.len() {
         return String::from_utf16_lossy(&buf[..n as usize]);
     }
     expanded
+}
+
+/// The folders where a bare program name is looked for: System32, Windows, then
+/// the absolute folders of PATH.
+fn safe_search_path() -> String {
+    let mut dirs = vec![expand_env("%SystemRoot%\\System32"), expand_env("%SystemRoot%")];
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path).filter(|p| p.is_absolute()).map(|p| p.to_string_lossy().to_string()));
+    }
+    dirs.join(";")
 }
 
 /// Returns the shell icon of a file, folder or URI, or null if none is found.

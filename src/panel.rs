@@ -65,6 +65,9 @@ pub const WM_APP_SHOW_MENU: u32 = WM_APP + 2;
 /// Posted to the main window when a panel grew, shrank or moved: the folders
 /// stacked under open ones are pushed down again.
 pub const WM_APP_PUSH: u32 = WM_APP + 3;
+/// Posted to the main window when a panel changed size outside the store (a
+/// new DPI): the arrangement is placed again.
+pub const WM_APP_ARRANGE: u32 = WM_APP + 4;
 
 thread_local! {
     /// The shortcut being dragged out of a panel, by id.
@@ -127,6 +130,9 @@ pub struct PanelState {
     applied: Option<(i32, i32, i32, i32)>,
     /// Being moved by its name: pushes leave it alone.
     moving: bool,
+    /// The window rectangle last given while moving: a different one at the
+    /// end means the move was cancelled (Esc).
+    last_moving: Option<RECT>,
     /// Lit up as the folder that a moved folder snaps to.
     snap_target: bool,
     /// Target state: open or closed. `progress` animates towards it.
@@ -578,6 +584,7 @@ pub fn create(cfg: &Panel, settings: &Settings, desktop: HWND, main: HWND) -> HW
         last_reach: None,
         applied: None,
         moving: false,
+        last_moving: None,
         snap_target: false,
         cfg: cfg.clone(),
         settings: settings.clone(),
@@ -672,6 +679,10 @@ pub fn update(hwnd: HWND, cfg: &Panel, settings: &Settings) {
     st.settings = settings.clone();
     if st.hover.is_some_and(|i| i >= st.cfg.items.len()) {
         st.hover = None;
+    }
+    // A shortcut pressed before the change may be gone.
+    if st.press.is_some_and(|(_, _, i)| i >= st.cfg.items.len()) {
+        st.press = None;
     }
     if resources {
         st.load_resources();
@@ -1143,7 +1154,8 @@ fn snap_moving(hwnd: HWND, st: &PanelState, r: &mut RECT) {
     // Over the arrangement's frame, it takes a place there instead of snapping.
     let mut cursor = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut cursor) };
-    if crate::arrange::folder_moving(st.cfg.id, layout::Rect { x: r.left, y: r.top - dy, w, h }, cursor) {
+    let free = unsafe { GetKeyState(VK_MENU as i32) } < 0;
+    if crate::arrange::folder_moving(st.cfg.id, layout::Rect { x: r.left, y: r.top - dy, w, h }, cursor, free) {
         crate::show_snap_targets(hwnd, &[]);
         return;
     }
@@ -1224,10 +1236,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             WM_ENTERSIZEMOVE => {
                 st.moving = !locked;
+                st.last_moving = None;
                 return 0;
             }
             WM_MOVING if st.moving => {
-                snap_moving(hwnd, st, &mut *(lparam as *mut RECT));
+                let r = &mut *(lparam as *mut RECT);
+                snap_moving(hwnd, st, r);
+                st.last_moving = Some(*r);
                 return 1;
             }
             WM_EXITSIZEMOVE => {
@@ -1235,13 +1250,19 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 let mut r: RECT = std::mem::zeroed();
                 GetWindowRect(hwnd, &mut r);
                 let dy = st.shown.1 - st.pos.1;
+                let moved = st.last_moving.take().is_some_and(|m| (m.left, m.top) == (r.left, r.top));
                 st.moving = false;
                 st.pos = (r.left, r.top - dy);
                 st.shown = (r.left, r.top);
                 let (id, (x, y), main) = (st.cfg.id, st.pos, st.main);
                 crate::show_snap_targets(hwnd, &[]);
-                // Saves it, and puts it into the arrangement or out of it.
-                crate::arrange::folder_dropped(id, x, y);
+                if moved {
+                    // Saves it, and puts it into the arrangement or out of it.
+                    crate::arrange::folder_dropped(id, x, y);
+                } else {
+                    // Esc put it back, or it was only clicked.
+                    crate::arrange::cancel_drag();
+                }
                 request_pushes(main);
                 return 0;
             }
@@ -1402,10 +1423,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     }
                     Hit::Item(i) => {
                         let item = st.cfg.items[i].clone();
-                        launch(&item.path, &item.args);
                         if st.settings.collapse_after_launch && !st.pinned && !st.highlighted {
                             set_open(hwnd, st, false);
                         }
+                        // Last, and nothing of the panel is used after it: ShellExecute can
+                        // run a message loop (a security prompt) in which the panel is destroyed.
+                        launch(&item.path, &item.args);
                     }
                     Hit::Grip | Hit::Nothing => {}
                 }
@@ -1438,6 +1461,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     st.pos = (suggested.left, suggested.top);
                 }
                 apply_size(hwnd, st);
+                // Its size changed: the arrangement it may be in is placed again.
+                PostMessageW(st.main, WM_APP_ARRANGE, 0, 0);
                 return 0;
             }
             WM_SYSCOMMAND => {
@@ -1615,6 +1640,17 @@ fn paint(hwnd: HWND, st: &PanelState, locked: bool) {
         let mut bits: *mut c_void = null_mut();
         let mem = CreateCompatibleDC(hdc);
         let bmp = CreateDIBSection(mem, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+        if mem.is_null() || bmp.is_null() || bits.is_null() {
+            // Out of memory or GDI handles: nothing drawn this time.
+            if !bmp.is_null() {
+                DeleteObject(bmp);
+            }
+            if !mem.is_null() {
+                DeleteDC(mem);
+            }
+            EndPaint(hwnd, &ps);
+            return;
+        }
         let old_bmp = SelectObject(mem, bmp);
         SetBkMode(mem, TRANSPARENT as _);
         SetTextColor(mem, text);
@@ -1697,7 +1733,7 @@ fn paint(hwnd: HWND, st: &PanelState, locked: bool) {
         }
 
         GdiFlush();
-        let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, (w * h) as usize);
+        let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, w as usize * h as usize);
         let band = title_top.max(0) as usize..(title_top + l.title_h).max(0) as usize;
         fix_alpha(pixels, w as usize, band, ease_out_cubic(st.progress));
 

@@ -85,6 +85,11 @@ fn dropped_files(data: *mut c_void) -> Vec<String> {
         if ((**(data as *const *const DataObjectVtbl)).get_data)(data, &format, &mut medium) != S_OK {
             return files;
         }
+        // Another program could answer with something else than memory.
+        if medium.tymed != TYMED_HGLOBAL || medium.u.hGlobal.is_null() {
+            ReleaseStgMedium(&mut medium);
+            return files;
+        }
         let hdrop = medium.u.hGlobal;
         let count = DragQueryFileW(hdrop, u32::MAX, null_mut(), 0);
         for i in 0..count {
@@ -330,9 +335,17 @@ pub fn panel_dir(root: &Path, title: &str) -> PathBuf {
 
 /// True if the file lives in the storage folder, i.e. it was moved into a panel.
 pub fn is_stored(path: &str, root: &Path) -> bool {
+    // A storage folder must be a real folder of its own, not a drive.
+    if !root.is_absolute() || root.parent().is_none() {
+        return false;
+    }
+    let expanded = crate::util::expand_env(path);
+    // "..\" could point anywhere outside the storage folder.
+    if Path::new(&expanded).components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir)) {
+        return false;
+    }
     let root = root.to_string_lossy().to_lowercase();
-    let path = crate::util::expand_env(path).to_lowercase();
-    path.starts_with(&format!("{}\\", root.trim_end_matches('\\')))
+    expanded.to_lowercase().starts_with(&format!("{}\\", root.trim_end_matches('\\')))
 }
 
 /// Moves a file or folder into `dir`, renaming it "name (2)" if the name is taken.
@@ -358,7 +371,10 @@ pub fn move_into(src: &Path, dir: &Path) -> Result<PathBuf, String> {
 
 /// The name shown for a dropped file: no ".lnk"/".url" extension, folders keep their name.
 pub fn display_name(path: &Path) -> String {
-    let name = if path.is_dir() { path.file_name() } else { path.file_stem() };
+    // Only shortcuts lose their extension: "Invoice.pdf.exe" must not show as "Invoice.pdf".
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase());
+    let shortcut = !path.is_dir() && matches!(ext.as_deref(), Some("lnk") | Some("url"));
+    let name = if shortcut { path.file_stem() } else { path.file_name() };
     name.map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string_lossy().to_string())
 }
 
@@ -372,6 +388,9 @@ mod tests {
         assert!(is_stored("c:\\users\\me\\documents\\deskfolds\\Apps\\Steam.lnk", root));
         assert!(!is_stored("C:\\Users\\me\\Desktop\\Steam.lnk", root));
         assert!(!is_stored("C:\\Users\\me\\Documents\\deskfolds-other\\a.lnk", root));
+        // Going up with ".." is never "inside", and a drive is never a storage folder.
+        assert!(!is_stored("C:\\Users\\me\\Documents\\deskfolds\\Apps\\..\\..\\..\\Pictures", root));
+        assert!(!is_stored("C:\\Windows\\notepad.exe", Path::new("C:\\")));
     }
 
     #[test]
