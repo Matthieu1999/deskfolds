@@ -65,16 +65,22 @@ There are two ways, and both give the same program:
 3. Double-click **deskfolds.exe**. The first time, Windows may show
    **Windows protected your PC**: deskfolds is not signed with a paid
    certificate, so Windows does not know it yet. Click **More info**, then
-   **Run anyway**. Windows does not ask again for this file.
+   **Run anyway**. Windows usually does not ask again for that file.
 
 Then see [First start](#first-start).
 
-To check that the file is the one GitHub built (optional), run this in
-PowerShell in the folder of the file, and compare the result with the
-SHA-256 shown on the release page:
+- If **Smart App Control** is on (Windows Security > App & browser control),
+  Windows may block deskfolds with no **Run anyway** button: it does not let
+  unsigned programs it does not know run. deskfolds cannot run on that PC
+  while it is on.
+- An antivirus may also be wary of a new, unsigned program at first.
+
+To check that the download is not damaged (optional), run this in PowerShell
+in the folder of the file, with the SHA-256 shown on the release page between
+the quotes. It prints `True` when they are the same:
 
 ```powershell
-(Get-FileHash .\deskfolds.exe).Hash
+(Get-FileHash .\deskfolds.exe).Hash -eq "PASTE-THE-SHA-256-HERE"
 ```
 
 deskfolds.exe needs nothing else: no .NET, no Visual C++ Redistributable. It
@@ -396,8 +402,8 @@ change always reaches the right one and the config file stays clean.
   file picker, confirmations) follow their own theme.
 - So far tested only at 100 % display scaling.
 - deskfolds.exe is not signed with a paid code-signing certificate, so
-  Windows SmartScreen asks once before running a new version (**More info** >
-  **Run anyway**).
+  Windows SmartScreen asks before running a new version (**More info** >
+  **Run anyway**), and Smart App Control, when it is on, blocks it.
 
 ## Size and memory
 

@@ -40,11 +40,15 @@ jobs:
           git merge-base --is-ancestor HEAD origin/main
           if ($LASTEXITCODE -ne 0) { throw "The tag $env:TAG is not on main." }
 
+      # A fixed Rust version, so that the same tag always builds the same way.
+      # Raise it on purpose, in a pull request that builds and tests it.
       - name: Install Rust
         shell: pwsh
+        env:
+          RUST_VERSION: "1.99.1"
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
+          rustup toolchain install $env:RUST_VERSION --profile minimal --no-self-update
+          rustup default $env:RUST_VERSION
           cargo --version
 
       - name: Test
@@ -63,10 +67,15 @@ jobs:
         run: |
           $exe = "target\release\deskfolds.exe"
           $b = [IO.File]::ReadAllBytes($exe)
-          $text = [Text.Encoding]::ASCII.GetString($b).ToLowerInvariant()
+          # Its text, read both as ASCII and as UTF-16 (the two forms paths are kept in).
+          $texts = @([Text.Encoding]::ASCII.GetString($b), [Text.Encoding]::Unicode.GetString($b), [Text.Encoding]::Unicode.GetString($b, 1, $b.Length - 1)) | ForEach-Object { $_.ToLowerInvariant() }
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
+          $machine = @(':\users\', $env:GITHUB_WORKSPACE, $cargoHome, $env:RUNNER_TEMP, $env:COMPUTERNAME) | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() }
           $problems = @()
-          if ($text.Contains('vcruntime') -or $text.Contains('api-ms-win-crt-')) { $problems += 'it needs the Visual C++ runtime DLLs' }
-          if ($text -match '[a-z]:\\users\\') { $problems += 'it contains the path of a user folder' }
+          if ($texts[0].Contains('vcruntime') -or $texts[0].Contains('api-ms-win-crt-')) { $problems += 'it needs the Visual C++ runtime DLLs' }
+          foreach ($m in $machine) {
+            if ($texts | Where-Object { $_.Contains($m) }) { $problems += "it contains '$m', a path or name of the build machine" }
+          }
           # DLLs are loaded from System32 only (DependentLoadFlags 0x800, set in build.rs).
           $pe = [BitConverter]::ToInt32($b, 0x3C)
           $opt = $pe + 24
@@ -111,11 +120,13 @@ jobs:
           REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
-          hash=$(cut -d' ' -f1 deskfolds.exe.sha256)
-          printf 'Download **deskfolds.exe** below and see [Install](https://github.com/%s#install) in the README.\n\nSHA-256 of deskfolds.exe: `%s`\n' "$REPO" "$hash" > notes.md
+          # The exe is the one the build job hashed.
+          sha256sum --check --strict deskfolds.exe.sha256
+          hash=$(cut -d' ' -f1 deskfolds.exe.sha256 | tr 'a-f' 'A-F')
+          notes=$(printf 'Download **deskfolds.exe** below and see [Install](https://github.com/%s#install) in the README.\n\nSHA-256 of deskfolds.exe: `%s`' "$REPO" "$hash")
           if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
             # A release made by hand for this tag: the files are added to it.
             gh release upload "$TAG" deskfolds.exe deskfolds.exe.sha256 --repo "$REPO" --clobber
           else
-            gh release create "$TAG" deskfolds.exe deskfolds.exe.sha256 --repo "$REPO" --verify-tag --title "deskfolds $TAG" --notes-file notes.md --generate-notes
+            gh release create "$TAG" deskfolds.exe deskfolds.exe.sha256 --repo "$REPO" --verify-tag --title "deskfolds $TAG" --notes "$notes" --generate-notes
           fi
