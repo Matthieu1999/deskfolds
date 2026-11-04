@@ -68,6 +68,16 @@ pub fn wrap(text: &str, width: i32, max_lines: usize, measure: impl Fn(&str) -> 
 /// The folders stacked under `labels[from]`: touching its bottom within `gap`
 /// and overlapping its column, then the ones stacked under those, and so on.
 pub fn stacked_below(labels: &[Rect], from: usize, gap: i32) -> Vec<usize> {
+    stacked(labels, from, gap, true)
+}
+
+/// The folders stacked above `labels[from]`: their bottom touching its top
+/// within `gap` and overlapping its column, then the ones stacked above those.
+pub fn stacked_above(labels: &[Rect], from: usize, gap: i32) -> Vec<usize> {
+    stacked(labels, from, gap, false)
+}
+
+fn stacked(labels: &[Rect], from: usize, gap: i32, below: bool) -> Vec<usize> {
     let mut chain = vec![from];
     let mut k = 0;
     while k < chain.len() {
@@ -77,7 +87,7 @@ pub fn stacked_below(labels: &[Rect], from: usize, gap: i32) -> Vec<usize> {
                 continue;
             }
             let overlap = a.right().min(b.right()) - a.x.max(b.x);
-            let dy = b.y - a.bottom();
+            let dy = if below { b.y - a.bottom() } else { a.y - b.bottom() };
             if overlap > 10 && dy >= -2 && dy <= gap + 4 {
                 chain.push(j);
             }
@@ -88,12 +98,70 @@ pub fn stacked_below(labels: &[Rect], from: usize, gap: i32) -> Vec<usize> {
     chain
 }
 
+/// The folders that open the same way as `labels[me]`: the folders stacked
+/// above and under it, and theirs, and every folder of the arrangement
+/// (`arranged`) once one of them is in it. `me` comes first.
+pub fn group(labels: &[Rect], arranged: &[bool], me: usize, gap: i32) -> Vec<usize> {
+    let mut group = vec![me];
+    let mut k = 0;
+    while k < group.len() {
+        let i = group[k];
+        let mut next = stacked_below(labels, i, gap);
+        next.extend(stacked_above(labels, i, gap));
+        if arranged[i] {
+            next.extend((0..labels.len()).filter(|&j| arranged[j]));
+        }
+        for j in next {
+            if !group.contains(&j) {
+                group.push(j);
+            }
+        }
+        k += 1;
+    }
+    group
+}
+
 /// Whether a folder whose label is at `top` opens upwards: when it does not fit
 /// below but fits above, or, fitting nowhere, when there is more room above.
 pub fn opens_up(top: i32, closed_h: i32, open_h: i32, area: Rect) -> bool {
     let fits_below = top + open_h <= area.bottom();
     let fits_above = top + closed_h - open_h >= area.y;
     !fits_below && (fits_above || top + closed_h - area.y > area.bottom() - top)
+}
+
+/// Whether `labels[me]` of `group` opens upwards (`extras`: how much taller
+/// each folder is when open). A folder alone follows `opens_up`. The folders of
+/// a group open the same way: downwards when the tallest of them fits below
+/// the group with every folder it pushes, otherwise upwards when that fits
+/// above, otherwise towards the side with more room. A folder that does not
+/// fit that way itself, but fits the other way, opens the other way.
+pub fn group_opens_up(labels: &[Rect], extras: &[i32], group: &[usize], me: usize, area: Rect) -> bool {
+    let a = labels[me];
+    if group.len() <= 1 {
+        return opens_up(a.y, a.h, a.h + extras[me], area);
+    }
+    let top = group.iter().map(|&i| labels[i].y).min().unwrap_or(a.y);
+    let bottom = group.iter().map(|&i| labels[i].bottom()).max().unwrap_or(a.bottom());
+    let extra = group.iter().map(|&i| extras[i]).max().unwrap_or(0);
+    let up = if bottom + extra <= area.bottom() {
+        false
+    } else if top - extra >= area.y {
+        true
+    } else {
+        top - area.y > area.bottom() - bottom
+    };
+    let fits_down = a.bottom() + extras[me] <= area.bottom();
+    let fits_up = a.y - extras[me] >= area.y;
+    match up {
+        true if !fits_up && fits_down => false,
+        false if !fits_down && fits_up => true,
+        _ => up,
+    }
+}
+
+/// Whether folders pushed by `by` pixels (negative: up) all stay on the screen.
+pub fn pushes_fit(labels: &[Rect], pushed: &[usize], by: i32, area: Rect) -> bool {
+    pushed.iter().all(|&j| labels[j].y + by >= area.y && labels[j].bottom() + by <= area.bottom())
 }
 
 /// Where a moved folder snaps, and the folders it snaps to.
@@ -378,6 +446,86 @@ mod tests {
         assert_eq!(stacked_below(&labels, 0, 8), [1, 2]);
         assert_eq!(stacked_below(&labels, 1, 8), [2]);
         assert!(stacked_below(&labels, 3, 8).is_empty());
+    }
+
+    #[test]
+    fn folders_stacked_above_are_found_step_by_step() {
+        let apps = Rect { x: 24, y: 24, w: 240, h: 36 };
+        let media = Rect { x: 24, y: 68, w: 240, h: 36 };
+        let tools = Rect { x: 24, y: 112, w: 240, h: 36 };
+        let games = Rect { x: 272, y: 112, w: 240, h: 36 };
+        let labels = [apps, media, tools, games];
+        assert_eq!(stacked_above(&labels, 2, 8), [1, 0]);
+        assert_eq!(stacked_above(&labels, 1, 8), [0]);
+        assert!(stacked_above(&labels, 0, 8).is_empty());
+        assert!(stacked_above(&labels, 3, 8).is_empty());
+    }
+
+    /// A grid of 3 × 2 folders 36 px high whose bottom row ends at `bottom`.
+    fn grid_at(bottom: i32) -> Vec<Rect> {
+        let mut labels = Vec::new();
+        for row in 0..2 {
+            for col in 0..3 {
+                let y = bottom - 36 - (1 - row) * 44;
+                labels.push(Rect { x: 24 + col * 248, y, w: 240, h: 36 });
+            }
+        }
+        labels
+    }
+
+    #[test]
+    fn a_group_is_the_stack_or_the_whole_arrangement() {
+        let mut labels = grid_at(500);
+        labels.push(Rect { x: 1200, y: 100, w: 240, h: 36 });
+        // Not arranged: each column of the grid is a stack of its own.
+        let free = [false; 7];
+        assert_eq!(group(&labels, &free, 0, 8), [0, 3]);
+        assert_eq!(group(&labels, &free, 6, 8), [6]);
+        // Arranged: the whole arrangement, but not the folder away from it.
+        let arranged = [true, true, true, true, true, true, false];
+        let mut g = group(&labels, &arranged, 4, 8);
+        g.sort();
+        assert_eq!(g, [0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn a_group_opens_the_same_way_for_every_folder() {
+        let all = [0, 1, 2, 3, 4, 5];
+        let extras = [200, 80, 120, 200, 40, 160];
+        // At the bottom of the screen: every folder opens upwards, the top row too.
+        let low = grid_at(1040 - 8);
+        assert!(all.iter().all(|&i| group_opens_up(&low, &extras, &all, i, SCREEN)));
+        // Higher, the top row would fit below on its own, as today, but the group
+        // with its tallest folder does not: still upwards, for every folder.
+        let middle = grid_at(1040 - 150);
+        assert!(!opens_up(middle[1].y, 36, 36 + extras[1], SCREEN));
+        assert!(all.iter().all(|&i| group_opens_up(&middle, &extras, &all, i, SCREEN)));
+        // With room below for the tallest and what it pushes: every folder opens downwards.
+        let high = grid_at(600);
+        assert!(all.iter().all(|&i| !group_opens_up(&high, &extras, &all, i, SCREEN)));
+    }
+
+    #[test]
+    fn a_folder_that_cannot_open_the_group_s_way_opens_the_other_way() {
+        // Two tall folders in the middle of the screen: the group fits neither way
+        // and opens upwards, where there is more room (500 px against 460), but
+        // the top folder only fits below.
+        let labels = [Rect { x: 24, y: 500, w: 240, h: 36 }, Rect { x: 24, y: 544, w: 240, h: 36 }, Rect { x: 24, y: 900, w: 240, h: 36 }];
+        let column = [0, 1];
+        let extras = [502, 600];
+        assert!(group_opens_up(&labels, &extras, &column, 1, SCREEN));
+        assert!(!group_opens_up(&labels, &extras, &column, 0, SCREEN));
+        // A folder alone keeps the old rule.
+        assert!(group_opens_up(&labels, &[0, 0, 300], &[2], 2, SCREEN));
+        assert!(!group_opens_up(&labels, &[50, 0, 0], &[0], 0, SCREEN));
+    }
+
+    #[test]
+    fn pushes_never_put_a_folder_off_the_screen() {
+        let labels = grid_at(1040 - 8);
+        assert!(pushes_fit(&labels, &[0, 1], -300, SCREEN));
+        assert!(!pushes_fit(&labels, &[3], 20, SCREEN));
+        assert!(!pushes_fit(&labels, &[0], -2000, SCREEN));
     }
 
     #[test]

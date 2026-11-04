@@ -19,8 +19,9 @@ place: they don't move unless you unlock them.
   An **arrangement** keeps them in a row, a column or a grid of as many
   columns or rows as you want, in a corner, on an edge or in the center of a
   screen; drag its frame to move them all at once. An opening folder pushes
-  the folders stacked under it down instead of covering them, and opens
-  upwards near the bottom of the screen.
+  the folders stacked under or above it out of its way instead of covering
+  them. Folders that touch open the same way, upwards near the bottom of the
+  screen, and are never pushed off it.
 - **Any shortcut**: programs, documents, folders, `.lnk` files and URIs
   (`https://…`, `ms-settings:…`), with their real Windows icons.
 - **Glass look**: the blurred acrylic background used by the Start menu,
@@ -221,7 +222,7 @@ update: they are in `%APPDATA%\deskfolds`, not in the program.
 | Open the menu | Right-click a panel or the tray icon, or click the tray icon once |
 | Open Settings | Double-click the tray icon, or menu > **Settings…** (from a panel's menu: **Edit '<name>'…**) |
 | Create a folder | Menu > **New folder**, or Settings > Folders > **New folder** |
-| Delete a folder | Settings > Folders > **Delete…**. Files you moved into it go back to the desktop, or stay in its storage folder if you choose so |
+| Delete a folder | Right-click it > **Delete '…'…**, or Settings > Folders > **Delete…**. Both ask first. Files you moved into it go back to the desktop, or stay in its storage folder if you choose so |
 | Rename, resize, reorder folders | Settings > Folders: name, width, columns, position, ▲ ▼. Type a number in the box next to a slider, or use its arrows or the Up/Down keys (Shift: ten steps) |
 | Arrange folders | Settings > Folders > **Arrange all…** (row, column or grid), or Settings > Layout > **Arrange all folders**. The folders form an **arrangement**: they stay in its shape and place, and are placed again when one is added, removed, renamed or resized |
 | Move the whole arrangement | While unlocked, drag its frame (the dashed outline with a blue tab). It snaps to the corners, edges and center of the screen; hold **Alt** to place it freely, press **Esc** to put it back. Or pick its place, offset and screen in Settings > Layout |
@@ -279,9 +280,10 @@ can see what you are editing.
   launching a shortcut, lock folders in place, start with Windows, and the
   storage folder for new folders.
 - **Layout**: snap when moving, the gap kept between folders, what happens
-  when a folder opens over the ones below it (**Push the folders below** or
-  **Cover them**), the open direction (**Automatic** opens upwards when there
-  is no room below, or **Always down**), whether folders stay closed or all
+  when a folder opens over the ones under or above it (**Push the folders
+  next to it** or **Cover them**), the open direction (**Automatic**: folders
+  that touch open the same way, upwards when there is no room below them; or
+  **Always down**), whether folders stay closed or all
   open while unlocked, the cell width and the width of new folders.
   **Arrangement**: its shape (**Row**, **Column**, or **Grid** of N
   **columns**, filled left to right, or N **rows**, filled top to bottom),
@@ -387,13 +389,16 @@ change always reaches the right one and the config file stays clean.
 
 ## Limitations
 
-- Folders open downwards, or upwards when there is no room below. In the
-  **Fit the name** title style, an open folder is wider than its label and
-  can go past the right edge of the screen.
-- Only the folders stacked right under an open one (within the gap) are
-  pushed down; folders further away are covered while it is open. While the
-  mouse is on a folder that was pushed down, the folder above stays open, so
-  the folder under the mouse never moves.
+- Folders open downwards, or upwards when there is no room below. Folders
+  that touch (an arrangement, or folders snapped together) open the same way:
+  downwards when the tallest of them fits below with every folder it pushes,
+  otherwise upwards. In the **Fit the name** title style, an open folder is
+  wider than its label and can go past the right edge of the screen.
+- Only the folders stacked right under or above an open one (within the gap)
+  are pushed; folders further away are covered while it is open. When pushing
+  would put a folder past the edge of the screen, the open folder covers them
+  instead. While the mouse is on a folder that was pushed away, the folder
+  that pushed it stays open, so the folder under the mouse never moves.
 - Positions are screen pixels. When a monitor is unplugged, its panels show
   on the nearest one; they return when it comes back. An arrangement on a
   screen that is unplugged goes to the main screen, and back when it returns.

@@ -46,6 +46,7 @@ const ID_NEW_FOLDER: usize = 102;
 const ID_LOCK: usize = 103;
 const ID_AUTOSTART: usize = 104;
 const ID_QUIT: usize = 105;
+const ID_DELETE_FOLDER: usize = 106;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
@@ -56,7 +57,7 @@ thread_local! {
     static ASKING: Cell<bool> = const { Cell::new(false) };
     /// Ignore the button release that ends a double-click on the tray icon.
     static SKIP_CLICK: Cell<bool> = const { Cell::new(false) };
-    /// (open folder, folder it pushes down), from the last push update.
+    /// (open folder, folder it pushes away), from the last push update.
     static STACKS: RefCell<Vec<(HWND, HWND)>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -222,9 +223,10 @@ fn update_pushes() {
 }
 
 /// Places every folder for this moment of the animations: the folders stacked
-/// under open ones are pushed down by how far those reach, the others are put
-/// back. All the moves go to Windows in one batch, so no frame shows some
-/// folders moved and others not.
+/// under (or above) open ones are pushed down (or up) by how far those reach,
+/// the others are put back. A folder that would push one past the edge of the
+/// screen covers them instead. All the moves go to Windows in one batch, so no
+/// frame shows some folders moved and others not.
 pub fn relayout() {
     panel::pushes_handled();
     let (push_below, gap) = store::with(|s| (s.settings.push_below, s.settings.gap));
@@ -239,15 +241,25 @@ pub fn relayout() {
             .map(|(h, g)| layout::Rect { h: g.label.h.max(arrange::row_height(*h).unwrap_or(0)), ..g.label })
             .collect();
         for (i, (opener, g)) in list.iter().enumerate() {
-            if g.extra <= 0 && !g.open_down {
+            if g.extra <= 0 && !g.open {
                 continue;
             }
             // An open folder of the "fit" style is wider than its label.
             let mut column = labels.clone();
             column[i].w = g.open_w;
-            for j in layout::stacked_below(&column, i, scale(gap, g.dpi)) {
-                offsets[j] += g.extra;
-                if g.open_down {
+            let gap = scale(gap, g.dpi);
+            let pushed = if g.up { layout::stacked_above(&column, i, gap) } else { layout::stacked_below(&column, i, gap) };
+            let sign = if g.up { -1 } else { 1 };
+            // Checked with the full height, so the pushed folders do not jump
+            // back half-way through the animation.
+            let now: Vec<layout::Rect> = labels.iter().zip(&offsets).map(|(l, o)| layout::Rect { y: l.y + o, ..*l }).collect();
+            let area = panel::work_area_at(g.label.x + g.label.w / 2, g.label.y + g.label.h / 2);
+            if !layout::pushes_fit(&now, &pushed, sign * (g.open_h - g.label.h), area) {
+                continue;
+            }
+            for j in pushed {
+                offsets[j] += sign * g.extra;
+                if g.open {
                     stacks.push((*opener, list[j].0));
                 }
             }
@@ -282,16 +294,39 @@ pub fn relayout() {
     }
 }
 
-/// The cursor is on a folder that this open folder pushes down.
+/// The cursor is on a folder that this open folder pushes away: that folder
+/// is the window under it (a window over the folders covers them).
 pub fn cursor_in_stack(opener: HWND) -> bool {
     let mut pt = POINT { x: 0, y: 0 };
-    unsafe { GetCursorPos(&mut pt) };
-    let pushed: Vec<HWND> = STACKS.with(|s| s.borrow().iter().filter(|(o, _)| *o == opener).map(|(_, p)| *p).collect());
-    pushed.into_iter().any(|h| {
-        let mut r = unsafe { std::mem::zeroed() };
-        let found = unsafe { GetWindowRect(h, &mut r) } != 0;
-        found && pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom
-    })
+    if unsafe { GetCursorPos(&mut pt) } == 0 {
+        return false;
+    }
+    let under = unsafe { GetAncestor(WindowFromPoint(pt), GA_ROOT) };
+    !under.is_null() && STACKS.with(|s| s.borrow().iter().any(|&(o, p)| o == opener && p == under))
+}
+
+/// Whether the folder in `hwnd` opens upwards: its label `label` grows by
+/// `extra` when open. It opens like the folders of its group: its
+/// arrangement, or the folders stacked with it (see `layout::group_opens_up`).
+pub fn opens_up(hwnd: HWND, label: layout::Rect, extra: i32, arranged: bool, dpi: u32) -> bool {
+    let gap = scale(store::with(|s| s.settings.gap), dpi);
+    // A folder of the arrangement counts as tall as its row, as for pushing.
+    let row = |h: HWND, l: layout::Rect| layout::Rect { h: l.h.max(arrange::row_height(h).unwrap_or(0)), ..l };
+    let mut labels = vec![row(hwnd, label)];
+    let mut extras = vec![extra];
+    let mut in_arrangement = vec![arranged];
+    for h in panels().into_iter().filter(|&h| h != hwnd) {
+        if let Some(g) = panel::geometry(h)
+            && !g.moving
+        {
+            labels.push(row(h, g.label));
+            extras.push(g.open_h - g.label.h);
+            in_arrangement.push(g.arranged);
+        }
+    }
+    let area = panel::work_area_at(label.x + label.w / 2, label.y + label.h / 2);
+    let group = layout::group(&labels, &in_arrangement, 0, gap);
+    layout::group_opens_up(&labels, &extras, &group, 0, area)
 }
 
 /// The labels of every other folder, for snapping a moved one.
@@ -436,12 +471,13 @@ fn tray_data(main: HWND) -> NOTIFYICONDATAW {
 fn show_menu(main: HWND, panel: Option<u32>) {
     check_config_file();
     let title = panel.and_then(|id| store::with(|s| s.panel(id).map(|p| p.title.clone())));
-    let edit_label = title.map(|t| format!("Edit '{}'…", ui::menu_text(&t)));
+    let edit_label = title.as_ref().map(|t| format!("Edit '{}'…", ui::menu_text(t)));
+    let delete_label = title.as_ref().map(|t| format!("Delete '{}'…", ui::menu_text(t)));
     let locked = LOCKED.load(Ordering::Relaxed);
     let autostart = if util::autostart_enabled() { MF_CHECKED } else { MF_UNCHECKED };
     let mut entries: Vec<MenuEntry> = Vec::new();
-    if let Some(label) = &edit_label {
-        entries.extend([(ID_EDIT_FOLDER, label.as_str(), 0), ui::SEPARATOR]);
+    if let (Some(edit), Some(delete)) = (&edit_label, &delete_label) {
+        entries.extend([(ID_EDIT_FOLDER, edit.as_str(), 0), (ID_DELETE_FOLDER, delete.as_str(), 0), ui::SEPARATOR]);
     }
     entries.extend([
         (ID_SETTINGS, "Settings…", 0),
@@ -454,8 +490,16 @@ fn show_menu(main: HWND, panel: Option<u32>) {
     ]);
     let mut at = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut at) };
-    match ui::popup_menu(main, &entries, at) {
+    let chosen = ui::popup_menu(main, &entries, at);
+    // The mouse may have left the folder while the menu was open.
+    panel::after_menu();
+    match chosen {
         ID_EDIT_FOLDER => open_settings(panel),
+        ID_DELETE_FOLDER => {
+            if let Some(id) = panel {
+                settings::delete_folder(settings::owner().unwrap_or(main), id);
+            }
+        }
         ID_SETTINGS => open_settings(None),
         ID_NEW_FOLDER => {
             let id = new_folder();

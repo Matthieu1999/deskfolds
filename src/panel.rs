@@ -20,6 +20,7 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE};
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::System::SystemServices::{MK_CONTROL, MK_LBUTTON};
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
@@ -172,15 +173,21 @@ pub struct PanelState {
     icons: Vec<HICON>,
 }
 
-/// Where a panel's label is and how far the panel reaches below it now.
+/// Where a panel's label is and how far the panel reaches past it now.
 pub struct Geometry {
     pub label: layout::Rect,
     /// Width of the panel when open (wider than the label in the "fit" style).
     pub open_w: i32,
-    /// How far it reaches below its label now (0 while it opens upwards).
+    /// Height of the panel when fully open.
+    pub open_h: i32,
+    /// How far it reaches past its label now: below it, or above it (`up`).
     pub extra: i32,
-    /// Open or opening downwards.
-    pub open_down: bool,
+    /// Opening upwards (or closing, after it opened upwards).
+    pub up: bool,
+    /// Open or opening (not closing).
+    pub open: bool,
+    /// In the arrangement.
+    pub arranged: bool,
     pub dpi: u32,
     pub moving: bool,
 }
@@ -325,18 +332,18 @@ impl PanelState {
     }
 
     /// An open folder that moved or changed size picks its direction again.
-    fn choose_direction(&mut self) {
+    fn choose_direction(&mut self, hwnd: HWND) {
         if self.open {
-            self.up = self.settings.open_upwards && self.needs_up();
+            self.up = self.settings.open_upwards && self.needs_up(hwnd);
         }
     }
 
-    /// Opening now would go past the bottom of the screen, and there is more room above.
-    fn needs_up(&self) -> bool {
+    /// It opens upwards: the folders it opens with (its arrangement, or the
+    /// folders stacked with it) have no room below, see `layout::group_opens_up`.
+    fn needs_up(&self, hwnd: HWND) -> bool {
         let (w, closed_h) = self.closed_size();
-        let open_h = self.open_size().1;
-        let top = self.pos.1 + self.push;
-        layout::opens_up(top, closed_h, open_h, work_area_at(self.pos.0 + w / 2, top + closed_h / 2))
+        let label = layout::Rect { x: self.pos.0, y: self.pos.1, w, h: closed_h };
+        crate::opens_up(hwnd, label, self.open_size().1 - closed_h, self.cfg.arranged, self.dpi)
     }
 
     fn size(&self) -> (i32, i32) {
@@ -693,7 +700,7 @@ pub fn update(hwnd: HWND, cfg: &Panel, settings: &Settings) {
         enable_glass(hwnd, &st.settings);
     }
     st.place();
-    st.choose_direction();
+    st.choose_direction(hwnd);
     apply_size(hwnd, st);
     // Switched between "all open" and "open on hover" while unlocked.
     if open_all_changed && !locked() {
@@ -710,7 +717,7 @@ pub fn update(hwnd: HWND, cfg: &Panel, settings: &Settings) {
 pub fn reposition(hwnd: HWND) {
     let Some(st) = state(hwnd) else { return };
     st.place();
-    st.choose_direction();
+    st.choose_direction(hwnd);
     apply_size(hwnd, st);
 }
 
@@ -737,11 +744,15 @@ pub fn geometry(hwnd: HWND) -> Option<Geometry> {
     let st = state(hwnd)?;
     let (w, h) = st.closed_size();
     let now_h = st.size().1;
+    let (open_w, open_h) = st.open_size();
     Some(Geometry {
         label: layout::Rect { x: st.pos.0, y: st.pos.1, w, h },
-        open_w: st.open_size().0,
-        extra: if st.up { 0 } else { (now_h - h).max(0) },
-        open_down: st.open && !st.up,
+        open_w,
+        open_h,
+        extra: (now_h - h).max(0),
+        up: st.up,
+        open: st.open,
+        arranged: st.cfg.arranged,
         dpi: st.dpi,
         moving: st.moving,
     })
@@ -1046,7 +1057,7 @@ fn set_open(hwnd: HWND, st: &mut PanelState, open: bool) {
         return;
     }
     if open && st.progress <= 0.0 {
-        st.up = st.settings.open_upwards && st.needs_up();
+        st.up = st.settings.open_upwards && st.needs_up(hwnd);
     }
     st.open = open;
     st.hover = None;
@@ -1116,15 +1127,43 @@ fn cursor_x() -> i32 {
 }
 
 /// The cursor is over the window (its name or its shortcuts).
+/// The mouse is on the panel itself: the panel is the window under it. A
+/// window over the panel covers it, even inside its rectangle. A menu of
+/// deskfolds over the panel (its right-click menu) still counts as the panel.
 fn cursor_inside(hwnd: HWND) -> bool {
     let mut pt = POINT { x: 0, y: 0 };
     let mut r: RECT = unsafe { std::mem::zeroed() };
-    let found = unsafe { GetCursorPos(&mut pt) != 0 && GetWindowRect(hwnd, &mut r) != 0 };
-    found
-        && pt.x >= r.left
-        && pt.x < r.right
-        && pt.y >= r.top
-        && pt.y < r.bottom
+    if unsafe { GetCursorPos(&mut pt) == 0 || GetWindowRect(hwnd, &mut r) == 0 } {
+        return false;
+    }
+    let in_rect = pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
+    let under = unsafe { WindowFromPoint(pt) };
+    if under.is_null() || !in_rect {
+        return false;
+    }
+    unsafe { GetAncestor(under, GA_ROOT) == hwnd || is_own_menu(under) }
+}
+
+/// A popup menu (window class "#32768") of this thread.
+fn is_own_menu(hwnd: HWND) -> bool {
+    let mut class = [0u16; 16];
+    let n = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) };
+    let ours = unsafe { GetWindowThreadProcessId(hwnd, null_mut()) == GetCurrentThreadId() };
+    ours && String::from_utf16_lossy(&class[..n.max(0) as usize]) == "#32768"
+}
+
+/// A menu of deskfolds closed: an open folder the mouse is no longer on closes
+/// after the usual delay, as when the mouse leaves it.
+pub fn after_menu() {
+    let locked = locked();
+    for hwnd in crate::panels() {
+        if let Some(st) = state(hwnd)
+            && st.open
+            && !cursor_inside(hwnd)
+        {
+            on_leave(hwnd, st, locked);
+        }
+    }
 }
 
 /// The mouse is over the panel: stop closing, and open after the hover delay.
@@ -1441,7 +1480,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             WM_RBUTTONUP => {
                 let (x, y) = mouse();
                 match st.hit(x, y) {
-                    Hit::Item(i) if !locked => item_menu(hwnd, st, i),
+                    Hit::Item(i) if !locked => {
+                        item_menu(hwnd, st, i);
+                        // The mouse may have gone elsewhere while the menu was open.
+                        if let Some(st) = state(hwnd)
+                            && !cursor_inside(hwnd)
+                        {
+                            on_leave(hwnd, st, locked);
+                        }
+                    }
                     _ => {
                         PostMessageW(st.main, WM_APP_SHOW_MENU, st.cfg.id as usize, 0);
                     }

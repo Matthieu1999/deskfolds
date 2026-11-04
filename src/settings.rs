@@ -522,6 +522,57 @@ pub fn owner() -> Option<HWND> {
     (!hwnd.is_null()).then_some(hwnd)
 }
 
+/// Asks whether to delete the folder `id` (and what to do with the files moved
+/// into it), and deletes it. True once it is deleted.
+pub fn delete_folder(owner: HWND, id: u32) -> bool {
+    const DELETE: i32 = 1000;
+    const TO_DESKTOP: i32 = 2000;
+    const KEEP: i32 = 2001;
+    let Some((title, total, moved, storage)) = store::with(|s| {
+        let p = s.panel(id)?;
+        let moved = p.items.iter().filter(|it| s.is_stored(id, it)).count();
+        Some((p.title.clone(), p.items.len(), moved, s.storage_of(id)))
+    }) else {
+        return false;
+    };
+    let instruction = format!("Delete the folder '{title}'?");
+    let content = if moved > 0 {
+        format!("It holds {total} shortcut(s); {moved} of them are files you moved into it. What should happen to those files?")
+    } else if total > 0 {
+        format!("Its {total} shortcut(s) are links: the files they open are not touched.")
+    } else {
+        "This folder is empty.".to_string()
+    };
+    let keep = format!("Keep them in {}", storage.display());
+    let radios = [(TO_DESKTOP, "Move them back to the desktop"), (KEEP, keep.as_str())];
+    let (button, radio) = ui::ask(
+        owner,
+        &Ask {
+            instruction: &instruction,
+            content: &content,
+            buttons: &[(DELETE, "Delete folder")],
+            default_button: DELETE,
+            radios: if moved > 0 { &radios[..] } else { &[] },
+            default_radio: TO_DESKTOP,
+            warning: true,
+            footer: Some("deskfolds never deletes a file."),
+            ..Default::default()
+        },
+    );
+    if button != DELETE {
+        return false;
+    }
+    let errors = store::change(|s| s.delete_panel(id, moved > 0 && radio != KEEP));
+    if !errors.is_empty() {
+        error_box(&format!(
+            "Some files could not be moved back to the desktop. They are still in {}:\n\n{}",
+            storage.display(),
+            errors.join("\n")
+        ));
+    }
+    true
+}
+
 /// Something changed (the store, the lock, autostart): refresh the window.
 pub fn on_store_changed() {
     if let Some(w) = win(WINDOW.get()) {
@@ -952,13 +1003,13 @@ impl Win {
         self.number(cx, 106, 64, L_GAP);
         self.label("px", cx + 72, 106, 30);
         self.label("When a folder opens", lx, 150, 200);
-        self.radio(cx, 150, L_PUSH, "Push the folders below", 150);
+        self.radio(cx, 150, L_PUSH, "Push the folders next to it", 178);
         self.radio(cx + 184, 150, L_COVER, "Cover them", 90);
-        self.help("Folders stacked right under it slide down while it is open, and come back when it closes.", lx, 172, 600);
+        self.help("Folders stacked right under or above it slide away while it is open, and come back when it closes.", lx, 172, 600);
         self.label("Open direction", lx, 196, 200);
         self.radio(cx, 196, L_AUTO, "Automatic", 80);
         self.radio(cx + 114, 196, L_DOWN, "Always down", 96);
-        self.help("Automatic opens a folder upwards when there is no room below it.", lx, 218, 600);
+        self.help("Automatic: folders that touch open the same way, upwards when there is no room below them.", lx, 218, 600);
         self.label("While unlocked", lx, 242, 200);
         self.radio(cx, 242, L_CLOSED, "Folders stay closed, open on hover", 210);
         self.radio(cx + 244, 242, L_OPEN_ALL, "All folders open", 120);
@@ -1683,53 +1734,10 @@ impl Win {
     }
 
     fn delete_folder(&mut self, id: u32) {
-        const DELETE: i32 = 1000;
-        const TO_DESKTOP: i32 = 2000;
-        const KEEP: i32 = 2001;
-        let Some((title, total, moved, storage)) = store::with(|s| {
-            let p = s.panel(id)?;
-            let moved = p.items.iter().filter(|it| s.is_stored(id, it)).count();
-            Some((p.title.clone(), p.items.len(), moved, s.storage_of(id)))
-        }) else {
-            return;
-        };
-        let instruction = format!("Delete the folder '{title}'?");
-        let content = if moved > 0 {
-            format!("It holds {total} shortcut(s); {moved} of them are files you moved into it. What should happen to those files?")
-        } else if total > 0 {
-            format!("Its {total} shortcut(s) are links: the files they open are not touched.")
-        } else {
-            "This folder is empty.".to_string()
-        };
-        let keep = format!("Keep them in {}", storage.display());
-        let radios = [(TO_DESKTOP, "Move them back to the desktop"), (KEEP, keep.as_str())];
-        let (button, radio) = ui::ask(
-            self.hwnd,
-            &Ask {
-                instruction: &instruction,
-                content: &content,
-                buttons: &[(DELETE, "Delete folder")],
-                default_button: DELETE,
-                radios: if moved > 0 { &radios[..] } else { &[] },
-                default_radio: TO_DESKTOP,
-                warning: true,
-                footer: Some("deskfolds never deletes a file."),
-                ..Default::default()
-            },
-        );
-        if button != DELETE {
-            return;
+        if delete_folder(self.hwnd, id) {
+            self.panel = None;
+            self.item = None;
         }
-        let errors = store::change(|s| s.delete_panel(id, moved > 0 && radio != KEEP));
-        if !errors.is_empty() {
-            error_box(&format!(
-                "Some files could not be moved back to the desktop. They are still in {}:\n\n{}",
-                storage.display(),
-                errors.join("\n")
-            ));
-        }
-        self.panel = None;
-        self.item = None;
     }
 
     fn restore_backup(&mut self) {

@@ -60,9 +60,10 @@ item_lines = 1                # lines for a shortcut's name under its icon (1 or
 
 # Arranging folders. While unlocked, a moved folder snaps to the edges of the
 # other folders and of the screen, gap pixels away (hold Alt to place it
-# freely). An opening folder pushes the folders stacked right under it down
-# (push_below = false: it covers them), and opens upwards when there is no
-# room below (open_upwards = false: always downwards).
+# freely). An opening folder pushes the folders stacked right under or above
+# it out of its way (push_below = false: it covers them). Folders that touch
+# open the same way, upwards when there is no room below them
+# (open_upwards = false: always downwards).
 snap = true
 gap = 8
 push_below = true

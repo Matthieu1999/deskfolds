@@ -907,6 +907,10 @@ mod tests {
         store.update_panel(apps, |p| p.title = "Tools".into());
         store.move_item(docs, apps, 1).unwrap();
         store.update_settings(|s| s.font_size = 15);
+        // A storage folder that does not exist, so a real "Games" folder in
+        // Documents\deskfolds does not turn the new one into "Games (2)".
+        let root = std::env::temp_dir().join(format!("deskfolds-test-{}-none", std::process::id()));
+        store.update_settings(|s| s.storage_dir = root.to_string_lossy().to_string());
         let new = store.add_panel("Games", 10, 20, 300);
         store.delete_panel(folders, false);
 

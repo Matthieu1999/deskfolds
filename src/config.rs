@@ -40,9 +40,9 @@ pub struct Settings {
     pub snap: bool,
     /// Space kept between folders by snapping, pushing and arranging.
     pub gap: i32,
-    /// An opening folder pushes the folders stacked right under it down.
+    /// An opening folder pushes the folders stacked right under or above it out of its way.
     pub push_below: bool,
-    /// A folder with no room below opens upwards.
+    /// Folders with no room below open upwards, with the folders they touch.
     pub open_upwards: bool,
     /// While unlocked, every folder is open (otherwise they open on hover).
     pub unlocked_open_all: bool,
