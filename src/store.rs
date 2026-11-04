@@ -236,6 +236,18 @@ fn sync_settings(t: &mut Table, s: &Settings) {
     put(t, "unlocked_open_all", V::Bool(s.unlocked_open_all), s.unlocked_open_all == d.unlocked_open_all);
     put(t, "cell_width", V::Int(s.cell_width as i64), s.cell_width == d.cell_width);
     put(t, "new_folder_width", V::Int(s.new_folder_width as i64), s.new_folder_width == d.new_folder_width);
+    for (key, value, default) in [
+        ("arrange_shape", &s.arrange_shape, &d.arrange_shape),
+        ("arrange_by", &s.arrange_by, &d.arrange_by),
+        ("arrange_anchor", &s.arrange_anchor, &d.arrange_anchor),
+        ("arrange_screen", &s.arrange_screen, &d.arrange_screen),
+    ] {
+        put(t, key, V::Str(value), value == default);
+    }
+    put(t, "arrange_count", V::Int(s.arrange_count as i64), s.arrange_count == d.arrange_count);
+    put(t, "arrange_offset_x", V::Int(s.arrange_offset_x as i64), s.arrange_offset_x == d.arrange_offset_x);
+    put(t, "arrange_offset_y", V::Int(s.arrange_offset_y as i64), s.arrange_offset_y == d.arrange_offset_y);
+    put(t, "new_folders_join", V::Bool(s.new_folders_join), s.new_folders_join == d.new_folders_join);
 }
 
 fn sync_panel(t: &mut Table, p: &Panel) {
@@ -245,6 +257,7 @@ fn sync_panel(t: &mut Table, p: &Panel) {
     put(t, "width", V::Int(p.width as i64), p.width == DEFAULT_WIDTH);
     put(t, "columns", V::Int(p.columns as i64), p.columns == DEFAULT_COLUMNS);
     put(t, "fit_columns", V::Bool(p.fit_columns), !p.fit_columns);
+    put(t, "arranged", V::Bool(p.arranged), !p.arranged);
     put_opt(t, "icon", p.icon.as_deref());
     put_opt(t, "storage", p.storage.as_deref());
 }
@@ -638,6 +651,7 @@ impl Store {
             icon: None,
             storage: Some(storage),
             fit_columns: false,
+            arranged: false,
             items: Vec::new(),
         });
         self.push(Change::Added(id));
@@ -703,6 +717,24 @@ impl Store {
             }
         }
         if self.panels[i] != before {
+            self.push(Change::Panel(id));
+        }
+    }
+
+    /// Puts panels in the arrangement, or frees them.
+    pub fn set_arranged(&mut self, ids: &[u32], on: bool) {
+        for &id in ids {
+            self.update_panel(id, |p| p.arranged = on);
+        }
+    }
+
+    /// Moves a panel to `index` in the list (the order of the arrangement).
+    pub fn move_panel_to(&mut self, id: u32, index: usize) {
+        let Some(i) = self.panel_index(id) else { return };
+        let panel = self.panels.remove(i);
+        let at = index.min(self.panels.len());
+        self.panels.insert(at, panel);
+        if at != i {
             self.push(Change::Panel(id));
         }
     }
@@ -994,6 +1026,25 @@ storage_dir = '{}'", base.display()));
         assert_eq!((s.push_below, s.title_style.as_str(), s.gap), (false, "left", 12));
         assert!(config.panels[0].fit_columns && !config.panels[1].fit_columns);
         assert_eq!((config.panels[1].x, config.panels[1].y), (300, 6));
+    }
+
+    #[test]
+    fn the_arrangement_is_saved_with_its_folders() {
+        let mut store = store_from("[[panel]]\ntitle = \"A\"\n\n[[panel]]\ntitle = \"B\"\n\n[[panel]]\ntitle = \"C\"\n");
+        let ids: Vec<u32> = store.panels.iter().map(|p| p.id).collect();
+        store.set_arranged(&ids[..2], true);
+        store.move_panel_to(ids[2], 0);
+        store.update_settings(|s| {
+            s.arrange_anchor = "bottom_right".into();
+            s.arrange_offset_x = -20;
+        });
+        let text = saved_text(&mut store);
+        assert!(!text.contains("arrange_shape") && !text.contains("new_folders_join"), "{text}");
+        let config = config::parse(&text).unwrap();
+        let titles: Vec<_> = config.panels.iter().map(|p| (p.title.as_str(), p.arranged)).collect();
+        assert_eq!(titles, [("C", false), ("A", true), ("B", true)]);
+        assert_eq!(config.settings.arrange_spec().anchor, (2, 2));
+        assert_eq!(config.settings.arrange_offset_x, -20);
     }
 
     #[test]

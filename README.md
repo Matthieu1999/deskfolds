@@ -8,15 +8,17 @@ away and it folds back. Click its name to pin it open. Panels are locked in
 place: they don't move unless you unlock them.
 
 - **Native and light**: one small program, with no framework or runtime to
-  install. About 560 KB on disk, 5 to 10 MB of memory, and no CPU use while
-  idle (it only wakes up when you use it).
+  install. About 640 KB on disk, about 5 MB of memory, and no CPU use while
+  idle (it only wakes up when you use it). See [Size and memory](#size-and-memory).
 - **Locked in place**: panels don't move while locked, and other programs
   cannot move them either.
 - **Stays on the desktop**: always below normal windows, never takes focus,
   no taskbar button, and stays visible after *Show desktop* (Win+D).
-- **Easy to arrange**: folders snap next to each other while you move them,
-  and can be put in a row, a column or a grid in one click. An opening folder
-  pushes the folders stacked under it down instead of covering them, and opens
+- **Easy to arrange**: folders snap next to each other while you move them.
+  An **arrangement** keeps them in a row, a column or a grid of as many
+  columns or rows as you want, in a corner, on an edge or in the center of a
+  screen; drag its frame to move them all at once. An opening folder pushes
+  the folders stacked under it down instead of covering them, and opens
   upwards near the bottom of the screen.
 - **Any shortcut**: programs, documents, folders, `.lnk` files and URIs
   (`https://…`, `ms-settings:…`), with their real Windows icons.
@@ -156,7 +158,10 @@ and on again from it.
 | Create a folder | Menu > **New folder**, or Settings > Folders > **New folder** |
 | Delete a folder | Settings > Folders > **Delete…**. Files you moved into it go back to the desktop, or stay in its storage folder if you choose so |
 | Rename, resize, reorder folders | Settings > Folders: name, width, columns, position, ▲ ▼. Type a number in the box next to a slider, or use its arrows or the Up/Down keys (Shift: ten steps) |
-| Arrange folders | Settings > Folders > **Arrange all…**, or Settings > Layout: **In a row**, **In a column** or **As a grid**, from the top left of the main screen |
+| Arrange folders | Settings > Folders > **Arrange all…** (row, column or grid), or Settings > Layout > **Arrange all folders**. The folders form an **arrangement**: they stay in its shape and place, and are placed again when one is added, removed, renamed or resized |
+| Move the whole arrangement | While unlocked, drag its frame (the dashed outline with a blue tab). It snaps to the corners, edges and center of the screen; hold **Alt** to place it freely. Or pick its place, offset and screen in Settings > Layout |
+| Change a folder's place in the arrangement | While unlocked, drag the folder inside the frame: a dashed slot shows where it goes and the others make room. The Folders list follows |
+| Take a folder out of the arrangement, or add one | While unlocked, drag it out of the frame (it stays where you drop it) or into it. Or tick **In the arrangement** in Settings > Folders, or use **Choose…** in Settings > Layout |
 | Add a shortcut | Drag a file, folder or shortcut onto a panel (a closed panel opens) or onto the shortcut list in Settings. It is **moved** into the folder's storage folder; hold **Ctrl** to keep it where it is and only add a link. Works even while locked. Settings > **Add…** adds links |
 | Edit a shortcut | Settings > Folders: select it, then change its name, arguments or icon |
 | Edit panels on the desktop | Menu > **Unlock panels (move and edit)**, or Settings > Folders > **Move on the desktop**: every panel gets a blue border and opens when you hover it (Settings > Layout can open them all instead) |
@@ -185,11 +190,13 @@ accepts.
 The folder selected in Settings stays open and outlined on the desktop, so you
 can see what you are editing.
 
-- **Folders**: the list of folders, with **New folder**, ▲ ▼ to reorder,
-  **Arrange all…**, and for the selected folder:
-  - its name, icon, width, number of columns and position (in screen pixels);
+- **Folders**: the list of folders, with **New folder**, ▲ ▼ to reorder (also
+  the order of the arrangement), **Arrange all…**, and for the selected folder:
+  - its name, icon, width, number of columns and position (in screen pixels;
+    grayed out when the arrangement places it);
   - **Width follows the columns**: the width becomes columns × the cell width
     (Layout page), so folders with the same number of columns line up;
+  - **In the arrangement**: placed by the arrangement, and moved with it;
   - **Move on the desktop** to unlock all folders and drag them, then **Done**;
   - its storage folder, with **Open** to show it in Explorer;
   - its shortcuts: **Add…**, **Remove**, ▲ ▼, **Open file location**, and
@@ -210,9 +217,15 @@ can see what you are editing.
   when a folder opens over the ones below it (**Push the folders below** or
   **Cover them**), the open direction (**Automatic** opens upwards when there
   is no room below, or **Always down**), whether folders stay closed or all
-  open while unlocked, the cell width, the width of new folders, and the
-  three Arrange buttons (a backup is made first, so **Restore…** can undo
-  it).
+  open while unlocked, the cell width and the width of new folders.
+  **Arrangement**: its shape (**Row**, **Column**, or **Grid** of N
+  **columns**, filled left to right, or N **rows**, filled top to bottom),
+  its place on the screen (one of 9 anchors, an offset in pixels and the
+  screen), the folders in it (**Choose…**), whether new folders join it, and
+  **Arrange all folders** (a backup is made first, so **Restore…** can undo
+  it) or **Free all folders**. Each column is as wide as its widest folder,
+  and an incomplete last row follows the anchor (on the left, centered or on
+  the right).
 - **About & advanced**: the config file, with **Open in Notepad** and
   **Reload**; the previous versions, with **Restore…**; and **Reset…** for the
   appearance, behavior and layout (folders and shortcuts are kept).
@@ -264,7 +277,9 @@ icon = "%SystemRoot%\\ImmersiveControlPanel\\SystemSettings.exe"
 ```
 
 Panel fields: `title`, `x`, `y`, `width`, `columns`, optional `fit_columns`
-(`true`: the width is `columns` × `cell_width`, plus 12 px), optional `icon`
+(`true`: the width is `columns` × `cell_width`, plus 12 px), optional
+`arranged` (`true`: in the arrangement; its `x` and `y` are then written by
+deskfolds each time it places the arrangement), optional `icon`
 (shown next to the name instead of a folder), and `storage`, the folder that holds
 the files dropped into the panel. deskfolds picks it when the panel is created
 (or, in an older config without it, when it is first loaded) and writes it on
@@ -289,9 +304,16 @@ text and highlights show on the glass, and icons come from the shell image
 lists.
 
 Placing folders (wrapping names, finding the folders stacked under an open
-one, snapping, arranging, finding a free spot) is plain geometry in
-`src/layout.rs`, with unit tests. Snapping happens in `WM_MOVING`, while
-Windows moves the folder, so it costs nothing at rest.
+one, snapping, the slots and anchor of the arrangement, finding a free spot)
+is plain geometry in `src/layout.rs`, with unit tests. Snapping happens in
+`WM_MOVING`, while Windows moves the folder, so it costs nothing at rest.
+
+The arrangement (`src/arrange.rs`) places its folders again after every
+change and saves their positions like any other move. Its frame
+(`src/frame.rs`) is a layered window that exists only while folders are
+unlocked; it is kept just under the folders, so they still get the mouse.
+Dragging it moves the folders with it, and on release its anchor and offset
+are saved.
 
 The data lives in one store (`src/store.rs`) that every change goes through:
 panels, drag and drop and the settings window all call it, and it tells the
@@ -308,10 +330,29 @@ change always reaches the right one and the config file stays clean.
   mouse is on a folder that was pushed down, the folder above stays open, so
   the folder under the mouse never moves.
 - Positions are screen pixels. When a monitor is unplugged, its panels show
-  on the nearest one; they return when it comes back.
+  on the nearest one; they return when it comes back. An arrangement on a
+  screen that is unplugged goes to the main screen, and back when it returns.
+- There is one arrangement. Folders that are not in it are placed by hand.
 - The settings window is always dark. Windows' own dialogs (color picker,
   file picker, confirmations) follow their own theme.
 - So far tested only at 100 % display scaling.
+
+## Size and memory
+
+Measured on Windows 11 at 100 % scaling with 12 folders and 82
+shortcuts. "Memory" is what Task Manager shows (the private working set); the
+working set also counts the Windows libraries shared with other programs.
+
+| Situation | Memory | Working set |
+|---|---|---|
+| At rest, folders closed | 4.4 MB | 28 MB |
+| Settings window open, any page | 4.6 MB | 32 MB |
+| Unlocked, with the arrangement's frame | 5.0 MB | 33 MB |
+| After closing the settings window | 5.0 MB | 33 MB |
+
+`deskfolds.exe` is about 640 KB. At rest it uses no CPU (0 ms over 10
+seconds): it only runs when you move the mouse over a folder, open the menu
+or the settings window, or when Windows tells it the screens changed.
 
 ## License
 

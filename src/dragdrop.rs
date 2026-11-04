@@ -14,7 +14,7 @@ use windows_sys::Win32::System::Ole::{
     CF_HDROP, RegisterDragDrop, ReleaseStgMedium, RevokeDragDrop,
 };
 use windows_sys::Win32::UI::Shell::{
-    DragQueryFileW, FOLDERID_Desktop, FOLDERID_Documents, ILClone, ILCreateFromPathW, ILFindLastID, ILFree, ILRemoveLastID,
+    DragQueryFileW, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_RoamingAppData, ILClone, ILCreateFromPathW, ILFindLastID, ILFree, ILRemoveLastID,
     SHCreateDataObject, SHDoDragDrop,
     SHGetKnownFolderPath,
 };
@@ -306,6 +306,11 @@ fn known_folder(id: &GUID) -> Option<PathBuf> {
 
 pub fn desktop_dir() -> Option<PathBuf> {
     known_folder(&FOLDERID_Desktop)
+}
+
+/// The user's roaming AppData folder, wherever APPDATA points.
+pub fn roaming_app_data() -> Option<PathBuf> {
+    known_folder(&FOLDERID_RoamingAppData)
 }
 
 /// Root folder for files moved into panels: `storage_dir`, or Documents\deskfolds.

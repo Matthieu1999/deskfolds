@@ -740,6 +740,21 @@ pub fn set_push(hwnd: HWND, push: i32) {
     unsafe { SetWindowPos(hwnd, HWND_BOTTOM, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE) };
 }
 
+/// Shows the label at (x, y) without saving it: the arrangement it is in is
+/// being moved, or makes room for a dragged folder.
+pub fn set_label(hwnd: HWND, x: i32, y: i32) {
+    let Some(st) = state(hwnd) else { return };
+    if st.moving || st.pos == (x, y) {
+        return;
+    }
+    st.pos = (x, y);
+    let (wx, wy) = st.window_pos();
+    st.shown = (wx, wy);
+    let main = st.main;
+    unsafe { SetWindowPos(hwnd, HWND_BOTTOM, wx, wy, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE) };
+    request_pushes(main);
+}
+
 /// Closes the panel at once, without animation, before a folder is moved. The
 /// one selected in Settings stays open unless it is the one being moved.
 pub fn close_now(hwnd: HWND, moving: bool) {
@@ -1085,6 +1100,13 @@ fn on_leave(hwnd: HWND, st: &mut PanelState, locked: bool) {
 fn snap_moving(hwnd: HWND, st: &PanelState, r: &mut RECT) {
     let dy = st.shown.1 - st.pos.1;
     let (w, h) = st.closed_size();
+    // Over the arrangement's frame, it takes a place there instead of snapping.
+    let mut cursor = POINT { x: 0, y: 0 };
+    unsafe { GetCursorPos(&mut cursor) };
+    if crate::arrange::folder_moving(st.cfg.id, layout::Rect { x: r.left, y: r.top - dy, w, h }, cursor) {
+        crate::show_snap_targets(hwnd, &[]);
+        return;
+    }
     let mut targets = Vec::new();
     if st.settings.snap && unsafe { GetKeyState(VK_MENU as i32) } >= 0 {
         let label = layout::Rect { x: r.left, y: r.top - dy, w, h };
@@ -1176,14 +1198,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 st.shown = (r.left, r.top);
                 let (id, (x, y), main) = (st.cfg.id, st.pos, st.main);
                 crate::show_snap_targets(hwnd, &[]);
-                store::change(|s| {
-                    s.update_panel(id, |p| {
-                        p.x = x;
-                        p.y = y;
-                    })
-                });
+                // Saves it, and puts it into the arrangement or out of it.
+                crate::arrange::folder_dropped(id, x, y);
                 request_pushes(main);
                 return 0;
+            }
+            WM_WINDOWPOSCHANGED => {
+                // Sent to the bottom of the z-order: the arrangement's frame goes back under it.
+                if (*(lparam as *const WINDOWPOS)).flags & SWP_NOZORDER == 0 {
+                    crate::frame::keep_below();
+                }
             }
             WM_NCMOUSEMOVE => {
                 // While unlocked the name is the move handle, outside the client area.

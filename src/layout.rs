@@ -154,62 +154,164 @@ pub fn snap(r: Rect, others: &[Rect], area: Rect, gap: i32, reach: i32) -> Snap 
     Snap { x: if bx.0 <= reach { bx.1 } else { r.x }, y: if by.0 <= reach { by.1 } else { r.y }, with }
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Arrange {
-    /// Side by side from the top left, onto a new row when the screen is full.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Shape {
+    /// One row, onto a new row when the screen is full.
     Row,
-    /// One under the other from the top left, into a new column when full.
+    /// One column, into a new column when the screen is full.
     Column,
-    /// Rows of equal columns, as wide as the widest folder.
+    /// A grid of `count` columns, or of `count` rows.
     Grid,
 }
 
-/// Positions for folders of these closed sizes, in this order, inside `area`.
-pub fn arrange(sizes: &[(i32, i32)], area: Rect, gap: i32, how: Arrange) -> Vec<(i32, i32)> {
-    let (left, top) = (area.x + gap, area.y + gap);
-    let mut out = Vec::with_capacity(sizes.len());
-    match how {
-        Arrange::Row => {
-            let (mut x, mut y, mut row_h) = (left, top, 0);
-            for &(w, h) in sizes {
-                if x > left && x + w > area.right() - gap {
-                    x = left;
-                    y += row_h + gap;
-                    row_h = 0;
-                }
-                out.push((x, y));
-                x += w + gap;
-                row_h = row_h.max(h);
-            }
+/// An arrangement: its shape, and where it sits on the screen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Spec {
+    pub shape: Shape,
+    /// For a grid: the number of columns, or of rows with `by_rows`.
+    pub count: usize,
+    /// A grid of rows is filled top to bottom, then the next column.
+    pub by_rows: bool,
+    /// (horizontal, vertical): 0 = left or top, 1 = center or middle, 2 = right or bottom.
+    pub anchor: (usize, usize),
+    /// Moved by this much from the anchor, in pixels.
+    pub offset: (i32, i32),
+}
+
+/// Where each folder goes inside an arrangement, and its size.
+#[derive(PartialEq, Debug)]
+pub struct Slots {
+    pub pos: Vec<(i32, i32)>,
+    /// The height of each folder's row: a folder lower in the same column is
+    /// stacked under it, even when its own label is shorter than the row.
+    pub heights: Vec<i32>,
+    pub w: i32,
+    pub h: i32,
+}
+
+fn fraction(a: usize) -> f32 {
+    [0.0, 0.5, 1.0][a.min(2)]
+}
+
+/// How many folders of these lengths fit one after the other in `room`.
+fn fitting(lengths: impl Iterator<Item = i32>, room: i32, gap: i32) -> usize {
+    let (mut used, mut n) = (0, 0);
+    for len in lengths {
+        if n > 0 && used + gap + len > room {
+            break;
         }
-        Arrange::Column => {
-            let (mut x, mut y, mut col_w) = (left, top, 0);
-            for &(w, h) in sizes {
-                if y > top && y + h > area.bottom() - gap {
-                    y = top;
-                    x += col_w + gap;
-                    col_w = 0;
-                }
-                out.push((x, y));
-                y += h + gap;
-                col_w = col_w.max(w);
-            }
+        used += if n > 0 { gap } else { 0 } + len;
+        n += 1;
+    }
+    n.max(1)
+}
+
+/// The slots for folders of these closed sizes, in this order. Each column is
+/// as wide as its widest folder and each row as tall as its tallest one. An
+/// incomplete last row (or column) follows the anchor: at the end it keeps to
+/// the columns (rows) above, in the middle it is centered.
+pub fn slots(sizes: &[(i32, i32)], spec: &Spec, area: Rect, gap: i32) -> Slots {
+    let n = sizes.len();
+    if n == 0 {
+        return Slots { pos: Vec::new(), heights: Vec::new(), w: 0, h: 0 };
+    }
+    let (cols, rows, by_column) = match spec.shape {
+        Shape::Row => {
+            let cols = fitting(sizes.iter().map(|s| s.0), area.w - 2 * gap, gap);
+            (cols, n.div_ceil(cols), false)
         }
-        Arrange::Grid => {
-            let cell_w = sizes.iter().map(|s| s.0).max().unwrap_or(0);
-            let per_row = ((area.w - gap) / (cell_w + gap).max(1)).max(1) as usize;
-            let (mut y, mut row_h) = (top, 0);
-            for (i, &(_, h)) in sizes.iter().enumerate() {
-                if i > 0 && i % per_row == 0 {
-                    y += row_h + gap;
-                    row_h = 0;
-                }
-                out.push((left + (i % per_row) as i32 * (cell_w + gap), y));
-                row_h = row_h.max(h);
-            }
+        Shape::Column => {
+            let rows = fitting(sizes.iter().map(|s| s.1), area.h - 2 * gap, gap);
+            (n.div_ceil(rows), rows, true)
+        }
+        Shape::Grid if spec.by_rows => {
+            let rows = spec.count.clamp(1, n);
+            (n.div_ceil(rows), rows, true)
+        }
+        Shape::Grid => {
+            let cols = spec.count.clamp(1, n);
+            (cols, n.div_ceil(cols), false)
+        }
+    };
+    let cell = |i: usize| if by_column { (i / rows, i % rows) } else { (i % cols, i / cols) };
+    let mut col_w = vec![0; cols];
+    let mut row_h = vec![0; rows];
+    for (i, &(w, h)) in sizes.iter().enumerate() {
+        let (c, r) = cell(i);
+        col_w[c] = col_w[c].max(w);
+        row_h[r] = row_h[r].max(h);
+    }
+    let starts = |lengths: &[i32]| {
+        let mut acc = 0;
+        lengths
+            .iter()
+            .map(|&l| {
+                let start = acc;
+                acc += l + gap;
+                start
+            })
+            .collect::<Vec<i32>>()
+    };
+    let (xs, ys) = (starts(&col_w), starts(&row_h));
+    let w = xs[cols - 1] + col_w[cols - 1];
+    let h = ys[rows - 1] + row_h[rows - 1];
+    let mut pos: Vec<(i32, i32)> = (0..n).map(|i| (xs[cell(i).0], ys[cell(i).1])).collect();
+    let (fx, fy) = (fraction(spec.anchor.0), fraction(spec.anchor.1));
+    if !by_column && !n.is_multiple_of(cols) && fx > 0.0 {
+        let used = n % cols;
+        let shift = ((w - (xs[used - 1] + col_w[used - 1])) as f32 * fx).round() as i32;
+        for (k, p) in pos[n - used..].iter_mut().enumerate() {
+            p.0 = if fx >= 1.0 { xs[cols - used + k] } else { p.0 + shift };
         }
     }
-    out
+    if by_column && !n.is_multiple_of(rows) && fy > 0.0 {
+        let used = n % rows;
+        let shift = ((h - (ys[used - 1] + row_h[used - 1])) as f32 * fy).round() as i32;
+        for (k, p) in pos[n - used..].iter_mut().enumerate() {
+            p.1 = if fy >= 1.0 { ys[rows - used + k] } else { p.1 + shift };
+        }
+    }
+    let heights = (0..n).map(|i| row_h[cell(i).1]).collect();
+    Slots { pos, heights, w, h }
+}
+
+/// Where the anchor puts a w × h arrangement in `area`, `gap` from the edges.
+fn anchored(w: i32, h: i32, anchor: (usize, usize), area: Rect, gap: i32) -> (i32, i32) {
+    let along = |start: i32, len: i32, size: i32, f: f32| (start as f32 + gap as f32 + f * (len - 2 * gap - size) as f32).round() as i32;
+    (along(area.x, area.w, w, fraction(anchor.0)), along(area.y, area.h, h, fraction(anchor.1)))
+}
+
+/// The top left corner of a w × h arrangement: at its anchor, plus its offset.
+pub fn origin(w: i32, h: i32, spec: &Spec, area: Rect, gap: i32) -> (i32, i32) {
+    let (x, y) = anchored(w, h, spec.anchor, area, gap);
+    (x + spec.offset.0, y + spec.offset.1)
+}
+
+/// The nearest anchor for a w × h arrangement put at (x, y), and the offset
+/// from it, so that `origin` puts it back exactly there.
+pub fn anchor_of(x: i32, y: i32, w: i32, h: i32, area: Rect, gap: i32) -> ((usize, usize), (i32, i32)) {
+    let nearest = |p: i32, base: &dyn Fn(usize) -> i32| {
+        let k = (0..3).min_by_key(|&k| (p - base(k)).abs()).unwrap_or(0);
+        (k, p - base(k))
+    };
+    let (kh, ox) = nearest(x, &|k| anchored(w, h, (k, 0), area, gap).0);
+    let (kv, oy) = nearest(y, &|k| anchored(w, h, (0, k), area, gap).1);
+    ((kh, kv), (ox, oy))
+}
+
+/// Snaps a w × h arrangement moved to (x, y) onto the nearest anchor within
+/// `reach`, separately for X and Y. Also says which axes snapped.
+pub fn snap_block(x: i32, y: i32, w: i32, h: i32, area: Rect, gap: i32, reach: i32) -> (i32, i32, bool, bool) {
+    let ((kh, kv), (ox, oy)) = anchor_of(x, y, w, h, area, gap);
+    let (bx, by) = anchored(w, h, (kh, kv), area, gap);
+    let (sx, sy) = (ox.abs() <= reach, oy.abs() <= reach);
+    (if sx { bx } else { x }, if sy { by } else { y }, sx, sy)
+}
+
+/// The slot whose top left corner is nearest to `at`.
+pub fn nearest_slot(slots: &[(i32, i32)], at: (i32, i32)) -> usize {
+    let d = |p: &(i32, i32)| (p.0 - at.0) as i64 * (p.0 - at.0) as i64 + (p.1 - at.1) as i64 * (p.1 - at.1) as i64;
+    (0..slots.len()).min_by_key(|&i| d(&slots[i])).unwrap_or(0)
 }
 
 /// The first spot from the top left of `area` where a w × h folder keeps `gap`
@@ -307,25 +409,85 @@ mod tests {
         assert_eq!(snap(corner, &[], SCREEN, 8, 10), Snap { x: 8, y: 1040 - 36 - 8, with: vec![] });
     }
 
+    fn grid(count: usize, by_rows: bool, anchor: (usize, usize)) -> Spec {
+        Spec { shape: Shape::Grid, count, by_rows, anchor, offset: (0, 0) }
+    }
+
+    const AREA: Rect = Rect { x: 0, y: 0, w: 1000, h: 600 };
+
     #[test]
-    fn arranging_in_a_row_wraps_at_the_screen_edge() {
-        let sizes = [(800, 36), (800, 50), (800, 36)];
-        assert_eq!(arrange(&sizes, SCREEN, 8, Arrange::Row), [(8, 8), (816, 8), (8, 66)]);
+    fn a_grid_of_columns_fills_rows_first() {
+        let s = slots(&[(100, 40); 9], &grid(3, false, (0, 0)), AREA, 8);
+        assert_eq!((s.w, s.h, s.pos[1], s.pos[3]), (316, 136, (108, 0), (0, 48)));
     }
 
     #[test]
-    fn arranging_in_a_column_stacks_with_the_gap() {
-        let sizes = [(240, 36), (200, 52), (240, 36)];
-        assert_eq!(arrange(&sizes, SCREEN, 8, Arrange::Column), [(8, 8), (8, 52), (8, 112)]);
-        let small = Rect { x: 0, y: 0, w: 1920, h: 120 };
-        assert_eq!(arrange(&sizes, small, 8, Arrange::Column), [(8, 8), (8, 52), (256, 8)]);
+    fn a_grid_of_rows_fills_columns_first() {
+        let s = slots(&[(100, 40); 9], &grid(2, true, (0, 0)), AREA, 8);
+        assert_eq!((s.h, s.pos[1], s.pos[2]), (88, (0, 48), (108, 0)));
     }
 
     #[test]
-    fn arranging_as_a_grid_uses_equal_columns() {
-        let sizes = [(240, 36), (200, 52), (240, 36)];
-        let narrow = Rect { x: 0, y: 0, w: 600, h: 1040 };
-        assert_eq!(arrange(&sizes, narrow, 8, Arrange::Grid), [(8, 8), (256, 8), (8, 68)]);
+    fn an_incomplete_last_row_follows_the_anchor() {
+        let centered = slots(&[(100, 40); 8], &grid(3, false, (1, 0)), AREA, 8);
+        assert_eq!((centered.pos[6], centered.pos[7]), ((54, 96), (162, 96)));
+        let right = slots(&[(100, 40); 8], &grid(3, false, (2, 0)), AREA, 8);
+        assert_eq!(right.pos[6], (108, 96));
+        // Filled by columns, at the bottom: the last column keeps to the rows.
+        let mut sizes = vec![(100, 40); 5];
+        sizes[0].1 = 60;
+        let bottom = slots(&sizes, &grid(2, true, (0, 2)), AREA, 8);
+        assert_eq!(bottom.pos[4], (216, bottom.pos[1].1));
+    }
+
+    #[test]
+    fn each_column_is_as_wide_as_its_widest_folder() {
+        let s = slots(&[(100, 40), (150, 60), (100, 40), (100, 40)], &grid(2, false, (0, 0)), AREA, 8);
+        assert_eq!((s.pos[1].0, s.w), (108, 258));
+        // The first row is as tall as its tallest folder, for each of its folders.
+        assert_eq!(s.heights, [60, 60, 40, 40]);
+    }
+
+    #[test]
+    fn rows_and_columns_wrap_at_the_screen_edge() {
+        let row = Spec { shape: Shape::Row, ..grid(1, false, (0, 0)) };
+        let s = slots(&[(250, 33); 12], &row, AREA, 8);
+        // 4 × 250 + 3 gaps is wider than 1000 - 2 × 8.
+        assert_eq!((s.pos[2], s.pos[3]), ((516, 0), (0, 41)));
+        let column = Spec { shape: Shape::Column, ..row };
+        let c = slots(&[(250, 100); 6], &column, AREA, 8);
+        assert_eq!((c.pos[4], c.pos[5]), ((0, 432), (258, 0)));
+    }
+
+    #[test]
+    fn the_anchor_and_offset_place_the_arrangement() {
+        let top_right = Spec { anchor: (2, 0), ..grid(3, false, (0, 0)) };
+        assert_eq!(origin(316, 136, &top_right, AREA, 8), (676, 8));
+        let centered = Spec { anchor: (1, 1), offset: (10, -5), ..top_right };
+        assert_eq!(origin(316, 136, &centered, AREA, 8), (352, 227));
+    }
+
+    #[test]
+    fn a_moved_arrangement_gets_the_nearest_anchor_and_keeps_its_place() {
+        assert_eq!(anchor_of(680, 10, 316, 136, AREA, 8), ((2, 0), (4, 2)));
+        for (x, y) in [(3, 400), (345, 230), (700, 500), (120, 15)] {
+            let (anchor, offset) = anchor_of(x, y, 316, 136, AREA, 8);
+            let spec = Spec { anchor, offset, ..grid(3, false, (0, 0)) };
+            assert_eq!(origin(316, 136, &spec, AREA, 8), (x, y));
+        }
+    }
+
+    #[test]
+    fn a_moved_arrangement_snaps_to_an_anchor() {
+        // 7 px from the horizontal center, far from any vertical anchor.
+        assert_eq!(snap_block(349, 150, 316, 136, AREA, 8, 10), (342, 150, true, false));
+        assert_eq!(snap_block(5, 590 - 136 - 3, 316, 136, AREA, 8, 10), (8, 456, true, true));
+    }
+
+    #[test]
+    fn the_nearest_slot_wins() {
+        assert_eq!(nearest_slot(&[(0, 0), (108, 0), (0, 48)], (100, 10)), 1);
+        assert_eq!(nearest_slot(&[(0, 0), (108, 0), (0, 48)], (5, 40)), 2);
     }
 
     #[test]
