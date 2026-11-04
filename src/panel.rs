@@ -244,7 +244,11 @@ impl PanelState {
     }
 
     fn style(&self) -> TitleStyle {
-        self.settings.title_style()
+        match self.settings.title_style() {
+            // With no icon, "icon above" is a centered name.
+            TitleStyle::IconAbove if !self.settings.show_folder_icon => TitleStyle::Centered,
+            style => style,
+        }
     }
 
     /// The panel's width in pixels: its own, or columns × cell width.
@@ -252,8 +256,17 @@ impl PanelState {
         self.scale(self.cfg.shown_width(&self.settings))
     }
 
+    /// Size of the folder's icon next to its name: 0 when icons are off.
     fn label_icon(&self) -> i32 {
+        if !self.settings.show_folder_icon {
+            return 0;
+        }
         self.scale(if self.style() == TitleStyle::IconAbove { BIG_ICON } else { 16 })
+    }
+
+    /// Space between the folder's icon and its name: none without an icon.
+    fn icon_gap(&self) -> i32 {
+        if self.settings.show_folder_icon { self.scale(8) } else { 0 }
     }
 
     /// Width of the shortcut count badge, or 0 when it is not shown.
@@ -267,7 +280,7 @@ impl PanelState {
         let badge = if self.settings.show_count { self.badge_w() + self.scale(6) } else { 0 };
         let room = match self.style() {
             TitleStyle::IconAbove => w - self.scale(24),
-            _ => w - self.scale(12 + 16 + 8 + 12 + PIN_ROOM) - badge,
+            _ => w - self.scale(12 + 12 + PIN_ROOM) - self.label_icon() - self.icon_gap() - badge,
         };
         room.max(self.scale(24))
     }
@@ -335,7 +348,7 @@ impl PanelState {
             return (self.width_px(), l.title_h);
         }
         let badge = if self.settings.show_count { self.badge_w() + self.scale(6) } else { 0 };
-        let w = self.scale(12) + l.label_icon + self.scale(8) + self.title_text_w + badge + self.scale(14);
+        let w = self.scale(12) + l.label_icon + self.icon_gap() + self.title_text_w + badge + self.scale(14);
         (w.min(self.width_px()), l.title_h)
     }
 
@@ -439,7 +452,11 @@ impl PanelState {
         };
         self.font = make_font(FW_NORMAL as i32);
         self.title_font = make_font(FW_SEMIBOLD as i32);
-        self.title_icon = load_icon(self.cfg.icon.as_deref().unwrap_or(DEFAULT_PANEL_ICON), self.label_icon());
+        self.title_icon = if self.settings.show_folder_icon {
+            load_icon(self.cfg.icon.as_deref().unwrap_or(DEFAULT_PANEL_ICON), self.label_icon())
+        } else {
+            null_mut()
+        };
         let size = self.scale(self.settings.icon_size);
         self.icons = self
             .cfg
@@ -726,7 +743,8 @@ pub fn update(hwnd: HWND, cfg: &Panel, settings: &Settings) {
         || st.cfg.items.iter().zip(&cfg.items).any(|(a, b)| a.path != b.path || a.icon != b.icon)
         || st.settings.font_size != settings.font_size
         || st.settings.icon_size != settings.icon_size
-        || st.settings.title_style() != settings.title_style();
+        || st.settings.title_style() != settings.title_style()
+        || st.settings.show_folder_icon != settings.show_folder_icon;
     let glass = st.settings.tint != settings.tint || st.settings.tint_opacity != settings.tint_opacity;
     let open_all_changed = st.settings.unlocked_open_all != settings.unlocked_open_all;
     if st.cfg.title != cfg.title {
@@ -1828,7 +1846,7 @@ unsafe fn draw_title(dc: HDC, st: &PanelState, l: &Layout, top: i32, w: i32, acc
             TitleStyle::Fit => {
                 let cy = top + l.title_h / 2;
                 draw_icon(s(12), cy - icon / 2);
-                let text_left = s(12) + icon + s(8);
+                let text_left = s(12) + icon + st.icon_gap();
                 let pin_space = if st.pinned { s(18) } else { 0 };
                 let badge_space = if count { st.badge_w() + s(6) } else { 0 };
                 let right = w - s(8) - pin_space - badge_space;
@@ -1844,13 +1862,13 @@ unsafe fn draw_title(dc: HDC, st: &PanelState, l: &Layout, top: i32, w: i32, acc
                 let room = st.title_wrap_width();
                 let block_w = st.title_lines.iter().map(|t| text_width(dc, t)).max().unwrap_or(0).min(room);
                 let badge_space = if count { s(6) + st.badge_w() } else { 0 };
-                let group_w = icon + s(8) + block_w + badge_space;
+                let group_w = icon + st.icon_gap() + block_w + badge_space;
                 let min_x = s(12);
                 let max_x = w - s(12 + PIN_ROOM) - group_w;
                 let gx = if style == TitleStyle::Centered { ((w - group_w) / 2).min(max_x).max(min_x) } else { min_x };
                 let cy = top + l.title_h / 2;
                 draw_icon(gx, cy - icon / 2);
-                let tx = gx + icon + s(8);
+                let tx = gx + icon + st.icon_gap();
                 let y0 = cy - st.title_lines.len() as i32 * st.line_h / 2;
                 let align = if style == TitleStyle::Centered { DT_CENTER } else { DT_LEFT };
                 for (k, line) in st.title_lines.iter().enumerate() {

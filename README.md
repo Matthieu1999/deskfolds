@@ -272,7 +272,9 @@ can see what you are editing.
   the glass tint and its strength, the accent, text, hover and border colors,
   the text and icon sizes, and the open/close animation. **Folder titles**:
   centered, on the left, with the icon above the name, or **Fit the name**
-  (a label only as wide as the name, on one line); how many lines a long name
+  (a label only as wide as the name, on one line); **Folder icon**: an icon
+  next to the name, or none (then no icon can be chosen, and the icons chosen
+  before come back when it is turned on again); how many lines a long name
   may take (then it ends with "…"); the number of shortcuts next to the
   name; and shortcut names on one or two lines.
 - **Behavior**: open folders on hover (when off, a folder opens and closes by

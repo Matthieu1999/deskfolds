@@ -34,6 +34,9 @@ pub struct Settings {
     pub title_lines: i32,
     /// Shows the number of shortcuts next to the folder name.
     pub show_count: bool,
+    /// Shows the folder's icon next to its name. Off, no icon is shown and none
+    /// can be chosen; the icons chosen before are kept for when it is on again.
+    pub show_folder_icon: bool,
     /// Lines a shortcut name may take under its icon (1 or 2).
     pub item_lines: i32,
     /// A folder being moved snaps to the edges of the others and of the screen.
@@ -125,6 +128,7 @@ impl Default for Settings {
             title_style: "centered".into(),
             title_lines: 2,
             show_count: false,
+            show_folder_icon: true,
             item_lines: 1,
             snap: true,
             gap: 8,

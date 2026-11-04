@@ -228,6 +228,7 @@ fn sync_settings(t: &mut Table, s: &Settings) {
     put(t, "title_style", V::Str(&s.title_style), s.title_style == d.title_style);
     put(t, "title_lines", V::Int(s.title_lines as i64), s.title_lines == d.title_lines);
     put(t, "show_count", V::Bool(s.show_count), s.show_count == d.show_count);
+    put(t, "show_folder_icon", V::Bool(s.show_folder_icon), s.show_folder_icon == d.show_folder_icon);
     put(t, "item_lines", V::Int(s.item_lines as i64), s.item_lines == d.item_lines);
     put(t, "snap", V::Bool(s.snap), s.snap == d.snap);
     put(t, "gap", V::Int(s.gap as i64), s.gap == d.gap);
@@ -1035,6 +1036,25 @@ storage_dir = '{}'", base.display()));
         assert_eq!((s.push_below, s.title_style.as_str(), s.gap), (false, "left", 12));
         assert!(config.panels[0].fit_columns && !config.panels[1].fit_columns);
         assert_eq!((config.panels[1].x, config.panels[1].y), (300, 6));
+    }
+
+    #[test]
+    fn folder_icons_turned_off_are_saved_and_read_back() {
+        let mut store = store_from("[settings]
+font_size = 13
+
+[[panel]]
+title = \"Apps\"
+icon = \"shell32.dll,3\"
+");
+        assert!(store.settings.show_folder_icon);
+        assert!(!saved_text(&mut store).contains("show_folder_icon"));
+        store.update_settings(|s| s.show_folder_icon = false);
+        let text = saved_text(&mut store);
+        let config = config::parse(&text).unwrap();
+        assert!(!config.settings.show_folder_icon, "{text}");
+        // The icon chosen for the folder is kept for when icons are on again.
+        assert_eq!(config.panels[0].icon.as_deref(), Some("shell32.dll,3"));
     }
 
     #[test]

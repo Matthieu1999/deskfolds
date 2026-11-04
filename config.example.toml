@@ -56,6 +56,7 @@ storage_dir = ""
 title_style = "centered"
 title_lines = 2
 show_count = false            # the number of shortcuts next to the name
+show_folder_icon = true       # the folder's icon next to its name (false: none)
 item_lines = 1                # lines for a shortcut's name under its icon (1 or 2)
 
 # Arranging folders. While unlocked, a moved folder snaps to the edges of the

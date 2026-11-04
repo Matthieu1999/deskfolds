@@ -132,6 +132,7 @@ const A_LINES: i32 = 334;
 const A_COUNT: i32 = 336;
 const A_NAMES_1: i32 = 337;
 const A_NAMES_2: i32 = 338;
+const A_FOLDER_ICON: i32 = 339;
 
 const B_HOVER: i32 = 400;
 const B_OPEN: i32 = 401;
@@ -186,7 +187,7 @@ const UPDOWN: i32 = 5000;
 
 const COLOR_BUTTONS: [i32; 5] = [A_TINT, A_ACCENT, A_TEXT, A_HOVER, A_BORDER];
 /// Check boxes that have a caption.
-const CAPTIONED_CHECKS: [i32; 5] = [F_FIT, F_ARRANGED, A_COUNT, L_SNAP, L_JOIN];
+const CAPTIONED_CHECKS: [i32; 6] = [F_FIT, F_ARRANGED, A_COUNT, A_FOLDER_ICON, L_SNAP, L_JOIN];
 const TITLE_STYLES: [(i32, TitleStyle); 4] = [
     (A_STYLE_CENTERED, TitleStyle::Centered),
     (A_STYLE_LEFT, TitleStyle::Left),
@@ -949,20 +950,23 @@ impl Win {
         self.help("0 = no animation", lx, 434, 200);
         self.slider(cx, 410, 330, A_ANIM);
 
-        self.label("Folder titles", lx, 466, 200);
-        self.help("How a closed folder shows its name", lx, 488, 205);
-        self.radio(cx, 466, A_STYLE_CENTERED, "Centered", 70);
-        self.radio(cx + 94, 466, A_STYLE_LEFT, "Left", 46);
-        self.radio(cx + 164, 466, A_STYLE_ICON, "Icon above", 84);
-        self.radio(cx + 274, 466, A_STYLE_FIT, "Fit the name", 96);
-        self.label("Title lines", lx, 512, 200);
-        self.help("A longer name ends with \u{2026}", lx, 534, 205);
-        self.number(cx, 514, 64, A_LINES);
-        self.label("lines at most", cx + 72, 514, 100);
-        self.check_text(cx + 210, 514, A_COUNT, "Show the number of shortcuts", 220);
-        self.label("Shortcut names", lx, 558, 200);
-        self.radio(cx, 558, A_NAMES_1, "One line", 70);
-        self.radio(cx + 94, 558, A_NAMES_2, "Up to two lines", 120);
+        self.label("Folder titles", lx, 456, 200);
+        self.help("How a closed folder shows its name", lx, 478, 205);
+        self.radio(cx, 456, A_STYLE_CENTERED, "Centered", 70);
+        self.radio(cx + 94, 456, A_STYLE_LEFT, "Left", 46);
+        self.radio(cx + 164, 456, A_STYLE_ICON, "Icon above", 84);
+        self.radio(cx + 274, 456, A_STYLE_FIT, "Fit the name", 96);
+        self.label("Folder icon", lx, 500, 200);
+        self.help("Off: no icon, and none can be chosen", lx, 522, 205);
+        self.check_text(cx, 500, A_FOLDER_ICON, "Show an icon next to the name", 240);
+        self.label("Title lines", lx, 544, 200);
+        self.help("A longer name ends with \u{2026}", lx, 566, 205);
+        self.number(cx, 546, 64, A_LINES);
+        self.label("lines at most", cx + 72, 546, 100);
+        self.check_text(cx + 210, 546, A_COUNT, "Show the number of shortcuts", 220);
+        self.label("Shortcut names", lx, 588, 200);
+        self.radio(cx, 588, A_NAMES_1, "One line", 70);
+        self.radio(cx + 94, 588, A_NAMES_2, "Up to two lines", 120);
     }
 
     fn build_behavior(&mut self) {
@@ -1232,6 +1236,8 @@ impl Win {
         for id in [F_NAME, F_ICON, F_DELETE, F_WIDTH, F_WIDTH + 1, F_COLS, F_COLS + 1, F_FIT, F_ARRANGED, F_X, F_Y, F_OPEN, S_ADD, S_LIST] {
             self.enable(id, panel.is_some());
         }
+        // With folder icons off, there is no icon to choose.
+        self.enable(F_ICON, panel.is_some() && settings.show_folder_icon);
         self.enable(F_ARRANGE, !panels.is_empty());
         self.set_text(F_PLACE, if LOCKED.load(std::sync::atomic::Ordering::Relaxed) { "Move on the desktop" } else { "Done" });
 
@@ -1315,6 +1321,7 @@ impl Win {
         // The "fit" style always shows one line.
         self.enable(A_LINES, style != TitleStyle::Fit);
         self.set_check(A_COUNT, s.show_count);
+        self.set_check(A_FOLDER_ICON, s.show_folder_icon);
         self.set_radio(A_NAMES_1, s.item_lines < 2);
         self.set_radio(A_NAMES_2, s.item_lines >= 2);
     }
@@ -1571,6 +1578,10 @@ impl Win {
             A_COUNT => {
                 let on = self.checked(A_COUNT);
                 store::change(|s| s.update_settings(|st| st.show_count = on));
+            }
+            A_FOLDER_ICON => {
+                let on = self.checked(A_FOLDER_ICON);
+                store::change(|s| s.update_settings(|st| st.show_folder_icon = on));
             }
             A_NAMES_1 | A_NAMES_2 => store::change(|s| s.update_settings(|st| st.item_lines = if id == A_NAMES_2 { 2 } else { 1 })),
             L_SNAP => {
