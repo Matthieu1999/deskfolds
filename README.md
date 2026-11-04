@@ -2,10 +2,10 @@
 
 Tiny foldable shortcut panels for the Windows desktop.
 
-Each panel is a small frosted-glass folder label on the desktop. Hover it and
-it unrolls a glass card of shortcuts; move the mouse away and it folds back.
-Click its name to pin it open. Panels are locked in place: they don't move
-unless you unlock them.
+Each panel is a small frosted-glass folder label on the desktop, as wide as
+the folder. Hover it and it unrolls a glass card of shortcuts; move the mouse
+away and it folds back. Click its name to pin it open. Panels are locked in
+place: they don't move unless you unlock them.
 
 - **Native and light**: one small program, with no framework or runtime to
   install. About 560 KB on disk, 5 to 10 MB of memory, and no CPU use while
@@ -14,6 +14,10 @@ unless you unlock them.
   cannot move them either.
 - **Stays on the desktop**: always below normal windows, never takes focus,
   no taskbar button, and stays visible after *Show desktop* (Win+D).
+- **Easy to arrange**: folders snap next to each other while you move them,
+  and can be put in a row, a column or a grid in one click. An opening folder
+  pushes the folders stacked under it down instead of covering them, and opens
+  upwards near the bottom of the screen.
 - **Any shortcut**: programs, documents, folders, `.lnk` files and URIs
   (`https://…`, `ms-settings:…`), with their real Windows icons.
 - **Glass look**: the blurred acrylic background used by the Start menu,
@@ -151,12 +155,13 @@ and on again from it.
 | Open Settings | Double-click the tray icon, or menu > **Settings…** (from a panel's menu: **Edit '<name>'…**) |
 | Create a folder | Menu > **New folder**, or Settings > Folders > **New folder** |
 | Delete a folder | Settings > Folders > **Delete…**. Files you moved into it go back to the desktop, or stay in its storage folder if you choose so |
-| Rename, resize, reorder folders | Settings > Folders: name, width, columns, position, ▲ ▼ |
+| Rename, resize, reorder folders | Settings > Folders: name, width, columns, position, ▲ ▼. Type a number in the box next to a slider, or use its arrows or the Up/Down keys (Shift: ten steps) |
+| Arrange folders | Settings > Folders > **Arrange all…**, or Settings > Layout: **In a row**, **In a column** or **As a grid**, from the top left of the main screen |
 | Add a shortcut | Drag a file, folder or shortcut onto a panel (a closed panel opens) or onto the shortcut list in Settings. It is **moved** into the folder's storage folder; hold **Ctrl** to keep it where it is and only add a link. Works even while locked. Settings > **Add…** adds links |
 | Edit a shortcut | Settings > Folders: select it, then change its name, arguments or icon |
-| Edit panels on the desktop | Menu > **Unlock panels (move and edit)**, or Settings > Folders > **Move on the desktop**: every panel opens with a blue border |
-| Move a panel | While unlocked, drag it by its name |
-| Resize a panel | While unlocked, drag its right edge |
+| Edit panels on the desktop | Menu > **Unlock panels (move and edit)**, or Settings > Folders > **Move on the desktop**: every panel gets a blue border and opens when you hover it (Settings > Layout can open them all instead) |
+| Move a panel | While unlocked, drag it by its name. It snaps to the edges of the other folders and of the screen, keeping a small gap; the folder it snaps to lights up. Hold **Alt** to place it freely |
+| Resize a panel | While unlocked, drag its right edge (not for a folder whose width follows its columns) |
 | Reorder or move shortcuts | While unlocked, drag a shortcut within the panel or onto another panel |
 | Take a shortcut out | While unlocked, drag it onto the desktop or an Explorer window. A file that was moved into the folder goes there. For a link, a shortcut to it is created there and the original stays where it is. Hold **Ctrl** to copy it and keep it in the panel |
 | Rename or remove a shortcut | While unlocked, right-click it. **Remove from folder** puts a moved file back on the desktop; a link is just removed |
@@ -169,17 +174,22 @@ deskfolds never deletes a file: it only moves files, and never overwrites one
 ## The settings window
 
 Every change is saved as soon as you make it: when you press Enter or leave a
-field, release a slider, or click a button. There is no Save button. **Tab**
-moves between fields and **Enter** saves the field you are typing in. **Esc**
-puts back the previous value of that field; when you are not typing, it
-closes the window.
+field, release a slider, click an arrow, or click a button. There is no Save
+button. **Tab** moves between fields and **Enter** saves the field you are
+typing in. **Esc** puts back the previous value of that field; when you are
+not typing, it closes the window. Each slider has a number box next to it:
+type a value, or use its arrows or the Up/Down keys (Shift: ten steps). A
+typed value can go past the slider's range, up to what the config file
+accepts.
 
 The folder selected in Settings stays open and outlined on the desktop, so you
 can see what you are editing.
 
-- **Folders**: the list of folders, with **New folder**, ▲ ▼ to reorder, and
-  for the selected folder:
+- **Folders**: the list of folders, with **New folder**, ▲ ▼ to reorder,
+  **Arrange all…**, and for the selected folder:
   - its name, icon, width, number of columns and position (in screen pixels);
+  - **Width follows the columns**: the width becomes columns × the cell width
+    (Layout page), so folders with the same number of columns line up;
   - **Move on the desktop** to unlock all folders and drag them, then **Done**;
   - its storage folder, with **Open** to show it in Explorer;
   - its shortcuts: **Add…**, **Remove**, ▲ ▼, **Open file location**, and
@@ -187,14 +197,25 @@ can see what you are editing.
     files on the list.
 - **Appearance**: three presets (**Light glass**, **Dark glass**, **Solid**),
   the glass tint and its strength, the accent, text, hover and border colors,
-  the text and icon sizes, and the open/close animation.
+  the text and icon sizes, and the open/close animation. **Folder titles**:
+  centered, on the left, with the icon above the name, or **Fit the name**
+  (a label only as wide as the name, on one line); how many lines a long name
+  may take (then it ends with "…"); the number of shortcuts next to the
+  name; and shortcut names on one or two lines.
 - **Behavior**: open folders on hover (when off, a folder opens and closes by
   clicking its name), the delays before opening and closing, close after
   launching a shortcut, lock folders in place, start with Windows, and the
   storage folder for new folders.
+- **Layout**: snap when moving, the gap kept between folders, what happens
+  when a folder opens over the ones below it (**Push the folders below** or
+  **Cover them**), the open direction (**Automatic** opens upwards when there
+  is no room below, or **Always down**), whether folders stay closed or all
+  open while unlocked, the cell width, the width of new folders, and the
+  three Arrange buttons (a backup is made first, so **Restore…** can undo
+  it).
 - **About & advanced**: the config file, with **Open in Notepad** and
   **Reload**; the previous versions, with **Restore…**; and **Reset…** for the
-  appearance and behavior (folders and shortcuts are kept).
+  appearance, behavior and layout (folders and shortcuts are kept).
 
 ## Configuration
 
@@ -242,8 +263,9 @@ path = "ms-settings:"
 icon = "%SystemRoot%\\ImmersiveControlPanel\\SystemSettings.exe"
 ```
 
-Panel fields: `title`, `x`, `y`, `width`, `columns`, optional `icon` (shown
-next to the name instead of a folder), and `storage`, the folder that holds
+Panel fields: `title`, `x`, `y`, `width`, `columns`, optional `fit_columns`
+(`true`: the width is `columns` × `cell_width`, plus 12 px), optional `icon`
+(shown next to the name instead of a folder), and `storage`, the folder that holds
 the files dropped into the panel. deskfolds picks it when the panel is created
 (or, in an older config without it, when it is first loaded) and writes it on
 the next save. While the folder holds no files, it follows
@@ -266,6 +288,11 @@ Drawing is double-buffered GDI into a 32-bit buffer whose alpha is rebuilt so
 text and highlights show on the glass, and icons come from the shell image
 lists.
 
+Placing folders (wrapping names, finding the folders stacked under an open
+one, snapping, arranging, finding a free spot) is plain geometry in
+`src/layout.rs`, with unit tests. Snapping happens in `WM_MOVING`, while
+Windows moves the folder, so it costs nothing at rest.
+
 The data lives in one store (`src/store.rs`) that every change goes through:
 panels, drag and drop and the settings window all call it, and it tells the
 app which panel to redraw. Panels and shortcuts get ids in memory only, so a
@@ -273,8 +300,13 @@ change always reaches the right one and the config file stays clean.
 
 ## Limitations
 
-- Panels unfold downwards. A panel near the bottom of the screen unfolds
-  partly off-screen.
+- Folders open downwards, or upwards when there is no room below. In the
+  **Fit the name** title style, an open folder is wider than its label and
+  can go past the right edge of the screen.
+- Only the folders stacked right under an open one (within the gap) are
+  pushed down; folders further away are covered while it is open. While the
+  mouse is on a folder that was pushed down, the folder above stays open, so
+  the folder under the mouse never moves.
 - Positions are screen pixels. When a monitor is unplugged, its panels show
   on the nearest one; they return when it comes back.
 - The settings window is always dark. Windows' own dialogs (color picker,

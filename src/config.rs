@@ -26,6 +26,49 @@ pub struct Settings {
     pub accent: String,
     /// Where new folders keep the files dropped into them. Empty = Documents\deskfolds.
     pub storage_dir: String,
+    /// How a closed folder shows its name: "centered", "left", "icon_above" or "fit".
+    pub title_style: String,
+    /// Lines a long folder name may take before it ends with "…".
+    pub title_lines: i32,
+    /// Shows the number of shortcuts next to the folder name.
+    pub show_count: bool,
+    /// Lines a shortcut name may take under its icon (1 or 2).
+    pub item_lines: i32,
+    /// A folder being moved snaps to the edges of the others and of the screen.
+    pub snap: bool,
+    /// Space kept between folders by snapping, pushing and arranging.
+    pub gap: i32,
+    /// An opening folder pushes the folders stacked right under it down.
+    pub push_below: bool,
+    /// A folder with no room below opens upwards.
+    pub open_upwards: bool,
+    /// While unlocked, every folder is open (otherwise they open on hover).
+    pub unlocked_open_all: bool,
+    /// Width of one column, for folders whose width follows their columns.
+    pub cell_width: i32,
+    /// Width given to new folders.
+    pub new_folder_width: i32,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum TitleStyle {
+    /// As wide as the folder, icon and name centered; long names wrap.
+    Centered,
+    /// As wide as the folder, icon and name on the left; long names wrap.
+    Left,
+    /// As wide as the folder, the icon above the name.
+    IconAbove,
+    /// As wide as the name, on one line (the look before deskfolds 0.3).
+    Fit,
+}
+
+impl TitleStyle {
+    pub const ALL: [(TitleStyle, &'static str); 4] =
+        [(TitleStyle::Centered, "centered"), (TitleStyle::Left, "left"), (TitleStyle::IconAbove, "icon_above"), (TitleStyle::Fit, "fit")];
+
+    pub fn name(self) -> &'static str {
+        Self::ALL.iter().find(|(s, _)| *s == self).map_or("centered", |(_, n)| n)
+    }
 }
 
 impl Default for Settings {
@@ -45,6 +88,17 @@ impl Default for Settings {
             border: "#3A3A3A".into(),
             accent: "#4CC2FF".into(),
             storage_dir: String::new(),
+            title_style: "centered".into(),
+            title_lines: 2,
+            show_count: false,
+            item_lines: 1,
+            snap: true,
+            gap: 8,
+            push_below: true,
+            open_upwards: true,
+            unlocked_open_all: false,
+            cell_width: 72,
+            new_folder_width: DEFAULT_WIDTH,
         }
     }
 }
@@ -58,6 +112,18 @@ impl Settings {
         self.animation_ms = self.animation_ms.min(2000);
         self.font_size = self.font_size.clamp(8, 40);
         self.icon_size = self.icon_size.clamp(16, 128);
+        self.title_style = self.title_style().name().to_string();
+        self.title_lines = self.title_lines.clamp(1, 3);
+        self.item_lines = self.item_lines.clamp(1, 2);
+        self.gap = self.gap.clamp(0, 40);
+        self.cell_width = self.cell_width.clamp(40, 200);
+        self.new_folder_width = self.new_folder_width.clamp(MIN_WIDTH, 4000);
+    }
+
+    /// The title style; an unknown name means the default one.
+    pub fn title_style(&self) -> TitleStyle {
+        let name = self.title_style.trim();
+        TitleStyle::ALL.iter().find(|(_, n)| n.eq_ignore_ascii_case(name)).map_or(TitleStyle::Centered, |(s, _)| *s)
     }
 }
 
@@ -82,6 +148,9 @@ pub struct Panel {
     /// renamed, so renaming the panel does not split its files.
     #[serde(default)]
     pub storage: Option<String>,
+    /// The width follows the columns: columns × the cell width of the settings.
+    #[serde(default)]
+    pub fit_columns: bool,
     #[serde(default, rename = "item")]
     pub items: Vec<Item>,
 }
@@ -91,7 +160,15 @@ impl Panel {
         self.columns = self.columns.clamp(1, 20);
         self.width = self.width.clamp(MIN_WIDTH, 4000);
     }
+
+    /// The width it is shown at, in pixels at 100 % scaling.
+    pub fn shown_width(&self, settings: &Settings) -> i32 {
+        if self.fit_columns { self.columns * settings.cell_width + 2 * PANEL_PAD } else { self.width }
+    }
 }
+
+/// Space between a panel's edge and its shortcuts, at 100 % scaling.
+pub const PANEL_PAD: i32 = 6;
 
 #[derive(Deserialize, Clone, PartialEq)]
 pub struct Item {
@@ -191,5 +268,25 @@ mod tests {
         let config = parse("[settings]\nfont_size = 2\n[[panel]]\ntitle = \"A\"\ncolumns = 0\nwidth = 1").unwrap();
         assert_eq!(config.settings.font_size, 8);
         assert_eq!((config.panels[0].columns, config.panels[0].width), (1, MIN_WIDTH));
+    }
+
+    #[test]
+    fn layout_settings_are_read_and_kept_in_range() {
+        let text = "[settings]
+title_style = \"Icon_Above\"
+title_lines = 9
+gap = -3
+push_below = false
+                    [[panel]]
+title = \"A\"
+columns = 3
+fit_columns = true";
+        let config = parse(text).unwrap();
+        let s = &config.settings;
+        assert_eq!((s.title_style(), s.title_style.as_str(), s.title_lines, s.gap, s.push_below), (TitleStyle::IconAbove, "icon_above", 3, 0, false));
+        assert_eq!(config.panels[0].shown_width(s), 3 * 72 + 12);
+        let odd = parse("[settings]
+title_style = \"sideways\"").unwrap();
+        assert_eq!(odd.settings.title_style(), TitleStyle::Centered);
     }
 }
