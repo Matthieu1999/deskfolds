@@ -21,7 +21,6 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, GetClassNameW, GetCursorPos, WindowFromPoint};
 use windows_sys::core::{GUID, HRESULT};
 
-use crate::panel;
 use crate::util::wide;
 
 const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
@@ -108,11 +107,21 @@ struct DropTargetVtbl {
     drop: unsafe extern "system" fn(*mut DropTarget, *mut c_void, u32, POINTL, *mut u32) -> HRESULT,
 }
 
+/// What a window does with files dragged over it. Each function gets the
+/// window, the mouse position in screen pixels, the key state and the effects
+/// the drag source allows; it returns the effect it chose.
+pub struct DropHandler {
+    pub over: fn(HWND, POINT, u32, u32) -> u32,
+    pub leave: fn(HWND),
+    pub drop: fn(HWND, Vec<String>, POINT, u32, u32) -> u32,
+}
+
 #[repr(C)]
 struct DropTarget {
     vtbl: *const DropTargetVtbl,
     refs: Cell<u32>,
     hwnd: HWND,
+    handler: &'static DropHandler,
     accepts: Cell<bool>,
     helper: *mut c_void,
 }
@@ -166,7 +175,7 @@ unsafe extern "system" fn dt_drag_enter(this: *mut DropTarget, data: *mut c_void
         let target = &*this;
         target.accepts.set(has_files(data));
         let point = POINT { x: pt.x, y: pt.y };
-        *effect = if target.accepts.get() { panel::on_drag_over(target.hwnd, point, keys, *effect) } else { 0 };
+        *effect = if target.accepts.get() { (target.handler.over)(target.hwnd, point, keys, *effect) } else { 0 };
         if let Some(h) = helper_vtbl(target.helper) {
             (h.drag_enter)(target.helper, target.hwnd, data, &point, *effect);
         }
@@ -178,7 +187,7 @@ unsafe extern "system" fn dt_drag_over(this: *mut DropTarget, keys: u32, pt: POI
     unsafe {
         let target = &*this;
         let point = POINT { x: pt.x, y: pt.y };
-        *effect = if target.accepts.get() { panel::on_drag_over(target.hwnd, point, keys, *effect) } else { 0 };
+        *effect = if target.accepts.get() { (target.handler.over)(target.hwnd, point, keys, *effect) } else { 0 };
         if let Some(h) = helper_vtbl(target.helper) {
             (h.drag_over)(target.helper, &point, *effect);
         }
@@ -189,7 +198,7 @@ unsafe extern "system" fn dt_drag_over(this: *mut DropTarget, keys: u32, pt: POI
 unsafe extern "system" fn dt_drag_leave(this: *mut DropTarget) -> HRESULT {
     unsafe {
         let target = &*this;
-        panel::on_drag_leave(target.hwnd);
+        (target.handler.leave)(target.hwnd);
         if let Some(h) = helper_vtbl(target.helper) {
             (h.drag_leave)(target.helper);
         }
@@ -206,7 +215,7 @@ unsafe extern "system" fn dt_drop(this: *mut DropTarget, data: *mut c_void, keys
         }
         *effect = if target.accepts.get() {
             let allowed = *effect;
-            panel::on_drop(target.hwnd, dropped_files(data), point, keys, allowed)
+            (target.handler.drop)(target.hwnd, dropped_files(data), point, keys, allowed)
         } else {
             0
         };
@@ -214,8 +223,8 @@ unsafe extern "system" fn dt_drop(this: *mut DropTarget, data: *mut c_void, keys
     S_OK
 }
 
-/// Makes a panel window accept files dragged from Explorer, the desktop or another panel.
-pub fn register(hwnd: HWND) {
+/// Makes a window accept files dragged from Explorer, the desktop or a panel.
+pub fn register(hwnd: HWND, handler: &'static DropHandler) {
     let mut helper: *mut c_void = null_mut();
     unsafe {
         CoCreateInstance(&CLSID_DRAGDROPHELPER, null_mut(), CLSCTX_INPROC_SERVER, &IID_IDROPTARGETHELPER, &mut helper);
@@ -223,6 +232,7 @@ pub fn register(hwnd: HWND) {
             vtbl: &DROP_TARGET_VTBL,
             refs: Cell::new(1),
             hwnd,
+            handler,
             accepts: Cell::new(false),
             helper,
         }));

@@ -1,14 +1,20 @@
 # deskfolds configuration
 #
+# You don't need to edit this file: tray icon > Settings… manages folders,
+# shortcuts, looks and behavior, and saves them here. If you do edit it by
+# hand, deskfolds notices before its next save and asks which version to keep.
+# The last 5 versions are kept in the "backups" folder next to this file.
+#
 # Each [[panel]] is a small glass folder on the desktop. Hover it to open it,
 # move the mouse away to close it, click its name to pin it open, and click a
 # shortcut to launch it. Panels are locked in place: they never move unless
-# you unlock them from the tray icon.
+# you unlock them (tray icon > "Unlock panels", or Settings > Folders >
+# "Move on the desktop").
 #
 # Positions (x, y) are screen pixels from the top-left corner of the main
-# monitor (negative values reach monitors on the left/top). The easiest way
-# to set them: tray icon > "Unlock panels", drag panels by their title bar,
-# then "Lock panels" to save the positions back into this file.
+# monitor (negative values reach monitors on the left/top). If no monitor
+# shows a folder anymore, it is shown on the nearest one until its monitor
+# comes back; its saved position is kept.
 #
 # Sizes (width, font_size, icon_size) are in pixels at 100 % scaling and are
 # scaled automatically with the monitor's DPI.
@@ -37,9 +43,10 @@ hover = "#2E2E2E"
 border = "#3A3A3A"
 accent = "#4CC2FF"            # border and pin marker
 
-# Files dragged into a panel are moved into storage_dir\<panel title>\.
-# Empty = Documents\deskfolds. Hold Ctrl while dropping to keep the file where
-# it is and only add a link to it.
+# Files dragged into a panel are moved into that panel's storage folder: its
+# "storage" key, chosen when the panel is created as storage_dir\<title>\ and
+# never renamed. Empty storage_dir = Documents\deskfolds. Hold Ctrl while
+# dropping to keep the file where it is and only add a link to it.
 storage_dir = ""
 
 [[panel]]
