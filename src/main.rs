@@ -319,7 +319,7 @@ pub fn opens_up(hwnd: HWND, label: layout::Rect, extra: i32, arranged: bool, dpi
         if let Some(g) = panel::geometry(h)
             && !g.moving
         {
-            labels.push(row(h, g.label));
+            labels.push(row(h, layout::Rect { w: g.label.w.max(g.open_w), ..g.label }));
             extras.push(g.open_h - g.label.h);
             in_arrangement.push(g.arranged);
         }
@@ -471,8 +471,10 @@ fn tray_data(main: HWND) -> NOTIFYICONDATAW {
 fn show_menu(main: HWND, panel: Option<u32>) {
     check_config_file();
     let title = panel.and_then(|id| store::with(|s| s.panel(id).map(|p| p.title.clone())));
-    let edit_label = title.as_ref().map(|t| format!("Edit '{}'…", ui::menu_text(t)));
-    let delete_label = title.as_ref().map(|t| format!("Delete '{}'…", ui::menu_text(t)));
+    // The name from the config, on one line and not too long, for the menu.
+    let name = title.as_ref().map(|t| ui::menu_text(&ui::short_name(t, 40)));
+    let edit_label = name.as_ref().map(|t| format!("Edit '{t}'…"));
+    let delete_label = name.as_ref().map(|t| format!("Delete '{t}'…"));
     let locked = LOCKED.load(Ordering::Relaxed);
     let autostart = if util::autostart_enabled() { MF_CHECKED } else { MF_UNCHECKED };
     let mut entries: Vec<MenuEntry> = Vec::new();

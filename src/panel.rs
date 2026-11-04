@@ -370,7 +370,9 @@ impl PanelState {
 
     /// An open folder that moved or changed size picks its direction again.
     fn choose_direction(&mut self, hwnd: HWND) {
-        if self.open {
+        // Not while it is opening or closing: the label window and the layout
+        // follow the direction it started with.
+        if self.open && self.progress >= 1.0 {
             self.up = self.settings.open_upwards && self.needs_up(hwnd);
         }
     }
@@ -379,8 +381,10 @@ impl PanelState {
     /// folders stacked with it) have no room below, see `layout::group_opens_up`.
     fn needs_up(&self, hwnd: HWND) -> bool {
         let (w, closed_h) = self.closed_size();
-        let label = layout::Rect { x: self.pos.0, y: self.pos.1, w, h: closed_h };
-        crate::opens_up(hwnd, label, self.open_size().1 - closed_h, self.cfg.arranged, self.dpi)
+        let (open_w, open_h) = self.open_size();
+        // As wide as it is open: an open "fit" folder is wider than its label.
+        let label = layout::Rect { x: self.pos.0, y: self.pos.1, w: w.max(open_w), h: closed_h };
+        crate::opens_up(hwnd, label, open_h - closed_h, self.cfg.arranged, self.dpi)
     }
 
     fn size(&self) -> (i32, i32) {
@@ -1275,6 +1279,17 @@ fn set_open(hwnd: HWND, st: &mut PanelState, open: bool) {
     } else {
         if st.up {
             lift_label(hwnd, st);
+        } else {
+            // Opening or closing downwards: no label window, and no step of the
+            // last upwards animation left to run (it would stop this one).
+            let was_lifted = st.lifted;
+            hide_label_window(st);
+            if was_lifted {
+                unsafe {
+                    InvalidateRect(hwnd, null(), 0);
+                    UpdateWindow(hwnd);
+                }
+            }
         }
         st.anim_from = st.progress;
         st.anim_start = unsafe { GetTickCount64() };
@@ -1722,7 +1737,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         if let Some(st) = state(hwnd)
                             && !cursor_inside(hwnd)
                         {
-                            on_leave(hwnd, st, locked);
+                            on_leave(hwnd, st, self::locked());
                         }
                     }
                     _ => {

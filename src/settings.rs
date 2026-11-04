@@ -529,14 +529,28 @@ pub fn delete_folder(owner: HWND, id: u32) -> bool {
     const DELETE: i32 = 1000;
     const TO_DESKTOP: i32 = 2000;
     const KEEP: i32 = 2001;
+    thread_local! {
+        static DELETING: Cell<bool> = const { Cell::new(false) };
+    }
+    // One question at a time: another right-click while it is open asks nothing.
+    if DELETING.replace(true) {
+        return false;
+    }
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            DELETING.set(false);
+        }
+    }
+    let _done = Done;
+    let count = |s: &store::Store| s.panel(id).map(|p| p.items.iter().filter(|it| s.is_stored(id, it)).count());
     let Some((title, total, moved, storage)) = store::with(|s| {
         let p = s.panel(id)?;
-        let moved = p.items.iter().filter(|it| s.is_stored(id, it)).count();
-        Some((p.title.clone(), p.items.len(), moved, s.storage_of(id)))
+        Some((p.title.clone(), p.items.len(), count(s)?, s.storage_of(id)))
     }) else {
         return false;
     };
-    let instruction = format!("Delete the folder '{title}'?");
+    let instruction = format!("Delete the folder '{}'?", ui::short_name(&title, 80));
     let content = if moved > 0 {
         format!("It holds {total} shortcut(s); {moved} of them are files you moved into it. What should happen to those files?")
     } else if total > 0 {
@@ -544,8 +558,11 @@ pub fn delete_folder(owner: HWND, id: u32) -> bool {
     } else {
         "This folder is empty.".to_string()
     };
-    let keep = format!("Keep them in {}", storage.display());
+    // A "&" in a radio button would underline the next letter.
+    let keep = ui::menu_text(&format!("Keep them in {}", storage.display()));
     let radios = [(TO_DESKTOP, "Move them back to the desktop"), (KEEP, keep.as_str())];
+    // In front, also when it comes from a folder's menu.
+    unsafe { SetForegroundWindow(owner) };
     let (button, radio) = ui::ask(
         owner,
         &Ask {
@@ -561,6 +578,10 @@ pub fn delete_folder(owner: HWND, id: u32) -> bool {
         },
     );
     if button != DELETE {
+        return false;
+    }
+    // Changed meanwhile (config edited or reloaded): the answer was about other files.
+    if store::with(|s| count(s)) != Some(moved) {
         return false;
     }
     let errors = store::change(|s| s.delete_panel(id, moved > 0 && radio != KEEP));
