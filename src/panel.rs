@@ -20,6 +20,7 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE};
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::System::SystemServices::{MK_CONTROL, MK_LBUTTON};
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
@@ -36,6 +37,8 @@ use crate::ui::{self, MenuEntry};
 use crate::util::{error_box, launch, load_icon, prompt_text, resolve, wide};
 
 const CLASS_NAME: &str = "deskfolds.panel";
+/// The window that shows a folder's label while the folder opens or closes upwards.
+const LABEL_CLASS: &str = "deskfolds.label";
 const OPEN_TIMER: usize = 1;
 const CLOSE_TIMER: usize = 2;
 const ANIM_TIMER: usize = 3;
@@ -124,6 +127,21 @@ pub struct PanelState {
     shown: (i32, i32),
     /// Opening upwards: chosen when it starts opening, kept until it is closed.
     up: bool,
+    /// While it opens or closes upwards, the label is shown by `label_window`
+    /// and the shortcuts keep to the top of the folder. Windows shows a
+    /// window's new size one frame before its new picture, with the old picture
+    /// at the top: a label drawn at the bottom of a folder growing upwards then
+    /// jumps up every other frame, and the shortcuts look doubled. Kept to the
+    /// top, the shortcuts are right in that frame too, and the label window is
+    /// moved and drawn in one go, so it never jumps.
+    lifted: bool,
+    /// The folder stops drawing its label at the next animation step, once the
+    /// label window, shown first, is on the screen (so the label never disappears).
+    lift_next: bool,
+    /// The label window goes away at the next animation step (after the folder
+    /// shows its own label again).
+    unlift_next: bool,
+    label_window: HWND,
     /// What the main window last heard about: position, size, upwards.
     last_reach: Option<((i32, i32), i32, i32, bool)>,
     /// The window's position and size as last given to Windows.
@@ -172,15 +190,21 @@ pub struct PanelState {
     icons: Vec<HICON>,
 }
 
-/// Where a panel's label is and how far the panel reaches below it now.
+/// Where a panel's label is and how far the panel reaches past it now.
 pub struct Geometry {
     pub label: layout::Rect,
     /// Width of the panel when open (wider than the label in the "fit" style).
     pub open_w: i32,
-    /// How far it reaches below its label now (0 while it opens upwards).
+    /// Height of the panel when fully open.
+    pub open_h: i32,
+    /// How far it reaches past its label now: below it, or above it (`up`).
     pub extra: i32,
-    /// Open or opening downwards.
-    pub open_down: bool,
+    /// Opening upwards (or closing, after it opened upwards).
+    pub up: bool,
+    /// Open or opening (not closing).
+    pub open: bool,
+    /// In the arrangement.
+    pub arranged: bool,
     pub dpi: u32,
     pub moving: bool,
 }
@@ -220,7 +244,11 @@ impl PanelState {
     }
 
     fn style(&self) -> TitleStyle {
-        self.settings.title_style()
+        match self.settings.title_style() {
+            // With no icon, "icon above" is a centered name.
+            TitleStyle::IconAbove if !self.settings.show_folder_icon => TitleStyle::Centered,
+            style => style,
+        }
     }
 
     /// The panel's width in pixels: its own, or columns × cell width.
@@ -228,8 +256,17 @@ impl PanelState {
         self.scale(self.cfg.shown_width(&self.settings))
     }
 
+    /// Size of the folder's icon next to its name: 0 when icons are off.
     fn label_icon(&self) -> i32 {
+        if !self.settings.show_folder_icon {
+            return 0;
+        }
         self.scale(if self.style() == TitleStyle::IconAbove { BIG_ICON } else { 16 })
+    }
+
+    /// Space between the folder's icon and its name: none without an icon.
+    fn icon_gap(&self) -> i32 {
+        if self.settings.show_folder_icon { self.scale(8) } else { 0 }
     }
 
     /// Width of the shortcut count badge, or 0 when it is not shown.
@@ -243,7 +280,7 @@ impl PanelState {
         let badge = if self.settings.show_count { self.badge_w() + self.scale(6) } else { 0 };
         let room = match self.style() {
             TitleStyle::IconAbove => w - self.scale(24),
-            _ => w - self.scale(12 + 16 + 8 + 12 + PIN_ROOM) - badge,
+            _ => w - self.scale(12 + 12 + PIN_ROOM) - self.label_icon() - self.icon_gap() - badge,
         };
         room.max(self.scale(24))
     }
@@ -279,7 +316,14 @@ impl PanelState {
 
     /// Top of the first row of shortcuts: they unroll from the name.
     fn content_top(&self, l: &Layout) -> i32 {
-        if self.up { self.size().1 - l.title_h - l.rows * l.cell_h } else { l.title_h }
+        if self.lifted {
+            // Where they are once open, counted from the top of the folder.
+            self.open_size().1 - l.title_h - l.rows * l.cell_h
+        } else if self.up {
+            self.size().1 - l.title_h - l.rows * l.cell_h
+        } else {
+            l.title_h
+        }
     }
 
     /// Where a file dropped at this client point would be inserted.
@@ -304,7 +348,7 @@ impl PanelState {
             return (self.width_px(), l.title_h);
         }
         let badge = if self.settings.show_count { self.badge_w() + self.scale(6) } else { 0 };
-        let w = self.scale(12) + l.label_icon + self.scale(8) + self.title_text_w + badge + self.scale(14);
+        let w = self.scale(12) + l.label_icon + self.icon_gap() + self.title_text_w + badge + self.scale(14);
         (w.min(self.width_px()), l.title_h)
     }
 
@@ -325,18 +369,22 @@ impl PanelState {
     }
 
     /// An open folder that moved or changed size picks its direction again.
-    fn choose_direction(&mut self) {
-        if self.open {
-            self.up = self.settings.open_upwards && self.needs_up();
+    fn choose_direction(&mut self, hwnd: HWND) {
+        // Not while it is opening or closing: the label window and the layout
+        // follow the direction it started with.
+        if self.open && self.progress >= 1.0 {
+            self.up = self.settings.open_upwards && self.needs_up(hwnd);
         }
     }
 
-    /// Opening now would go past the bottom of the screen, and there is more room above.
-    fn needs_up(&self) -> bool {
+    /// It opens upwards: the folders it opens with (its arrangement, or the
+    /// folders stacked with it) have no room below, see `layout::group_opens_up`.
+    fn needs_up(&self, hwnd: HWND) -> bool {
         let (w, closed_h) = self.closed_size();
-        let open_h = self.open_size().1;
-        let top = self.pos.1 + self.push;
-        layout::opens_up(top, closed_h, open_h, work_area_at(self.pos.0 + w / 2, top + closed_h / 2))
+        let (open_w, open_h) = self.open_size();
+        // As wide as it is open: an open "fit" folder is wider than its label.
+        let label = layout::Rect { x: self.pos.0, y: self.pos.1, w: w.max(open_w), h: closed_h };
+        crate::opens_up(hwnd, label, open_h - closed_h, self.cfg.arranged, self.dpi)
     }
 
     fn size(&self) -> (i32, i32) {
@@ -408,7 +456,11 @@ impl PanelState {
         };
         self.font = make_font(FW_NORMAL as i32);
         self.title_font = make_font(FW_SEMIBOLD as i32);
-        self.title_icon = load_icon(self.cfg.icon.as_deref().unwrap_or(DEFAULT_PANEL_ICON), self.label_icon());
+        self.title_icon = if self.settings.show_folder_icon {
+            load_icon(self.cfg.icon.as_deref().unwrap_or(DEFAULT_PANEL_ICON), self.label_icon())
+        } else {
+            null_mut()
+        };
         let size = self.scale(self.settings.icon_size);
         self.icons = self
             .cfg
@@ -510,7 +562,30 @@ unsafe fn text_width(dc: HDC, text: &str) -> i32 {
     size.cx
 }
 
+/// The label window lets the mouse through and is never activated.
+unsafe extern "system" fn label_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_NCHITTEST => HTTRANSPARENT as LRESULT,
+        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
 pub fn register_class() {
+    let label = wide(LABEL_CLASS);
+    let lc = WNDCLASSW {
+        style: 0,
+        lpfnWndProc: Some(label_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: unsafe { GetModuleHandleW(null()) },
+        hIcon: null_mut(),
+        hCursor: unsafe { LoadCursorW(null_mut(), IDC_ARROW) },
+        hbrBackground: null_mut(),
+        lpszMenuName: null(),
+        lpszClassName: label.as_ptr(),
+    };
+    unsafe { RegisterClassW(&lc) };
     let class = wide(CLASS_NAME);
     let wc = WNDCLASSW {
         style: 0,
@@ -581,6 +656,10 @@ pub fn create(cfg: &Panel, settings: &Settings, desktop: HWND, main: HWND) -> HW
         push: 0,
         shown: (cfg.x, cfg.y),
         up: false,
+        lifted: false,
+        lift_next: false,
+        unlift_next: false,
+        label_window: null_mut(),
         last_reach: None,
         applied: None,
         moving: false,
@@ -668,7 +747,8 @@ pub fn update(hwnd: HWND, cfg: &Panel, settings: &Settings) {
         || st.cfg.items.iter().zip(&cfg.items).any(|(a, b)| a.path != b.path || a.icon != b.icon)
         || st.settings.font_size != settings.font_size
         || st.settings.icon_size != settings.icon_size
-        || st.settings.title_style() != settings.title_style();
+        || st.settings.title_style() != settings.title_style()
+        || st.settings.show_folder_icon != settings.show_folder_icon;
     let glass = st.settings.tint != settings.tint || st.settings.tint_opacity != settings.tint_opacity;
     let open_all_changed = st.settings.unlocked_open_all != settings.unlocked_open_all;
     if st.cfg.title != cfg.title {
@@ -693,7 +773,7 @@ pub fn update(hwnd: HWND, cfg: &Panel, settings: &Settings) {
         enable_glass(hwnd, &st.settings);
     }
     st.place();
-    st.choose_direction();
+    st.choose_direction(hwnd);
     apply_size(hwnd, st);
     // Switched between "all open" and "open on hover" while unlocked.
     if open_all_changed && !locked() {
@@ -710,7 +790,7 @@ pub fn update(hwnd: HWND, cfg: &Panel, settings: &Settings) {
 pub fn reposition(hwnd: HWND) {
     let Some(st) = state(hwnd) else { return };
     st.place();
-    st.choose_direction();
+    st.choose_direction(hwnd);
     apply_size(hwnd, st);
 }
 
@@ -737,11 +817,15 @@ pub fn geometry(hwnd: HWND) -> Option<Geometry> {
     let st = state(hwnd)?;
     let (w, h) = st.closed_size();
     let now_h = st.size().1;
+    let (open_w, open_h) = st.open_size();
     Some(Geometry {
         label: layout::Rect { x: st.pos.0, y: st.pos.1, w, h },
-        open_w: st.open_size().0,
-        extra: if st.up { 0 } else { (now_h - h).max(0) },
-        open_down: st.open && !st.up,
+        open_w,
+        open_h,
+        extra: (now_h - h).max(0),
+        up: st.up,
+        open: st.open,
+        arranged: st.cfg.arranged,
         dpi: st.dpi,
         moving: st.moving,
     })
@@ -807,6 +891,7 @@ pub fn close_now(hwnd: HWND, moving: bool) {
     st.hover = None;
     st.progress = 0.0;
     st.up = false;
+    hide_label_window(st);
     apply_size(hwnd, st);
 }
 
@@ -1033,6 +1118,139 @@ fn apply_size(hwnd: HWND, st: &mut PanelState) {
     }
 }
 
+/// The label window of this folder, made the first time it is needed.
+fn label_window(hwnd: HWND, st: &mut PanelState) -> HWND {
+    if st.label_window.is_null() || unsafe { IsWindow(st.label_window) } == 0 {
+        let class = wide(LABEL_CLASS);
+        st.label_window = unsafe {
+            CreateWindowExW(
+                // Clicks go through it to the folder, which keeps the mouse.
+                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                class.as_ptr(),
+                null(),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                // Owned by the folder: always just above it.
+                hwnd,
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            )
+        };
+    }
+    st.label_window
+}
+
+/// Shows the label in the label window, at the label's place on the screen.
+fn draw_label_window(hwnd: HWND, st: &mut PanelState) {
+    let win = label_window(hwnd, st);
+    if win.is_null() {
+        return;
+    }
+    let l = st.layout();
+    let (w, h) = (st.size().0.max(1), l.title_h.max(1));
+    let (x, y) = (st.pos.0, st.pos.1 + st.push);
+    let s = &st.settings;
+    let (text, hover, border, accent) =
+        (parse_color(&s.text, 0xF2F2F2), parse_color(&s.hover, 0x2E2E2E), parse_color(&s.border, 0x3A3A3A), parse_color(&s.accent, 0xFFC24C));
+    let outlined = !locked() || st.highlighted;
+    unsafe {
+        let screen = GetDC(null_mut());
+        let mut info: BITMAPINFO = std::mem::zeroed();
+        info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = w;
+        info.bmiHeader.biHeight = -h;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        let mut bits: *mut c_void = null_mut();
+        let mem = CreateCompatibleDC(screen);
+        let bmp = CreateDIBSection(mem, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+        if mem.is_null() || bmp.is_null() || bits.is_null() {
+            if !bmp.is_null() {
+                DeleteObject(bmp);
+            }
+            if !mem.is_null() {
+                DeleteDC(mem);
+            }
+            ReleaseDC(null_mut(), screen);
+            return;
+        }
+        let old_bmp = SelectObject(mem, bmp);
+        SetBkMode(mem, TRANSPARENT as _);
+        SetTextColor(mem, text);
+        // The bottom of the folder's border: its sides, corners and bottom edge.
+        let radius = st.scale(8);
+        let pen = CreatePen(PS_SOLID, if outlined { st.scale(2) } else { 1 }, if outlined { accent } else { border });
+        let old_pen = SelectObject(mem, pen);
+        let old_brush = SelectObject(mem, GetStockObject(NULL_BRUSH));
+        RoundRect(mem, 0, -radius * 4, w, h, radius * 2, radius * 2);
+        SelectObject(mem, old_brush);
+        SelectObject(mem, old_pen);
+        DeleteObject(pen);
+        draw_title(mem, st, &l, 0, w, accent, hover);
+        GdiFlush();
+        let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, w as usize * h as usize);
+        fix_alpha(pixels, w as usize, 0..h as usize, 1.0);
+        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+        let (at, size, origin) = (POINT { x, y }, SIZE { cx: w, cy: h }, POINT { x: 0, y: 0 });
+        UpdateLayeredWindow(win, screen, &at, &size, mem, &origin, 0, &blend, ULW_ALPHA);
+        SelectObject(mem, old_bmp);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        ReleaseDC(null_mut(), screen);
+        if IsWindowVisible(win) == 0 {
+            // Just above the folder, under every window that is above it. The
+            // window right above the folder may be this one, hidden.
+            let mut above = GetWindow(hwnd, GW_HWNDPREV);
+            while above == win {
+                above = GetWindow(above, GW_HWNDPREV);
+            }
+            let after = if above.is_null() { HWND_TOP } else { above };
+            SetWindowPos(win, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+            if IsWindowVisible(win) == 0 {
+                ShowWindow(win, SW_SHOWNOACTIVATE);
+            }
+        }
+    }
+}
+
+/// Shows the label window over the label; from the next animation step on, it
+/// shows the label instead of the folder (see `PanelState::lifted`).
+fn lift_label(hwnd: HWND, st: &mut PanelState) {
+    st.unlift_next = false;
+    draw_label_window(hwnd, st);
+    if !st.lifted {
+        st.lift_next = true;
+    }
+}
+
+/// The folder shows its own label again; the label window goes away at the
+/// next step, once that is on the screen.
+fn drop_label(hwnd: HWND, st: &mut PanelState) {
+    if !st.lifted {
+        return;
+    }
+    st.lifted = false;
+    st.unlift_next = true;
+    unsafe {
+        InvalidateRect(hwnd, null(), 0);
+        UpdateWindow(hwnd);
+    }
+}
+
+fn hide_label_window(st: &mut PanelState) {
+    st.lifted = false;
+    st.lift_next = false;
+    st.unlift_next = false;
+    if !st.label_window.is_null() {
+        unsafe { ShowWindow(st.label_window, SW_HIDE) };
+    }
+}
+
 fn set_open(hwnd: HWND, st: &mut PanelState, open: bool) {
     unsafe {
         KillTimer(hwnd, OPEN_TIMER);
@@ -1046,7 +1264,7 @@ fn set_open(hwnd: HWND, st: &mut PanelState, open: bool) {
         return;
     }
     if open && st.progress <= 0.0 {
-        st.up = st.settings.open_upwards && st.needs_up();
+        st.up = st.settings.open_upwards && st.needs_up(hwnd);
     }
     st.open = open;
     st.hover = None;
@@ -1056,8 +1274,23 @@ fn set_open(hwnd: HWND, st: &mut PanelState, open: bool) {
     if st.settings.animation_ms == 0 {
         st.progress = if open { 1.0 } else { 0.0 };
         st.up &= open;
+        hide_label_window(st);
         apply_size(hwnd, st);
     } else {
+        if st.up {
+            lift_label(hwnd, st);
+        } else {
+            // Opening or closing downwards: no label window, and no step of the
+            // last upwards animation left to run (it would stop this one).
+            let was_lifted = st.lifted;
+            hide_label_window(st);
+            if was_lifted {
+                unsafe {
+                    InvalidateRect(hwnd, null(), 0);
+                    UpdateWindow(hwnd);
+                }
+            }
+        }
         st.anim_from = st.progress;
         st.anim_start = unsafe { GetTickCount64() };
         unsafe { SetTimer(hwnd, ANIM_TIMER, ANIM_FRAME_MS, None) };
@@ -1065,20 +1298,49 @@ fn set_open(hwnd: HWND, st: &mut PanelState, open: bool) {
 }
 
 fn animate(hwnd: HWND, st: &mut PanelState) {
+    if st.unlift_next {
+        // The folder shows its own label since the last step.
+        hide_label_window(st);
+        unsafe { KillTimer(hwnd, ANIM_TIMER) };
+        return;
+    }
+    if st.lift_next {
+        // The label window is on the screen since the last step: the folder stops
+        // drawing its label, and the animation starts now. If it could not be
+        // shown, the folder keeps drawing its label.
+        st.lift_next = false;
+        st.lifted = !st.label_window.is_null() && unsafe { IsWindowVisible(st.label_window) } != 0;
+        st.anim_from = st.progress;
+        st.anim_start = unsafe { GetTickCount64() };
+        unsafe {
+            InvalidateRect(hwnd, null(), 0);
+            UpdateWindow(hwnd);
+        }
+        return;
+    }
     let target = if st.open { 1.0 } else { 0.0 };
     // A full open takes animation_ms; a reversed half-way animation takes less.
     let duration = st.settings.animation_ms as f32 * (target - st.anim_from).abs();
     let elapsed = unsafe { GetTickCount64() } - st.anim_start;
     let p = if duration <= 0.0 { 1.0 } else { (elapsed as f32 / duration).min(1.0) };
     st.progress = st.anim_from + (target - st.anim_from) * p;
-    if p >= 1.0 {
+    let done = p >= 1.0;
+    if done {
         st.progress = target;
         st.up &= st.open;
-        unsafe { KillTimer(hwnd, ANIM_TIMER) };
+        if st.lifted {
+            // One more step takes the label window away (see drop_label).
+            drop_label(hwnd, st);
+        } else {
+            unsafe { KillTimer(hwnd, ANIM_TIMER) };
+        }
     }
     // This folder's new size and the folders it pushes move together, in one
     // batch: otherwise some are drawn moved and others not, and the glass flickers.
     crate::relayout();
+    if st.lifted {
+        draw_label_window(hwnd, st);
+    }
 }
 
 /// Puts an opening panel above the other panels, still under every other
@@ -1116,15 +1378,43 @@ fn cursor_x() -> i32 {
 }
 
 /// The cursor is over the window (its name or its shortcuts).
+/// The mouse is on the panel itself: the panel is the window under it. A
+/// window over the panel covers it, even inside its rectangle. A menu of
+/// deskfolds over the panel (its right-click menu) still counts as the panel.
 fn cursor_inside(hwnd: HWND) -> bool {
     let mut pt = POINT { x: 0, y: 0 };
     let mut r: RECT = unsafe { std::mem::zeroed() };
-    let found = unsafe { GetCursorPos(&mut pt) != 0 && GetWindowRect(hwnd, &mut r) != 0 };
-    found
-        && pt.x >= r.left
-        && pt.x < r.right
-        && pt.y >= r.top
-        && pt.y < r.bottom
+    if unsafe { GetCursorPos(&mut pt) == 0 || GetWindowRect(hwnd, &mut r) == 0 } {
+        return false;
+    }
+    let in_rect = pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
+    let under = unsafe { WindowFromPoint(pt) };
+    if under.is_null() || !in_rect {
+        return false;
+    }
+    unsafe { GetAncestor(under, GA_ROOT) == hwnd || is_own_menu(under) }
+}
+
+/// A popup menu (window class "#32768") of this thread.
+fn is_own_menu(hwnd: HWND) -> bool {
+    let mut class = [0u16; 16];
+    let n = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) };
+    let ours = unsafe { GetWindowThreadProcessId(hwnd, null_mut()) == GetCurrentThreadId() };
+    ours && String::from_utf16_lossy(&class[..n.max(0) as usize]) == "#32768"
+}
+
+/// A menu of deskfolds closed: an open folder the mouse is no longer on closes
+/// after the usual delay, as when the mouse leaves it.
+pub fn after_menu() {
+    let locked = locked();
+    for hwnd in crate::panels() {
+        if let Some(st) = state(hwnd)
+            && st.open
+            && !cursor_inside(hwnd)
+        {
+            on_leave(hwnd, st, locked);
+        }
+    }
 }
 
 /// The mouse is over the panel: stop closing, and open after the hover delay.
@@ -1441,7 +1731,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             WM_RBUTTONUP => {
                 let (x, y) = mouse();
                 match st.hit(x, y) {
-                    Hit::Item(i) if !locked => item_menu(hwnd, st, i),
+                    Hit::Item(i) if !locked => {
+                        item_menu(hwnd, st, i);
+                        // The mouse may have gone elsewhere while the menu was open.
+                        if let Some(st) = state(hwnd)
+                            && !cursor_inside(hwnd)
+                        {
+                            on_leave(hwnd, st, self::locked());
+                        }
+                    }
                     _ => {
                         PostMessageW(st.main, WM_APP_SHOW_MENU, st.cfg.id as usize, 0);
                     }
@@ -1563,7 +1861,7 @@ unsafe fn draw_title(dc: HDC, st: &PanelState, l: &Layout, top: i32, w: i32, acc
             TitleStyle::Fit => {
                 let cy = top + l.title_h / 2;
                 draw_icon(s(12), cy - icon / 2);
-                let text_left = s(12) + icon + s(8);
+                let text_left = s(12) + icon + st.icon_gap();
                 let pin_space = if st.pinned { s(18) } else { 0 };
                 let badge_space = if count { st.badge_w() + s(6) } else { 0 };
                 let right = w - s(8) - pin_space - badge_space;
@@ -1579,13 +1877,13 @@ unsafe fn draw_title(dc: HDC, st: &PanelState, l: &Layout, top: i32, w: i32, acc
                 let room = st.title_wrap_width();
                 let block_w = st.title_lines.iter().map(|t| text_width(dc, t)).max().unwrap_or(0).min(room);
                 let badge_space = if count { s(6) + st.badge_w() } else { 0 };
-                let group_w = icon + s(8) + block_w + badge_space;
+                let group_w = icon + st.icon_gap() + block_w + badge_space;
                 let min_x = s(12);
                 let max_x = w - s(12 + PIN_ROOM) - group_w;
                 let gx = if style == TitleStyle::Centered { ((w - group_w) / 2).min(max_x).max(min_x) } else { min_x };
                 let cy = top + l.title_h / 2;
                 draw_icon(gx, cy - icon / 2);
-                let tx = gx + icon + s(8);
+                let tx = gx + icon + st.icon_gap();
                 let y0 = cy - st.title_lines.len() as i32 * st.line_h / 2;
                 let align = if style == TitleStyle::Centered { DT_CENTER } else { DT_LEFT };
                 for (k, line) in st.title_lines.iter().enumerate() {
@@ -1666,13 +1964,19 @@ fn paint(hwnd: HWND, st: &PanelState, locked: bool) {
         let pen = CreatePen(PS_SOLID, pen_w, if outlined || st.snap_target { accent } else { border });
         let old_pen = SelectObject(mem, pen);
         let old_brush = SelectObject(mem, GetStockObject(NULL_BRUSH));
+        // While lifted, the label window draws the label and the bottom of the border.
+        let above_label = if st.lifted { h - l.title_h } else { h };
+        let clip = CreateRectRgn(0, 0, w, above_label);
+        SelectClipRgn(mem, clip);
         RoundRect(mem, 0, 0, w, h, radius * 2, radius * 2);
         SelectObject(mem, old_brush);
         SelectObject(mem, old_pen);
         DeleteObject(pen);
 
         let title_top = st.title_top(&l);
-        draw_title(mem, st, &l, title_top, w, accent, hover);
+        if !st.lifted {
+            draw_title(mem, st, &l, title_top, w, accent, hover);
+        }
         let old_font = SelectObject(mem, st.font);
 
         if st.progress > 0.0 {
@@ -1732,9 +2036,11 @@ fn paint(hwnd: HWND, st: &PanelState, locked: bool) {
             }
         }
 
+        SelectClipRgn(mem, null_mut());
+        DeleteObject(clip);
         GdiFlush();
         let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, w as usize * h as usize);
-        let band = title_top.max(0) as usize..(title_top + l.title_h).max(0) as usize;
+        let band = if st.lifted { 0..0 } else { title_top.max(0) as usize..(title_top + l.title_h).max(0) as usize };
         fix_alpha(pixels, w as usize, band, ease_out_cubic(st.progress));
 
         BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);

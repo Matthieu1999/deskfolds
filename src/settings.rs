@@ -132,6 +132,7 @@ const A_LINES: i32 = 334;
 const A_COUNT: i32 = 336;
 const A_NAMES_1: i32 = 337;
 const A_NAMES_2: i32 = 338;
+const A_FOLDER_ICON: i32 = 339;
 
 const B_HOVER: i32 = 400;
 const B_OPEN: i32 = 401;
@@ -186,7 +187,7 @@ const UPDOWN: i32 = 5000;
 
 const COLOR_BUTTONS: [i32; 5] = [A_TINT, A_ACCENT, A_TEXT, A_HOVER, A_BORDER];
 /// Check boxes that have a caption.
-const CAPTIONED_CHECKS: [i32; 5] = [F_FIT, F_ARRANGED, A_COUNT, L_SNAP, L_JOIN];
+const CAPTIONED_CHECKS: [i32; 6] = [F_FIT, F_ARRANGED, A_COUNT, A_FOLDER_ICON, L_SNAP, L_JOIN];
 const TITLE_STYLES: [(i32, TitleStyle); 4] = [
     (A_STYLE_CENTERED, TitleStyle::Centered),
     (A_STYLE_LEFT, TitleStyle::Left),
@@ -520,6 +521,78 @@ pub fn close() {
 pub fn owner() -> Option<HWND> {
     let hwnd = WINDOW.get();
     (!hwnd.is_null()).then_some(hwnd)
+}
+
+/// Asks whether to delete the folder `id` (and what to do with the files moved
+/// into it), and deletes it. True once it is deleted.
+pub fn delete_folder(owner: HWND, id: u32) -> bool {
+    const DELETE: i32 = 1000;
+    const TO_DESKTOP: i32 = 2000;
+    const KEEP: i32 = 2001;
+    thread_local! {
+        static DELETING: Cell<bool> = const { Cell::new(false) };
+    }
+    // One question at a time: another right-click while it is open asks nothing.
+    if DELETING.replace(true) {
+        return false;
+    }
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            DELETING.set(false);
+        }
+    }
+    let _done = Done;
+    let count = |s: &store::Store| s.panel(id).map(|p| p.items.iter().filter(|it| s.is_stored(id, it)).count());
+    let Some((title, total, moved, storage)) = store::with(|s| {
+        let p = s.panel(id)?;
+        Some((p.title.clone(), p.items.len(), count(s)?, s.storage_of(id)))
+    }) else {
+        return false;
+    };
+    let instruction = format!("Delete the folder '{}'?", ui::short_name(&title, 80));
+    let content = if moved > 0 {
+        format!("It holds {total} shortcut(s); {moved} of them are files you moved into it. What should happen to those files?")
+    } else if total > 0 {
+        format!("Its {total} shortcut(s) are links: the files they open are not touched.")
+    } else {
+        "This folder is empty.".to_string()
+    };
+    // A "&" in a radio button would underline the next letter.
+    let keep = ui::menu_text(&format!("Keep them in {}", storage.display()));
+    let radios = [(TO_DESKTOP, "Move them back to the desktop"), (KEEP, keep.as_str())];
+    // In front, also when it comes from a folder's menu.
+    unsafe { SetForegroundWindow(owner) };
+    let (button, radio) = ui::ask(
+        owner,
+        &Ask {
+            instruction: &instruction,
+            content: &content,
+            buttons: &[(DELETE, "Delete folder")],
+            default_button: DELETE,
+            radios: if moved > 0 { &radios[..] } else { &[] },
+            default_radio: TO_DESKTOP,
+            warning: true,
+            footer: Some("deskfolds never deletes a file."),
+            ..Default::default()
+        },
+    );
+    if button != DELETE {
+        return false;
+    }
+    // Changed meanwhile (config edited or reloaded): the answer was about other files.
+    if store::with(|s| count(s)) != Some(moved) {
+        return false;
+    }
+    let errors = store::change(|s| s.delete_panel(id, moved > 0 && radio != KEEP));
+    if !errors.is_empty() {
+        error_box(&format!(
+            "Some files could not be moved back to the desktop. They are still in {}:\n\n{}",
+            storage.display(),
+            errors.join("\n")
+        ));
+    }
+    true
 }
 
 /// Something changed (the store, the lock, autostart): refresh the window.
@@ -898,20 +971,23 @@ impl Win {
         self.help("0 = no animation", lx, 434, 200);
         self.slider(cx, 410, 330, A_ANIM);
 
-        self.label("Folder titles", lx, 466, 200);
-        self.help("How a closed folder shows its name", lx, 488, 205);
-        self.radio(cx, 466, A_STYLE_CENTERED, "Centered", 70);
-        self.radio(cx + 94, 466, A_STYLE_LEFT, "Left", 46);
-        self.radio(cx + 164, 466, A_STYLE_ICON, "Icon above", 84);
-        self.radio(cx + 274, 466, A_STYLE_FIT, "Fit the name", 96);
-        self.label("Title lines", lx, 512, 200);
-        self.help("A longer name ends with \u{2026}", lx, 534, 205);
-        self.number(cx, 514, 64, A_LINES);
-        self.label("lines at most", cx + 72, 514, 100);
-        self.check_text(cx + 210, 514, A_COUNT, "Show the number of shortcuts", 220);
-        self.label("Shortcut names", lx, 558, 200);
-        self.radio(cx, 558, A_NAMES_1, "One line", 70);
-        self.radio(cx + 94, 558, A_NAMES_2, "Up to two lines", 120);
+        self.label("Folder titles", lx, 456, 200);
+        self.help("How a closed folder shows its name", lx, 478, 205);
+        self.radio(cx, 456, A_STYLE_CENTERED, "Centered", 70);
+        self.radio(cx + 94, 456, A_STYLE_LEFT, "Left", 46);
+        self.radio(cx + 164, 456, A_STYLE_ICON, "Icon above", 84);
+        self.radio(cx + 274, 456, A_STYLE_FIT, "Fit the name", 96);
+        self.label("Folder icon", lx, 500, 200);
+        self.help("Off: no icon, and none can be chosen", lx, 522, 205);
+        self.check_text(cx, 500, A_FOLDER_ICON, "Show an icon next to the name", 240);
+        self.label("Title lines", lx, 544, 200);
+        self.help("A longer name ends with \u{2026}", lx, 566, 205);
+        self.number(cx, 546, 64, A_LINES);
+        self.label("lines at most", cx + 72, 546, 100);
+        self.check_text(cx + 210, 546, A_COUNT, "Show the number of shortcuts", 220);
+        self.label("Shortcut names", lx, 588, 200);
+        self.radio(cx, 588, A_NAMES_1, "One line", 70);
+        self.radio(cx + 94, 588, A_NAMES_2, "Up to two lines", 120);
     }
 
     fn build_behavior(&mut self) {
@@ -952,13 +1028,13 @@ impl Win {
         self.number(cx, 106, 64, L_GAP);
         self.label("px", cx + 72, 106, 30);
         self.label("When a folder opens", lx, 150, 200);
-        self.radio(cx, 150, L_PUSH, "Push the folders below", 150);
+        self.radio(cx, 150, L_PUSH, "Push the folders next to it", 178);
         self.radio(cx + 184, 150, L_COVER, "Cover them", 90);
-        self.help("Folders stacked right under it slide down while it is open, and come back when it closes.", lx, 172, 600);
+        self.help("Folders stacked right under or above it slide away while it is open, and come back when it closes.", lx, 172, 600);
         self.label("Open direction", lx, 196, 200);
         self.radio(cx, 196, L_AUTO, "Automatic", 80);
         self.radio(cx + 114, 196, L_DOWN, "Always down", 96);
-        self.help("Automatic opens a folder upwards when there is no room below it.", lx, 218, 600);
+        self.help("Automatic: folders that touch open the same way, upwards when there is no room below them.", lx, 218, 600);
         self.label("While unlocked", lx, 242, 200);
         self.radio(cx, 242, L_CLOSED, "Folders stay closed, open on hover", 210);
         self.radio(cx + 244, 242, L_OPEN_ALL, "All folders open", 120);
@@ -1181,6 +1257,8 @@ impl Win {
         for id in [F_NAME, F_ICON, F_DELETE, F_WIDTH, F_WIDTH + 1, F_COLS, F_COLS + 1, F_FIT, F_ARRANGED, F_X, F_Y, F_OPEN, S_ADD, S_LIST] {
             self.enable(id, panel.is_some());
         }
+        // With folder icons off, there is no icon to choose.
+        self.enable(F_ICON, panel.is_some() && settings.show_folder_icon);
         self.enable(F_ARRANGE, !panels.is_empty());
         self.set_text(F_PLACE, if LOCKED.load(std::sync::atomic::Ordering::Relaxed) { "Move on the desktop" } else { "Done" });
 
@@ -1264,6 +1342,7 @@ impl Win {
         // The "fit" style always shows one line.
         self.enable(A_LINES, style != TitleStyle::Fit);
         self.set_check(A_COUNT, s.show_count);
+        self.set_check(A_FOLDER_ICON, s.show_folder_icon);
         self.set_radio(A_NAMES_1, s.item_lines < 2);
         self.set_radio(A_NAMES_2, s.item_lines >= 2);
     }
@@ -1521,6 +1600,10 @@ impl Win {
                 let on = self.checked(A_COUNT);
                 store::change(|s| s.update_settings(|st| st.show_count = on));
             }
+            A_FOLDER_ICON => {
+                let on = self.checked(A_FOLDER_ICON);
+                store::change(|s| s.update_settings(|st| st.show_folder_icon = on));
+            }
             A_NAMES_1 | A_NAMES_2 => store::change(|s| s.update_settings(|st| st.item_lines = if id == A_NAMES_2 { 2 } else { 1 })),
             L_SNAP => {
                 let on = self.checked(L_SNAP);
@@ -1683,53 +1766,10 @@ impl Win {
     }
 
     fn delete_folder(&mut self, id: u32) {
-        const DELETE: i32 = 1000;
-        const TO_DESKTOP: i32 = 2000;
-        const KEEP: i32 = 2001;
-        let Some((title, total, moved, storage)) = store::with(|s| {
-            let p = s.panel(id)?;
-            let moved = p.items.iter().filter(|it| s.is_stored(id, it)).count();
-            Some((p.title.clone(), p.items.len(), moved, s.storage_of(id)))
-        }) else {
-            return;
-        };
-        let instruction = format!("Delete the folder '{title}'?");
-        let content = if moved > 0 {
-            format!("It holds {total} shortcut(s); {moved} of them are files you moved into it. What should happen to those files?")
-        } else if total > 0 {
-            format!("Its {total} shortcut(s) are links: the files they open are not touched.")
-        } else {
-            "This folder is empty.".to_string()
-        };
-        let keep = format!("Keep them in {}", storage.display());
-        let radios = [(TO_DESKTOP, "Move them back to the desktop"), (KEEP, keep.as_str())];
-        let (button, radio) = ui::ask(
-            self.hwnd,
-            &Ask {
-                instruction: &instruction,
-                content: &content,
-                buttons: &[(DELETE, "Delete folder")],
-                default_button: DELETE,
-                radios: if moved > 0 { &radios[..] } else { &[] },
-                default_radio: TO_DESKTOP,
-                warning: true,
-                footer: Some("deskfolds never deletes a file."),
-                ..Default::default()
-            },
-        );
-        if button != DELETE {
-            return;
+        if delete_folder(self.hwnd, id) {
+            self.panel = None;
+            self.item = None;
         }
-        let errors = store::change(|s| s.delete_panel(id, moved > 0 && radio != KEEP));
-        if !errors.is_empty() {
-            error_box(&format!(
-                "Some files could not be moved back to the desktop. They are still in {}:\n\n{}",
-                storage.display(),
-                errors.join("\n")
-            ));
-        }
-        self.panel = None;
-        self.item = None;
     }
 
     fn restore_backup(&mut self) {

@@ -287,9 +287,31 @@ pub fn menu_text(s: &str) -> String {
     s.replace('&', "&&")
 }
 
+/// A name from the config for a menu or a dialog: control and text-direction
+/// characters removed (they could make it read as something else), and at
+/// most `max` characters, ending with "…" when cut.
+pub fn short_name(s: &str, max: usize) -> String {
+    let bidi = |c: char| matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    let clean: Vec<char> = s.chars().filter(|&c| !c.is_control() && !bidi(c)).collect();
+    if clean.len() <= max {
+        return clean.into_iter().collect();
+    }
+    let mut cut: String = clean[..max.saturating_sub(1)].iter().collect();
+    cut.push('…');
+    cut
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_for_menus_are_short_and_plain() {
+        assert_eq!(short_name("Games", 40), "Games");
+        assert_eq!(short_name("Tab\there\u{202E}gnp.exe", 40), "Tabheregnp.exe");
+        assert_eq!(short_name(&"x".repeat(60), 10), format!("{}…", "x".repeat(9)));
+        assert_eq!(menu_text(&short_name("Tom & Jerry", 40)), "Tom && Jerry");
+    }
 
     fn buffer(s: &str) -> Vec<u16> {
         s.encode_utf16().chain([0, 0]).collect()

@@ -34,15 +34,18 @@ pub struct Settings {
     pub title_lines: i32,
     /// Shows the number of shortcuts next to the folder name.
     pub show_count: bool,
+    /// Shows the folder's icon next to its name. Off, no icon is shown and none
+    /// can be chosen; the icons chosen before are kept for when it is on again.
+    pub show_folder_icon: bool,
     /// Lines a shortcut name may take under its icon (1 or 2).
     pub item_lines: i32,
     /// A folder being moved snaps to the edges of the others and of the screen.
     pub snap: bool,
     /// Space kept between folders by snapping, pushing and arranging.
     pub gap: i32,
-    /// An opening folder pushes the folders stacked right under it down.
+    /// An opening folder pushes the folders stacked right under or above it out of its way.
     pub push_below: bool,
-    /// A folder with no room below opens upwards.
+    /// Folders with no room below open upwards, with the folders they touch.
     pub open_upwards: bool,
     /// While unlocked, every folder is open (otherwise they open on hover).
     pub unlocked_open_all: bool,
@@ -125,6 +128,7 @@ impl Default for Settings {
             title_style: "centered".into(),
             title_lines: 2,
             show_count: false,
+            show_folder_icon: true,
             item_lines: 1,
             snap: true,
             gap: 8,
