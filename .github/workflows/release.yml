@@ -1,0 +1,132 @@
+# Builds deskfolds.exe on GitHub's own Windows machines.
+# - On a pull request: tests, builds and checks it, and keeps the exe for 7
+#   days as an artifact of the run (nothing is published).
+# - On a version tag such as v0.4.0: the same, then publishes a release with
+#   deskfolds.exe and its SHA-256.
+name: Build and release
+
+on:
+  pull_request:
+  push:
+    tags: ["v*"]
+
+# No job gets any right it does not ask for below.
+permissions: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ($env:TAG -notmatch '^v(\d+\.\d+\.\d+)$') { throw "The tag '$env:TAG' is not a version like v1.2.3." }
+          $tagVersion = $Matches[1]
+          $line = Select-String -Path Cargo.toml -Pattern '^version = "(.+)"$' | Select-Object -First 1
+          $version = $line.Matches[0].Groups[1].Value
+          if ($tagVersion -ne $version) { throw "The tag is v$tagVersion but Cargo.toml says $version." }
+          # Only what is on main is released.
+          git merge-base --is-ancestor HEAD origin/main
+          if ($LASTEXITCODE -ne 0) { throw "The tag $env:TAG is not on main." }
+
+      # A fixed Rust version, so that the same tag always builds the same way.
+      # Raise it on purpose, in a pull request that builds and tests it.
+      - name: Install Rust
+        shell: pwsh
+        env:
+          RUST_VERSION: "1.99.1"
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal --no-self-update
+          rustup default $env:RUST_VERSION
+          cargo --version
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        shell: pwsh
+        run: |
+          # Paths of the build machine are not kept in the exe.
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
+          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = "--remap-path-prefix=$cargoHome=cargo --remap-path-prefix=$env:GITHUB_WORKSPACE=deskfolds"
+          cargo build --release --locked
+
+      - name: Check the exe
+        shell: pwsh
+        run: |
+          $exe = "target\release\deskfolds.exe"
+          $b = [IO.File]::ReadAllBytes($exe)
+          # Its text, read both as ASCII and as UTF-16 (the two forms paths are kept in).
+          $texts = @([Text.Encoding]::ASCII.GetString($b), [Text.Encoding]::Unicode.GetString($b), [Text.Encoding]::Unicode.GetString($b, 1, $b.Length - 1)) | ForEach-Object { $_.ToLowerInvariant() }
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
+          $machine = @(':\users\', $env:GITHUB_WORKSPACE, $cargoHome, $env:RUNNER_TEMP, $env:COMPUTERNAME) | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() }
+          $problems = @()
+          if ($texts[0].Contains('vcruntime') -or $texts[0].Contains('api-ms-win-crt-')) { $problems += 'it needs the Visual C++ runtime DLLs' }
+          foreach ($m in $machine) {
+            if ($texts | Where-Object { $_.Contains($m) }) { $problems += "it contains '$m', a path or name of the build machine" }
+          }
+          # DLLs are loaded from System32 only (DependentLoadFlags 0x800, set in build.rs).
+          $pe = [BitConverter]::ToInt32($b, 0x3C)
+          $opt = $pe + 24
+          $sections = $opt + [BitConverter]::ToUInt16($b, $pe + 20)
+          $loadConfig = [BitConverter]::ToUInt32($b, $opt + 192)
+          $flags = $null
+          for ($i = 0; $i -lt [BitConverter]::ToUInt16($b, $pe + 6); $i++) {
+            $s = $sections + 40 * $i
+            $size = [BitConverter]::ToUInt32($b, $s + 8); $va = [BitConverter]::ToUInt32($b, $s + 12); $raw = [BitConverter]::ToUInt32($b, $s + 20)
+            if ($loadConfig -ge $va -and $loadConfig -lt $va + $size) { $flags = [BitConverter]::ToUInt16($b, $loadConfig - $va + $raw + 0x4E) }
+          }
+          if ($flags -ne 0x800) { $problems += "DependentLoadFlags is $flags, not 0x800" }
+          if ($problems) { throw ("deskfolds.exe: " + ($problems -join '; ') + '.') }
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$PWD\target\release\deskfolds.exe.sha256", "$hash  deskfolds.exe`n")
+          "deskfolds.exe: $($b.Length) bytes, SHA-256 $hash"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deskfolds
+          path: |
+            target/release/deskfolds.exe
+            target/release/deskfolds.exe.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: deskfolds
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # The exe is the one the build job hashed.
+          sha256sum --check --strict deskfolds.exe.sha256
+          hash=$(cut -d' ' -f1 deskfolds.exe.sha256 | tr 'a-f' 'A-F')
+          notes=$(printf 'Download **deskfolds.exe** below and see [Install](https://github.com/%s#install) in the README.\n\nSHA-256 of deskfolds.exe: `%s`' "$REPO" "$hash")
+          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            # A release made by hand for this tag: the files are added to it.
+            gh release upload "$TAG" deskfolds.exe deskfolds.exe.sha256 --repo "$REPO" --clobber
+          else
+            gh release create "$TAG" deskfolds.exe deskfolds.exe.sha256 --repo "$REPO" --verify-tag --title "deskfolds $TAG" --notes "$notes" --generate-notes
+          fi

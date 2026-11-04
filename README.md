@@ -8,8 +8,9 @@ away and it folds back. Click its name to pin it open. Panels are locked in
 place: they don't move unless you unlock them.
 
 - **Native and light**: one small program, with no framework or runtime to
-  install. About 640 KB on disk, about 5 MB of memory, and no CPU use while
-  idle (it only wakes up when you use it). See [Size and memory](#size-and-memory).
+  install: [download](#option-a-download-it) one file and run it. About 750 KB
+  on disk, about 5 MB of memory, and no CPU use while idle (it only wakes up
+  when you use it). See [Size and memory](#size-and-memory).
 - **Locked in place**: panels don't move while locked, and other programs
   cannot move them either.
 - **Stays on the desktop**: always below normal windows, never takes focus,
@@ -39,17 +40,58 @@ place: they don't move unless you unlock them.
 
 - Windows 11, or Windows 10 version 1903 or later. deskfolds is tested on
   Windows 11.
-- To build it: [Rust](https://rustup.rs) (1.88 or later) and Microsoft's C++
-  build tools. Step 1 below installs them, along with Git.
-
-There is no ready-made download yet: you build deskfolds from its source code.
-It takes a few minutes the first time.
+- Nothing else to use the ready-made download.
+- To build it yourself: [Rust](https://rustup.rs) (1.88 or later) and
+  Microsoft's C++ build tools. Step 1 of [Option B](#option-b-build-it-from-its-source-code)
+  installs them, along with Git.
 
 ## Install
 
+There are two ways, and both give the same program:
+
+- **Option A: download it.** The easiest: one file, nothing to install.
+- **Option B: build it from its source code.** It takes a few minutes the
+  first time.
+
+### Option A: download it
+
+1. Open the [latest release](https://github.com/Matthieu1999/deskfolds/releases/latest)
+   and download **deskfolds.exe**.
+2. Put it in a folder of its own that you keep, for example
+   `%LOCALAPPDATA%\Programs\deskfolds`. To open that place, paste it in the
+   address bar of File Explorer (create the `deskfolds` folder if it is not
+   there). **Start with Windows** remembers where the file is, so choose its
+   place before you turn it on.
+3. Double-click **deskfolds.exe**. The first time, Windows may show
+   **Windows protected your PC**: deskfolds is not signed with a paid
+   certificate, so Windows does not know it yet. Click **More info**, then
+   **Run anyway**. Windows usually does not ask again for that file.
+
+Then see [First start](#first-start).
+
+- If **Smart App Control** is on (Windows Security > App & browser control),
+  Windows may block deskfolds with no **Run anyway** button: it does not let
+  unsigned programs it does not know run. deskfolds cannot run on that PC
+  while it is on.
+- An antivirus may also be wary of a new, unsigned program at first.
+
+To check that the download is not damaged (optional), run this in PowerShell
+in the folder of the file, with the SHA-256 shown on the release page between
+the quotes. It prints `True` when they are the same:
+
+```powershell
+(Get-FileHash .\deskfolds.exe).Hash -eq "PASTE-THE-SHA-256-HERE"
+```
+
+deskfolds.exe needs nothing else: no .NET, no Visual C++ Redistributable. It
+is built from this repository by GitHub, on GitHub's own machines, each time a
+version is released (see [Making a release](#making-a-release)).
+
+### Option B: build it from its source code
+
 The commands below are for PowerShell or Windows Terminal.
 
-### 1. Install the build tools (once)
+#### 1. Install the build tools (once)
 
 ```powershell
 winget install --id Microsoft.VisualStudio.BuildTools -e --override "--passive --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
@@ -73,7 +115,7 @@ cargo --version
 
 It should print a version number.
 
-### 2. Get the code and build it
+#### 2. Get the code and build it
 
 ```powershell
 cd $HOME
@@ -88,15 +130,18 @@ If the build stops with an error saying that `link.exe` was not found, the C++
 build tools are missing: run the first command of step 1 again, or open the
 Visual Studio Installer and add **Desktop development with C++**.
 
-### 3. Start it
+#### 3. Start it
 
 ```powershell
 .\target\release\deskfolds.exe
 ```
 
-You can also double-click `deskfolds.exe` in File Explorer. deskfolds has no
-window and no taskbar button: you use it through its panels, its tray icon
-and its settings window.
+You can also double-click `deskfolds.exe` in File Explorer.
+
+### First start
+
+deskfolds has no window and no taskbar button: you use it through its
+panels, its tray icon and its settings window.
 
 Two sample folders appear at the top left of the desktop, and a folder icon
 appears in the notification area, next to the clock. If you don't see the
@@ -105,18 +150,38 @@ in Windows Settings > Personalization > Taskbar > Other system tray icons.
 
 Only one copy of deskfolds runs at a time: starting it again does nothing.
 
-### 4. Start it with Windows
+### Start it with Windows
 
 Tray menu > **Start with Windows**, or Settings > Behavior > **Start with
 Windows**.
 
-Windows then starts deskfolds from the place it is in now. Keep the
-`deskfolds` folder where it is: if you move or delete it, deskfolds no longer
-starts with Windows. To use another place, quit deskfolds, copy
-`deskfolds.exe` there, start that copy, and turn **Start with Windows** off
-and on again from it.
+Windows then starts deskfolds from the place it is in now. Keep
+`deskfolds.exe` (or the `deskfolds` folder you built it in) where it is: if
+you move or delete it, deskfolds no longer starts with Windows. To use another
+place, quit deskfolds, move `deskfolds.exe` there, start it from there, and
+turn **Start with Windows** off and on again.
 
 ### Update
+
+deskfolds does not update itself. Settings > **About & advanced** shows the
+version you have, and the [releases page](https://github.com/Matthieu1999/deskfolds/releases)
+lists the new ones. Your folders, shortcuts and settings are kept when you
+update: they are in `%APPDATA%\deskfolds`, not in the program.
+
+#### If you downloaded it (option A)
+
+1. Quit deskfolds: tray menu > **Quit**. Windows does not let you replace a
+   program that is running.
+2. Download the new **deskfolds.exe** from the
+   [latest release](https://github.com/Matthieu1999/deskfolds/releases/latest).
+3. Replace the old file with it: same folder, same name `deskfolds.exe`. Move
+   the new file into that folder and choose **Replace the file in the
+   destination**, or delete the old `deskfolds.exe` first. With the same
+   place and name, **Start with Windows** keeps working.
+4. Double-click the new `deskfolds.exe`. Windows may ask once more to
+   **Run anyway**, since it is a new file.
+
+#### If you built it (option B)
 
 1. Quit deskfolds: tray menu > **Quit**. Windows does not let the build
    replace a program that is running.
@@ -141,10 +206,10 @@ and on again from it.
    storage folder: by default `deskfolds\<folder name>` inside your Documents
    folder (which may be in OneDrive). Deleting a folder in Settings with
    **Move them back to the desktop** also brings them back.
-3. Delete the `deskfolds` folder you built it in, and, if you no longer want
-   your settings, `%APPDATA%\deskfolds`.
+3. Delete `deskfolds.exe` (or the `deskfolds` folder you built it in), and,
+   if you no longer want your settings, `%APPDATA%\deskfolds`.
 4. If you installed the build tools only for deskfolds, remove them with
-   `winget uninstall` and the same ids as in step 1.
+   `winget uninstall` and the same ids as in step 1 of option B.
 
 ## Use
 
@@ -336,6 +401,9 @@ change always reaches the right one and the config file stays clean.
 - The settings window is always dark. Windows' own dialogs (color picker,
   file picker, confirmations) follow their own theme.
 - So far tested only at 100 % display scaling.
+- deskfolds.exe is not signed with a paid code-signing certificate, so
+  Windows SmartScreen asks before running a new version (**More info** >
+  **Run anyway**), and Smart App Control, when it is on, blocks it.
 
 ## Size and memory
 
@@ -350,9 +418,33 @@ working set also counts the Windows libraries shared with other programs.
 | Unlocked, with the arrangement's frame | 5.0 MB | 33 MB |
 | After closing the settings window | 5.0 MB | 33 MB |
 
-`deskfolds.exe` is about 640 KB. At rest it uses no CPU (0 ms over 10
+`deskfolds.exe` is about 750 KB, with the C runtime inside it. At rest it uses no CPU (0 ms over 10
 seconds): it only runs when you move the mouse over a folder, open the menu
 or the settings window, or when Windows tells it the screens changed.
+
+## Making a release
+
+For the maintainer. Releases are built and published by GitHub Actions
+(`.github/workflows/release.yml`), never from a personal PC:
+
+1. Set the new version in `Cargo.toml` (for example `version = "0.5.0"`), in
+   a pull request, and merge it.
+2. Tag that version on `main` and push the tag:
+
+   ```powershell
+   git switch main
+   git pull
+   git tag v0.5.0
+   git push origin v0.5.0
+   ```
+
+3. GitHub tests and builds `deskfolds.exe` and publishes the release with it
+   and its SHA-256. It stops without publishing if the tag does not match the
+   version in `Cargo.toml`, if the tag is not on `main`, or if the exe needs
+   the Visual C++ runtime or contains a path of the build machine. Follow it
+   in the **Actions** tab.
+
+Every pull request is built and checked the same way, without publishing.
 
 ## License
 
