@@ -73,6 +73,8 @@ thread_local! {
     static INTERNAL_DROP_DONE: Cell<bool> = const { Cell::new(false) };
     /// A WM_APP_PUSH is waiting in the queue.
     static PUSH_POSTED: Cell<bool> = const { Cell::new(false) };
+    /// A panel is being raised above the others on purpose: it may leave the bottom.
+    static RAISING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Asks the main window to update the pushes, once however often it is asked.
@@ -121,6 +123,8 @@ pub struct PanelState {
     up: bool,
     /// What the main window last heard about: position, size, upwards.
     last_reach: Option<((i32, i32), i32, i32, bool)>,
+    /// The window's position and size as last given to Windows.
+    applied: Option<(i32, i32, i32, i32)>,
     /// Being moved by its name: pushes leave it alone.
     moving: bool,
     /// Lit up as the folder that a moved folder snaps to.
@@ -572,6 +576,7 @@ pub fn create(cfg: &Panel, settings: &Settings, desktop: HWND, main: HWND) -> HW
         shown: (cfg.x, cfg.y),
         up: false,
         last_reach: None,
+        applied: None,
         moving: false,
         snap_target: false,
         cfg: cfg.clone(),
@@ -639,6 +644,9 @@ pub fn create(cfg: &Panel, settings: &Settings, desktop: HWND, main: HWND) -> HW
         st.place();
         apply_size(hwnd, st);
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        // A new window starts above the others: put it at the bottom, under
+        // every program. Later moves leave the z-order alone.
+        SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
         dragdrop::register(hwnd, &DROP_HANDLER);
         hwnd
     }
@@ -728,16 +736,29 @@ pub fn geometry(hwnd: HWND) -> Option<Geometry> {
     })
 }
 
-/// Moves the panel down by `push` pixels (0 puts it back), unless it is being moved.
-pub fn set_push(hwnd: HWND, push: i32) {
-    let Some(st) = state(hwnd) else { return };
-    if st.moving || st.push == push {
-        return;
+/// Where a window goes: (x, y, width, height, resized).
+pub type Placement = (i32, i32, i32, i32, bool);
+
+/// Where the window goes in the next batch of moves, pushed down by `push`
+/// pixels. None when it does not change, or while it is being moved by the user.
+pub fn place_for(hwnd: HWND, push: i32) -> Option<Placement> {
+    let st = state(hwnd)?;
+    if st.moving {
+        return None;
     }
     st.push = push;
+    let (w, h) = st.size();
     let (x, y) = st.window_pos();
     st.shown = (x, y);
-    unsafe { SetWindowPos(hwnd, HWND_BOTTOM, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE) };
+    // The pushes were just worked out with this size: no need to ask again.
+    st.last_reach = Some((st.pos, w, h, st.up));
+    let rect = (x, y, w, h);
+    if st.applied == Some(rect) {
+        return None;
+    }
+    let resized = st.applied.is_none_or(|a| (a.2, a.3) != (w, h));
+    st.applied = Some(rect);
+    Some((x, y, w, h, resized))
 }
 
 /// Shows the label at (x, y) without saving it: the arrangement it is in is
@@ -750,8 +771,10 @@ pub fn set_label(hwnd: HWND, x: i32, y: i32) {
     st.pos = (x, y);
     let (wx, wy) = st.window_pos();
     st.shown = (wx, wy);
+    let (w, h) = st.size();
+    st.applied = Some((wx, wy, w, h));
     let main = st.main;
-    unsafe { SetWindowPos(hwnd, HWND_BOTTOM, wx, wy, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE) };
+    unsafe { SetWindowPos(hwnd, null_mut(), wx, wy, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER) };
     request_pushes(main);
 }
 
@@ -983,8 +1006,11 @@ fn apply_size(hwnd: HWND, st: &mut PanelState) {
     let (w, h) = st.size();
     let (x, y) = st.window_pos();
     st.shown = (x, y);
+    st.applied = Some((x, y, w, h));
     unsafe {
-        SetWindowPos(hwnd, HWND_BOTTOM, x, y, w, h, SWP_NOACTIVATE);
+        // The z-order is left alone: changing it makes Windows redraw the glass
+        // of the other folders.
+        SetWindowPos(hwnd, null_mut(), x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
         InvalidateRect(hwnd, null(), 0);
         UpdateWindow(hwnd);
     }
@@ -1014,7 +1040,7 @@ fn set_open(hwnd: HWND, st: &mut PanelState, open: bool) {
     st.open = open;
     st.hover = None;
     if open {
-        push_other_panels_down(hwnd);
+        raise_above_panels(hwnd);
     }
     if st.settings.animation_ms == 0 {
         st.progress = if open { 1.0 } else { 0.0 };
@@ -1039,23 +1065,37 @@ fn animate(hwnd: HWND, st: &mut PanelState) {
         st.up &= st.open;
         unsafe { KillTimer(hwnd, ANIM_TIMER) };
     }
-    apply_size(hwnd, st);
+    // This folder's new size and the folders it pushes move together, in one
+    // batch: otherwise some are drawn moved and others not, and the glass flickers.
+    crate::relayout();
 }
 
-/// Sends every other panel to the bottom so an open panel overlaps its neighbours.
-fn push_other_panels_down(keep: HWND) {
-    let class = wide(CLASS_NAME);
-    let mut other = null_mut();
+/// Puts an opening panel above the other panels, still under every other
+/// window, so it covers the neighbours it overlaps. Only this window changes
+/// place, and only if a panel is above it: moving the others in the z-order
+/// makes Windows redraw their glass, which flickers.
+fn raise_above_panels(hwnd: HWND) {
+    let ours = crate::panels();
+    let mut top = null_mut();
+    let mut h = hwnd;
     loop {
-        other = unsafe { FindWindowExW(null_mut(), other, class.as_ptr(), null()) };
-        if other.is_null() {
+        h = unsafe { GetWindow(h, GW_HWNDPREV) };
+        if h.is_null() {
             break;
         }
-        if other != keep {
-            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
-            unsafe { SetWindowPos(other, HWND_BOTTOM, 0, 0, 0, 0, flags) };
+        if ours.contains(&h) {
+            top = h;
         }
     }
+    if top.is_null() {
+        return;
+    }
+    let above = unsafe { GetWindow(top, GW_HWNDPREV) };
+    RAISING.set(true);
+    // NOOWNERZORDER: the desktop window owns the panels and must stay where it is.
+    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+    unsafe { SetWindowPos(hwnd, if above.is_null() { HWND_TOP } else { above }, 0, 0, 0, 0, flags) };
+    RAISING.set(false);
 }
 
 fn cursor_x() -> i32 {
@@ -1155,10 +1195,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         match msg {
             WM_MOUSEACTIVATE => return MA_NOACTIVATE as LRESULT,
             WM_WINDOWPOSCHANGING => {
-                // Stay at the bottom of the z-order, and pinned while locked.
+                // Stay at the bottom of the z-order, and pinned while locked. A
+                // move that leaves the z-order alone keeps it alone.
                 let pos = &mut *(lparam as *mut WINDOWPOS);
-                pos.hwndInsertAfter = HWND_BOTTOM;
-                pos.flags &= !SWP_NOZORDER;
+                if pos.flags & SWP_NOZORDER == 0 && !RAISING.get() {
+                    pos.hwndInsertAfter = HWND_BOTTOM;
+                }
                 if locked {
                     pos.x = st.shown.0;
                     pos.y = st.shown.1;

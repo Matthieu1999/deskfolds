@@ -16,6 +16,7 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{InvalidateRect, UpdateWindow};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Ole::OleInitialize;
 use windows_sys::Win32::System::Threading::CreateMutexW;
@@ -214,9 +215,15 @@ pub fn new_folder() -> u32 {
     })
 }
 
-/// Pushes the folders stacked under open ones down by how far those reach,
-/// and puts the others back.
 fn update_pushes() {
+    relayout();
+}
+
+/// Places every folder for this moment of the animations: the folders stacked
+/// under open ones are pushed down by how far those reach, the others are put
+/// back. All the moves go to Windows in one batch, so no frame shows some
+/// folders moved and others not.
+pub fn relayout() {
     panel::pushes_handled();
     let (push_below, gap) = store::with(|s| (s.settings.push_below, s.settings.gap));
     let list: Vec<(HWND, panel::Geometry)> =
@@ -244,10 +251,33 @@ fn update_pushes() {
             }
         }
     }
-    for ((hwnd, _), push) in list.iter().zip(offsets) {
-        panel::set_push(*hwnd, push);
-    }
+    let moves: Vec<(HWND, panel::Placement)> =
+        list.iter().zip(offsets).filter_map(|((hwnd, _), push)| panel::place_for(*hwnd, push).map(|p| (*hwnd, p))).collect();
     STACKS.with(|s| *s.borrow_mut() = stacks);
+    if moves.is_empty() {
+        return;
+    }
+    let flags = |resized: bool| SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | if resized { 0 } else { SWP_NOSIZE };
+    unsafe {
+        let mut batch = BeginDeferWindowPos(moves.len() as i32);
+        for &(hwnd, (x, y, w, h, resized)) in &moves {
+            if !batch.is_null() {
+                batch = DeferWindowPos(batch, hwnd, null_mut(), x, y, w, h, flags(resized));
+            }
+        }
+        if batch.is_null() || EndDeferWindowPos(batch) == 0 {
+            // The batch could not be made: move them one by one.
+            for &(hwnd, (x, y, w, h, resized)) in &moves {
+                SetWindowPos(hwnd, null_mut(), x, y, w, h, flags(resized));
+            }
+        }
+        for &(hwnd, (.., resized)) in &moves {
+            if resized {
+                InvalidateRect(hwnd, null(), 0);
+                UpdateWindow(hwnd);
+            }
+        }
+    }
 }
 
 /// The cursor is on a folder that this open folder pushes down.
