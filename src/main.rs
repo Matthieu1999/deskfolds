@@ -1,7 +1,9 @@
 #![windows_subsystem = "windows"]
 
+mod arrange;
 mod config;
 mod dragdrop;
+mod frame;
 mod layout;
 mod panel;
 mod settings;
@@ -14,18 +16,19 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{InvalidateRect, UpdateWindow};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Ole::OleInitialize;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, SetProcessDpiAwarenessContext};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, IsWindowEnabled};
 use windows_sys::Win32::UI::Shell::{
     ExtractIconExW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use panel::{LOCKED, WM_APP_PUSH, WM_APP_SHOW_MENU};
+use panel::{LOCKED, WM_APP_ARRANGE, WM_APP_PUSH, WM_APP_SHOW_MENU};
 use store::{Change, Store, WM_APP_CONFLICT, WM_APP_REFRESH};
 use ui::{Ask, MenuEntry};
 use util::{error_box, wide};
@@ -100,6 +103,9 @@ fn rebuild_panels(main: HWND) {
     let created: Vec<HWND> =
         list.iter().map(|p| panel::create(p, &settings, desktop, main)).filter(|h| !h.is_null()).collect();
     PANELS.with(|p| *p.borrow_mut() = created);
+    // The frame belonged to the old desktop window (Explorer restarted).
+    frame::hide();
+    arrange::rearrange();
 }
 
 /// Redraws only what the store says changed.
@@ -111,6 +117,12 @@ fn apply_changes(main: HWND, changes: &[Change]) {
         rebuild_panels(main);
         return;
     }
+    apply_panel_changes(main, changes);
+    // A folder joined, left, moved in the list or changed size: place the arrangement again.
+    arrange::rearrange();
+}
+
+fn apply_panel_changes(main: HWND, changes: &[Change]) {
     let (settings, list) = store::snapshot();
     let find = |id: u32| list.iter().find(|p| p.id == id);
     for change in changes {
@@ -156,6 +168,7 @@ fn reposition_panels() {
     for hwnd in panels() {
         panel::reposition(hwnd);
     }
+    arrange::rearrange();
 }
 
 /// Keeps the folder selected in the settings window open and outlined.
@@ -172,6 +185,8 @@ pub fn set_locked(locked: bool) {
     for hwnd in panels() {
         panel::set_editing(hwnd, !locked);
     }
+    // Shows or hides the arrangement's frame.
+    arrange::rearrange();
     settings::on_store_changed();
 }
 
@@ -190,15 +205,27 @@ pub fn new_folder() -> u32 {
     let dpi = unsafe { GetDpiForSystem() }.max(96);
     let area = panel::primary_work_area();
     let (x, y) = layout::free_spot(&taken, scale(width, dpi), scale(font + 20, dpi), area, scale(gap.max(8), dpi));
+    // It joins the arrangement, if there is one and the settings say so.
+    let join = arrange::has_members() && store::with(|s| s.settings.new_folders_join);
     store::change(|s| {
         let title = s.unique_title("New folder");
-        s.add_panel(&title, x, y, width)
+        let id = s.add_panel(&title, x, y, width);
+        if join {
+            s.set_arranged(&[id], true);
+        }
+        id
     })
 }
 
-/// Pushes the folders stacked under open ones down by how far those reach,
-/// and puts the others back.
 fn update_pushes() {
+    relayout();
+}
+
+/// Places every folder for this moment of the animations: the folders stacked
+/// under open ones are pushed down by how far those reach, the others are put
+/// back. All the moves go to Windows in one batch, so no frame shows some
+/// folders moved and others not.
+pub fn relayout() {
     panel::pushes_handled();
     let (push_below, gap) = store::with(|s| (s.settings.push_below, s.settings.gap));
     let list: Vec<(HWND, panel::Geometry)> =
@@ -206,7 +233,11 @@ fn update_pushes() {
     let mut offsets = vec![0; list.len()];
     let mut stacks = Vec::new();
     if push_below {
-        let labels: Vec<layout::Rect> = list.iter().map(|(_, g)| g.label).collect();
+        // A folder of the arrangement counts as tall as its row.
+        let labels: Vec<layout::Rect> = list
+            .iter()
+            .map(|(h, g)| layout::Rect { h: g.label.h.max(arrange::row_height(*h).unwrap_or(0)), ..g.label })
+            .collect();
         for (i, (opener, g)) in list.iter().enumerate() {
             if g.extra <= 0 && !g.open_down {
                 continue;
@@ -222,10 +253,33 @@ fn update_pushes() {
             }
         }
     }
-    for ((hwnd, _), push) in list.iter().zip(offsets) {
-        panel::set_push(*hwnd, push);
-    }
+    let moves: Vec<(HWND, panel::Placement)> =
+        list.iter().zip(offsets).filter_map(|((hwnd, _), push)| panel::place_for(*hwnd, push).map(|p| (*hwnd, p))).collect();
     STACKS.with(|s| *s.borrow_mut() = stacks);
+    if moves.is_empty() {
+        return;
+    }
+    let flags = |resized: bool| SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | if resized { 0 } else { SWP_NOSIZE };
+    unsafe {
+        let mut batch = BeginDeferWindowPos(moves.len() as i32);
+        for &(hwnd, (x, y, w, h, resized)) in &moves {
+            if !batch.is_null() {
+                batch = DeferWindowPos(batch, hwnd, null_mut(), x, y, w, h, flags(resized));
+            }
+        }
+        if batch.is_null() || EndDeferWindowPos(batch) == 0 {
+            // The batch could not be made: move them one by one.
+            for &(hwnd, (x, y, w, h, resized)) in &moves {
+                SetWindowPos(hwnd, null_mut(), x, y, w, h, flags(resized));
+            }
+        }
+        for &(hwnd, (.., resized)) in &moves {
+            if resized {
+                InvalidateRect(hwnd, null(), 0);
+                UpdateWindow(hwnd);
+            }
+        }
+    }
 }
 
 /// The cursor is on a folder that this open folder pushes down.
@@ -252,33 +306,24 @@ pub fn show_snap_targets(moving: HWND, targets: &[HWND]) {
     }
 }
 
-/// A folder is about to be moved: fold every folder (but the one selected in
-/// Settings), so it moves by its label and nothing is pushed meanwhile.
+/// A move of a folder or of the frame ended: with "all folders open while
+/// unlocked", the folders folded for the move open again.
+pub fn after_move() {
+    if !LOCKED.load(Ordering::Relaxed) && store::with(|s| s.settings.unlocked_open_all) {
+        for hwnd in panels() {
+            panel::set_editing(hwnd, true);
+        }
+    }
+}
+
+/// A folder (or the arrangement's frame, with a null `moving`) is about to be
+/// moved: fold every folder but the one selected in Settings, so it moves by
+/// its label and nothing is pushed meanwhile.
 pub fn fold_for_move(moving: HWND) {
     for hwnd in panels() {
         panel::close_now(hwnd, hwnd == moving);
     }
     update_pushes();
-}
-
-/// Puts every folder in a row, a column or a grid from the top left of the
-/// main screen, in the order of the Folders list. A backup is made first.
-pub fn arrange(how: layout::Arrange) {
-    let (gap, order) = store::with(|s| (s.settings.gap, s.panels.iter().map(|p| p.id).collect::<Vec<_>>()));
-    let mut ids = Vec::new();
-    let mut sizes = Vec::new();
-    let mut dpi = 96;
-    for id in order {
-        if let Some(g) = panel_window(id).and_then(panel::geometry) {
-            ids.push(id);
-            sizes.push((g.label.w, g.label.h));
-            dpi = g.dpi;
-        }
-    }
-    let spots = layout::arrange(&sizes, panel::primary_work_area(), scale(gap, dpi), how);
-    let positions: Vec<(u32, i32, i32)> = ids.into_iter().zip(spots).map(|(id, (x, y))| (id, x, y)).collect();
-    store::with(|s| s.backup_now());
-    store::change(|s| s.set_positions(&positions));
 }
 
 /// Loads config.toml again, after it was edited by hand.
@@ -334,6 +379,14 @@ fn open_settings(panel: Option<u32>) {
 }
 
 fn quit(main: HWND) {
+    // A dialog of the settings window is open: its code still uses the window
+    // once the dialog returns, so quitting now would pull it away. Show it instead.
+    if let Some(w) = settings::owner()
+        && unsafe { IsWindowEnabled(w) } == 0
+    {
+        unsafe { SetForegroundWindow(w) };
+        return;
+    }
     if store::with(|s| s.has_conflict()) {
         resolve_conflict();
     }
@@ -466,6 +519,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 update_pushes();
                 0
             }
+            WM_APP_ARRANGE => {
+                arrange::rearrange();
+                0
+            }
             WM_DISPLAYCHANGE => {
                 reposition_panels();
                 0
@@ -498,12 +555,30 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
     }
 }
 
+/// One deskfolds per config file. With the usual one it keeps the name older
+/// versions use, so they never run together; another APPDATA (a test copy)
+/// gets its own.
+fn instance_name() -> String {
+    const NAME: &str = "Local\\deskfolds.single-instance";
+    // Compared after resolving links, mapped drives and short names.
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().to_lowercase();
+    let usual = dragdrop::roaming_app_data();
+    let ours = config::app_dir();
+    let our_root = ours.parent().map(canon);
+    if usual.as_deref().is_none_or(|d| Some(canon(d)) == our_root) {
+        return NAME.into();
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&ours.to_string_lossy().to_lowercase(), &mut h);
+    format!("{NAME}.{:016x}", std::hash::Hasher::finish(&h))
+}
+
 fn main() {
     unsafe {
         // Also set by the manifest; kept for builds without it.
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-        let mutex_name = wide("Local\\deskfolds.single-instance");
+        let mutex_name = wide(&instance_name());
         let _mutex = CreateMutexW(null(), 0, mutex_name.as_ptr());
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return;
@@ -531,6 +606,7 @@ fn main() {
         RegisterClassW(&wc);
         panel::register_class();
         settings::register_class();
+        frame::register_class();
 
         // Hidden top-level window: receives tray, menu and store messages.
         let main = CreateWindowExW(

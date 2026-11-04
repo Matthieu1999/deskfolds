@@ -71,6 +71,23 @@ unlocked_open_all = false     # while unlocked: true = every folder open, false 
 cell_width = 72               # column width of panels with fit_columns = true
 new_folder_width = 300        # width of new folders
 
+# The arrangement: the folders with arranged = true are placed in it, in the
+# order of this file, and moved with it. Its frame can be dragged while
+# unlocked. Shape: "row", "column" or "grid"; a grid has arrange_count
+# columns (arrange_by = "columns", filled left to right) or rows ("rows",
+# filled top to bottom). Anchor: top_left, top_center, top_right,
+# middle_left, center, middle_right, bottom_left, bottom_center or
+# bottom_right, moved by the offset (pixels). arrange_screen: empty for the
+# main screen, or a monitor's device name such as \\.\DISPLAY2.
+arrange_shape = "grid"
+arrange_count = 3
+arrange_by = "columns"
+arrange_anchor = "top_left"
+arrange_offset_x = 0
+arrange_offset_y = 0
+arrange_screen = ""
+new_folders_join = true       # new folders join the arrangement (if it has folders)
+
 # A panel with fit_columns = true is columns x cell_width wide (plus 12 px).
 [[panel]]
 title = "Apps"

@@ -65,6 +65,9 @@ pub const WM_APP_SHOW_MENU: u32 = WM_APP + 2;
 /// Posted to the main window when a panel grew, shrank or moved: the folders
 /// stacked under open ones are pushed down again.
 pub const WM_APP_PUSH: u32 = WM_APP + 3;
+/// Posted to the main window when a panel changed size outside the store (a
+/// new DPI): the arrangement is placed again.
+pub const WM_APP_ARRANGE: u32 = WM_APP + 4;
 
 thread_local! {
     /// The shortcut being dragged out of a panel, by id.
@@ -73,6 +76,8 @@ thread_local! {
     static INTERNAL_DROP_DONE: Cell<bool> = const { Cell::new(false) };
     /// A WM_APP_PUSH is waiting in the queue.
     static PUSH_POSTED: Cell<bool> = const { Cell::new(false) };
+    /// A panel is being raised above the others on purpose: it may leave the bottom.
+    static RAISING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Asks the main window to update the pushes, once however often it is asked.
@@ -121,8 +126,13 @@ pub struct PanelState {
     up: bool,
     /// What the main window last heard about: position, size, upwards.
     last_reach: Option<((i32, i32), i32, i32, bool)>,
+    /// The window's position and size as last given to Windows.
+    applied: Option<(i32, i32, i32, i32)>,
     /// Being moved by its name: pushes leave it alone.
     moving: bool,
+    /// The window rectangle last given while moving: a different one at the
+    /// end means the move was cancelled (Esc).
+    last_moving: Option<RECT>,
     /// Lit up as the folder that a moved folder snaps to.
     snap_target: bool,
     /// Target state: open or closed. `progress` animates towards it.
@@ -572,7 +582,9 @@ pub fn create(cfg: &Panel, settings: &Settings, desktop: HWND, main: HWND) -> HW
         shown: (cfg.x, cfg.y),
         up: false,
         last_reach: None,
+        applied: None,
         moving: false,
+        last_moving: None,
         snap_target: false,
         cfg: cfg.clone(),
         settings: settings.clone(),
@@ -639,6 +651,9 @@ pub fn create(cfg: &Panel, settings: &Settings, desktop: HWND, main: HWND) -> HW
         st.place();
         apply_size(hwnd, st);
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        // A new window starts above the others: put it at the bottom, under
+        // every program. Later moves leave the z-order alone.
+        SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
         dragdrop::register(hwnd, &DROP_HANDLER);
         hwnd
     }
@@ -664,6 +679,10 @@ pub fn update(hwnd: HWND, cfg: &Panel, settings: &Settings) {
     st.settings = settings.clone();
     if st.hover.is_some_and(|i| i >= st.cfg.items.len()) {
         st.hover = None;
+    }
+    // A shortcut pressed before the change may be gone.
+    if st.press.is_some_and(|(_, _, i)| i >= st.cfg.items.len()) {
+        st.press = None;
     }
     if resources {
         st.load_resources();
@@ -728,16 +747,46 @@ pub fn geometry(hwnd: HWND) -> Option<Geometry> {
     })
 }
 
-/// Moves the panel down by `push` pixels (0 puts it back), unless it is being moved.
-pub fn set_push(hwnd: HWND, push: i32) {
-    let Some(st) = state(hwnd) else { return };
-    if st.moving || st.push == push {
-        return;
+/// Where a window goes: (x, y, width, height, resized).
+pub type Placement = (i32, i32, i32, i32, bool);
+
+/// Where the window goes in the next batch of moves, pushed down by `push`
+/// pixels. None when it does not change, or while it is being moved by the user.
+pub fn place_for(hwnd: HWND, push: i32) -> Option<Placement> {
+    let st = state(hwnd)?;
+    if st.moving {
+        return None;
     }
     st.push = push;
+    let (w, h) = st.size();
     let (x, y) = st.window_pos();
     st.shown = (x, y);
-    unsafe { SetWindowPos(hwnd, HWND_BOTTOM, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE) };
+    // The pushes were just worked out with this size: no need to ask again.
+    st.last_reach = Some((st.pos, w, h, st.up));
+    let rect = (x, y, w, h);
+    if st.applied == Some(rect) {
+        return None;
+    }
+    let resized = st.applied.is_none_or(|a| (a.2, a.3) != (w, h));
+    st.applied = Some(rect);
+    Some((x, y, w, h, resized))
+}
+
+/// Shows the label at (x, y) without saving it: the arrangement it is in is
+/// being moved, or makes room for a dragged folder.
+pub fn set_label(hwnd: HWND, x: i32, y: i32) {
+    let Some(st) = state(hwnd) else { return };
+    if st.moving || st.pos == (x, y) {
+        return;
+    }
+    st.pos = (x, y);
+    let (wx, wy) = st.window_pos();
+    st.shown = (wx, wy);
+    let (w, h) = st.size();
+    st.applied = Some((wx, wy, w, h));
+    let main = st.main;
+    unsafe { SetWindowPos(hwnd, null_mut(), wx, wy, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER) };
+    request_pushes(main);
 }
 
 /// Closes the panel at once, without animation, before a folder is moved. The
@@ -968,8 +1017,11 @@ fn apply_size(hwnd: HWND, st: &mut PanelState) {
     let (w, h) = st.size();
     let (x, y) = st.window_pos();
     st.shown = (x, y);
+    st.applied = Some((x, y, w, h));
     unsafe {
-        SetWindowPos(hwnd, HWND_BOTTOM, x, y, w, h, SWP_NOACTIVATE);
+        // The z-order is left alone: changing it makes Windows redraw the glass
+        // of the other folders.
+        SetWindowPos(hwnd, null_mut(), x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
         InvalidateRect(hwnd, null(), 0);
         UpdateWindow(hwnd);
     }
@@ -999,7 +1051,7 @@ fn set_open(hwnd: HWND, st: &mut PanelState, open: bool) {
     st.open = open;
     st.hover = None;
     if open {
-        push_other_panels_down(hwnd);
+        raise_above_panels(hwnd);
     }
     if st.settings.animation_ms == 0 {
         st.progress = if open { 1.0 } else { 0.0 };
@@ -1024,23 +1076,37 @@ fn animate(hwnd: HWND, st: &mut PanelState) {
         st.up &= st.open;
         unsafe { KillTimer(hwnd, ANIM_TIMER) };
     }
-    apply_size(hwnd, st);
+    // This folder's new size and the folders it pushes move together, in one
+    // batch: otherwise some are drawn moved and others not, and the glass flickers.
+    crate::relayout();
 }
 
-/// Sends every other panel to the bottom so an open panel overlaps its neighbours.
-fn push_other_panels_down(keep: HWND) {
-    let class = wide(CLASS_NAME);
-    let mut other = null_mut();
+/// Puts an opening panel above the other panels, still under every other
+/// window, so it covers the neighbours it overlaps. Only this window changes
+/// place, and only if a panel is above it: moving the others in the z-order
+/// makes Windows redraw their glass, which flickers.
+fn raise_above_panels(hwnd: HWND) {
+    let ours = crate::panels();
+    let mut top = null_mut();
+    let mut h = hwnd;
     loop {
-        other = unsafe { FindWindowExW(null_mut(), other, class.as_ptr(), null()) };
-        if other.is_null() {
+        h = unsafe { GetWindow(h, GW_HWNDPREV) };
+        if h.is_null() {
             break;
         }
-        if other != keep {
-            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
-            unsafe { SetWindowPos(other, HWND_BOTTOM, 0, 0, 0, 0, flags) };
+        if ours.contains(&h) {
+            top = h;
         }
     }
+    if top.is_null() {
+        return;
+    }
+    let above = unsafe { GetWindow(top, GW_HWNDPREV) };
+    RAISING.set(true);
+    // NOOWNERZORDER: the desktop window owns the panels and must stay where it is.
+    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+    unsafe { SetWindowPos(hwnd, if above.is_null() { HWND_TOP } else { above }, 0, 0, 0, 0, flags) };
+    RAISING.set(false);
 }
 
 fn cursor_x() -> i32 {
@@ -1085,6 +1151,14 @@ fn on_leave(hwnd: HWND, st: &mut PanelState, locked: bool) {
 fn snap_moving(hwnd: HWND, st: &PanelState, r: &mut RECT) {
     let dy = st.shown.1 - st.pos.1;
     let (w, h) = st.closed_size();
+    // Over the arrangement's frame, it takes a place there instead of snapping.
+    let mut cursor = POINT { x: 0, y: 0 };
+    unsafe { GetCursorPos(&mut cursor) };
+    let free = unsafe { GetKeyState(VK_MENU as i32) } < 0;
+    if crate::arrange::folder_moving(st.cfg.id, layout::Rect { x: r.left, y: r.top - dy, w, h }, cursor, free) {
+        crate::show_snap_targets(hwnd, &[]);
+        return;
+    }
     let mut targets = Vec::new();
     if st.settings.snap && unsafe { GetKeyState(VK_MENU as i32) } >= 0 {
         let label = layout::Rect { x: r.left, y: r.top - dy, w, h };
@@ -1133,10 +1207,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         match msg {
             WM_MOUSEACTIVATE => return MA_NOACTIVATE as LRESULT,
             WM_WINDOWPOSCHANGING => {
-                // Stay at the bottom of the z-order, and pinned while locked.
+                // Stay at the bottom of the z-order, and pinned while locked. A
+                // move that leaves the z-order alone keeps it alone.
                 let pos = &mut *(lparam as *mut WINDOWPOS);
-                pos.hwndInsertAfter = HWND_BOTTOM;
-                pos.flags &= !SWP_NOZORDER;
+                if pos.flags & SWP_NOZORDER == 0 && !RAISING.get() {
+                    pos.hwndInsertAfter = HWND_BOTTOM;
+                }
                 if locked {
                     pos.x = st.shown.0;
                     pos.y = st.shown.1;
@@ -1160,10 +1236,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             WM_ENTERSIZEMOVE => {
                 st.moving = !locked;
+                st.last_moving = None;
                 return 0;
             }
             WM_MOVING if st.moving => {
-                snap_moving(hwnd, st, &mut *(lparam as *mut RECT));
+                let r = &mut *(lparam as *mut RECT);
+                snap_moving(hwnd, st, r);
+                st.last_moving = Some(*r);
                 return 1;
             }
             WM_EXITSIZEMOVE => {
@@ -1171,19 +1250,27 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 let mut r: RECT = std::mem::zeroed();
                 GetWindowRect(hwnd, &mut r);
                 let dy = st.shown.1 - st.pos.1;
+                let moved = st.last_moving.take().is_some_and(|m| (m.left, m.top) == (r.left, r.top));
                 st.moving = false;
                 st.pos = (r.left, r.top - dy);
                 st.shown = (r.left, r.top);
                 let (id, (x, y), main) = (st.cfg.id, st.pos, st.main);
                 crate::show_snap_targets(hwnd, &[]);
-                store::change(|s| {
-                    s.update_panel(id, |p| {
-                        p.x = x;
-                        p.y = y;
-                    })
-                });
+                if moved {
+                    // Saves it, and puts it into the arrangement or out of it.
+                    crate::arrange::folder_dropped(id, x, y);
+                } else {
+                    // Esc put it back, or it was only clicked.
+                    crate::arrange::cancel_drag();
+                }
                 request_pushes(main);
                 return 0;
+            }
+            WM_WINDOWPOSCHANGED => {
+                // Sent to the bottom of the z-order: the arrangement's frame goes back under it.
+                if (*(lparam as *const WINDOWPOS)).flags & SWP_NOZORDER == 0 {
+                    crate::frame::keep_below();
+                }
             }
             WM_NCMOUSEMOVE => {
                 // While unlocked the name is the move handle, outside the client area.
@@ -1336,10 +1423,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     }
                     Hit::Item(i) => {
                         let item = st.cfg.items[i].clone();
-                        launch(&item.path, &item.args);
                         if st.settings.collapse_after_launch && !st.pinned && !st.highlighted {
                             set_open(hwnd, st, false);
                         }
+                        // Last, and nothing of the panel is used after it: ShellExecute can
+                        // run a message loop (a security prompt) in which the panel is destroyed.
+                        launch(&item.path, &item.args);
                     }
                     Hit::Grip | Hit::Nothing => {}
                 }
@@ -1372,6 +1461,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     st.pos = (suggested.left, suggested.top);
                 }
                 apply_size(hwnd, st);
+                // Its size changed: the arrangement it may be in is placed again.
+                PostMessageW(st.main, WM_APP_ARRANGE, 0, 0);
                 return 0;
             }
             WM_SYSCOMMAND => {
@@ -1549,6 +1640,17 @@ fn paint(hwnd: HWND, st: &PanelState, locked: bool) {
         let mut bits: *mut c_void = null_mut();
         let mem = CreateCompatibleDC(hdc);
         let bmp = CreateDIBSection(mem, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+        if mem.is_null() || bmp.is_null() || bits.is_null() {
+            // Out of memory or GDI handles: nothing drawn this time.
+            if !bmp.is_null() {
+                DeleteObject(bmp);
+            }
+            if !mem.is_null() {
+                DeleteDC(mem);
+            }
+            EndPaint(hwnd, &ps);
+            return;
+        }
         let old_bmp = SelectObject(mem, bmp);
         SetBkMode(mem, TRANSPARENT as _);
         SetTextColor(mem, text);
@@ -1631,7 +1733,7 @@ fn paint(hwnd: HWND, st: &PanelState, locked: bool) {
         }
 
         GdiFlush();
-        let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, (w * h) as usize);
+        let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, w as usize * h as usize);
         let band = title_top.max(0) as usize..(title_top + l.title_h).max(0) as usize;
         fix_alpha(pixels, w as usize, band, ease_out_cubic(st.progress));
 

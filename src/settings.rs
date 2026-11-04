@@ -18,7 +18,7 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemServices::{SS_CENTERIMAGE, SS_ENDELLIPSIS, SS_NOPREFIX, SS_PATHELLIPSIS};
 use windows_sys::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, EM_SETSEL, HIMAGELIST, MEASUREITEMSTRUCT, ODS_DISABLED, ODS_SELECTED, ODT_LISTBOX, I_IMAGENONE, ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ILC_COLOR32, ILC_MASK, INITCOMMONCONTROLSEX,
+    DRAWITEMSTRUCT, EM_SETSEL, HIMAGELIST, MEASUREITEMSTRUCT, ODS_DISABLED, ODS_SELECTED, ODT_BUTTON, ODT_LISTBOX, I_IMAGENONE, ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ILC_COLOR32, ILC_MASK, INITCOMMONCONTROLSEX,
     ImageList_Create, ImageList_Destroy, ImageList_ReplaceIcon, InitCommonControlsEx, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
     LVIF_IMAGE, LVIF_PARAM, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS,
     LVM_ENSUREVISIBLE, LVM_GETITEMW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETBKCOLOR,
@@ -33,8 +33,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, Ge
 use windows_sys::Win32::UI::Shell::ExtractIconExW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::config::{self, MIN_WIDTH, Settings, TitleStyle, format_color, parse_color};
-use crate::layout::Arrange;
+use crate::arrange;
+use crate::config::{self, ANCHORS, MIN_WIDTH, Settings, TitleStyle, anchor_label, format_color, parse_color};
+use crate::layout::Shape;
 use crate::dragdrop::{self, DropHandler, storage_root};
 use crate::panel::{self, DEFAULT_PANEL_ICON, LOCKED};
 use crate::store;
@@ -109,6 +110,7 @@ const S_ICON_V: i32 = 224;
 const S_ICON: i32 = 225;
 const F_FIT: i32 = 226;
 const F_ARRANGE: i32 = 227;
+const F_ARRANGED: i32 = 228;
 
 const A_LIGHT: i32 = 300;
 const A_DARK: i32 = 301;
@@ -159,9 +161,23 @@ const L_CLOSED: i32 = 607;
 const L_OPEN_ALL: i32 = 608;
 const L_CELL: i32 = 610;
 const L_NEW_W: i32 = 612;
-const L_ROW: i32 = 615;
-const L_COLUMN: i32 = 616;
-const L_GRID: i32 = 617;
+const L_SHAPE_ROW: i32 = 620;
+const L_SHAPE_COLUMN: i32 = 621;
+const L_SHAPE_GRID: i32 = 622;
+const L_COUNT: i32 = 623;
+const L_BY: i32 = 625;
+/// The 9 anchor buttons, L_ANCHOR + vertical × 3 + horizontal.
+const L_ANCHOR: i32 = 630;
+const L_OFFSET_X: i32 = 640;
+const L_OFFSET_Y: i32 = 642;
+const L_SCREEN: i32 = 644;
+const L_NOW: i32 = 645;
+const L_MEMBERS: i32 = 646;
+const L_CHOOSE: i32 = 647;
+const L_JOIN: i32 = 648;
+const L_ARRANGE_ALL: i32 = 649;
+const L_FREE_ALL: i32 = 650;
+const L_LINE: i32 = 651;
 
 /// The clickable text next to a check box or a radio button: its id + this.
 const CAPTION: i32 = 1000;
@@ -170,7 +186,7 @@ const UPDOWN: i32 = 5000;
 
 const COLOR_BUTTONS: [i32; 5] = [A_TINT, A_ACCENT, A_TEXT, A_HOVER, A_BORDER];
 /// Check boxes that have a caption.
-const CAPTIONED_CHECKS: [i32; 3] = [F_FIT, A_COUNT, L_SNAP];
+const CAPTIONED_CHECKS: [i32; 5] = [F_FIT, F_ARRANGED, A_COUNT, L_SNAP, L_JOIN];
 const TITLE_STYLES: [(i32, TitleStyle); 4] = [
     (A_STYLE_CENTERED, TitleStyle::Centered),
     (A_STYLE_LEFT, TitleStyle::Left),
@@ -180,7 +196,7 @@ const TITLE_STYLES: [(i32, TitleStyle); 4] = [
 
 /// Number boxes: (id, smallest, largest, arrow step). Typed values may go past
 /// the slider next to it, up to what the config file accepts.
-const NUMBERS: [(i32, i32, i32, i32); 14] = [
+const NUMBERS: [(i32, i32, i32, i32); 17] = [
     (F_WIDTH + 1, MIN_WIDTH, 4000, 10),
     (F_COLS + 1, 1, 20, 1),
     (F_X, -32000, 32000, 1),
@@ -195,6 +211,9 @@ const NUMBERS: [(i32, i32, i32, i32); 14] = [
     (L_GAP, 0, 40, 1),
     (L_CELL + 1, 40, 200, 2),
     (L_NEW_W + 1, MIN_WIDTH, 4000, 10),
+    (L_COUNT, 1, 20, 1),
+    (L_OFFSET_X, -20000, 20000, 1),
+    (L_OFFSET_Y, -20000, 20000, 1),
 ];
 
 fn number_def(id: i32) -> Option<(i32, i32, i32)> {
@@ -262,7 +281,11 @@ struct Win {
     dpi: u32,
     font: HFONT,
     heading: HFONT,
+    /// Semibold, for the title of a group of settings.
+    strong: HFONT,
     bg: HBRUSH,
+    /// The line above a group of settings.
+    line: HBRUSH,
     pane: HBRUSH,
     field: HBRUSH,
     icons: [HICON; 2],
@@ -287,6 +310,10 @@ struct Win {
     select_name: bool,
     drop_list: HWND,
     backups: Vec<PathBuf>,
+    /// The screens in the Layout page's list, by device name ("" = main).
+    screens: Vec<String>,
+    /// The arrangement's anchor, for drawing the anchor buttons.
+    anchor: (usize, usize),
 }
 
 fn win<'a>(hwnd: HWND) -> Option<&'a mut Win> {
@@ -413,7 +440,9 @@ pub fn open(panel: Option<u32>, rename: bool) {
         dpi: 96,
         font: null_mut(),
         heading: null_mut(),
+        strong: null_mut(),
         bg: unsafe { CreateSolidBrush(BG) },
+        line: unsafe { CreateSolidBrush(0x00383838) },
         pane: unsafe { CreateSolidBrush(PANE) },
         field: unsafe { CreateSolidBrush(FIELD) },
         icons: [null_mut(); 2],
@@ -432,6 +461,8 @@ pub fn open(panel: Option<u32>, rename: bool) {
         select_name: rename,
         drop_list: null_mut(),
         backups: Vec::new(),
+        screens: Vec::new(),
+        anchor: (0, 0),
     });
     let area = work_area_at_cursor();
     let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
@@ -553,8 +584,13 @@ impl Win {
                 face.as_ptr(),
             )
         };
-        let (font, heading) = (make(self.s(12), FW_NORMAL as i32), make(self.s(22), FW_SEMIBOLD as i32));
-        for old in [std::mem::replace(&mut self.font, font), std::mem::replace(&mut self.heading, heading)] {
+        let (font, heading, strong) =
+            (make(self.s(12), FW_NORMAL as i32), make(self.s(22), FW_SEMIBOLD as i32), make(self.s(13), FW_SEMIBOLD as i32));
+        for old in [
+            std::mem::replace(&mut self.font, font),
+            std::mem::replace(&mut self.heading, heading),
+            std::mem::replace(&mut self.strong, strong),
+        ] {
             if !old.is_null() {
                 unsafe { DeleteObject(old) };
             }
@@ -653,6 +689,26 @@ impl Win {
         send(arrows, UDM_SETRANGE32, (-10isize) as usize, 10);
         send(arrows, UDM_SETBUDDY, edit as usize, 0);
         ui::dark_control(arrows, false);
+    }
+
+    /// A drop-down list of choices.
+    fn combo(&mut self, x: i32, y: i32, w: i32, id: i32, items: &[&str]) {
+        let h = self.create("COMBOBOX", "", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32, 0, (x, y, w, 200), id);
+        ui::dark_control(h, true);
+        for item in items {
+            let text = wide(item);
+            send(h, CB_ADDSTRING, 0, text.as_ptr() as isize);
+        }
+    }
+
+    /// The 3 × 3 buttons that pick the arrangement's anchor.
+    fn anchor_buttons(&mut self, x: i32, y: i32) {
+        for v in 0..3 {
+            for h in 0..3 {
+                let style = WS_TABSTOP | BS_OWNERDRAW as u32;
+                self.create("BUTTON", "", style, 0, (x + h * 24, y + v * 20, 22, 18), L_ANCHOR + v * 3 + h);
+            }
+        }
     }
 
     /// A check box with its caption, which can be clicked too.
@@ -778,9 +834,9 @@ impl Win {
         self.slider(cx, 90, 230, F_WIDTH);
         self.label("Columns", rx, 124, 92);
         self.slider(cx, 122, 230, F_COLS);
-        self.label("Sizing", rx, 156, 92);
+        self.label("Options", rx, 156, 92);
         self.check_text(cx, 156, F_FIT, "Width follows the columns", 160);
-        self.help("= columns × cell width", 680, 159, 184);
+        self.check_text(690, 156, F_ARRANGED, "In the arrangement", 150);
         self.label("Position", rx, 190, 92);
         self.label("X", cx, 190, 14);
         self.number(cx + 16, 190, 64, F_X);
@@ -892,7 +948,7 @@ impl Win {
         self.check_text(cx, 56, L_SNAP, "Snap to other folders and to the screen edges", 300);
         self.help("Hold Alt while dragging to place a folder freely.", lx, 78, 420);
         self.label("Gap between folders", lx, 104, 200);
-        self.help("For snapping, pushing and Arrange", lx, 126, 205);
+        self.help("For snapping, pushing and arranging", lx, 126, 205);
         self.number(cx, 106, 64, L_GAP);
         self.label("px", cx + 72, 106, 30);
         self.label("When a folder opens", lx, 150, 200);
@@ -912,12 +968,36 @@ impl Win {
         self.slider(cx, 288, 330, L_CELL);
         self.label("Width of new folders", lx, 334, 200);
         self.slider(cx, 332, 330, L_NEW_W);
-        self.label("Arrange all folders", lx, 380, 200);
-        self.button("In a row", cx, 378, 120, L_ROW);
-        self.button("In a column", cx + 126, 378, 120, L_COLUMN);
-        self.button("As a grid", cx + 252, 378, 120, L_GRID);
-        self.help("In the order of the Folders list, from the top left of the main screen.", lx, 410, 600);
-        self.help("A backup is made first, so Previous versions \u{203A} Restore can undo it.", lx, 428, 600);
+        self.create("STATIC", "", SS_NOPREFIX, 0, (lx, 372, 664, 1), L_LINE);
+        let title = self.label("Arrangement", lx, 380, 200);
+        send(title, WM_SETFONT, self.strong as usize, 0);
+        self.help("The folders in it move and stay together.", cx, 383, 454);
+        self.label("Shape", lx, 412, 200);
+        self.radio(cx, 412, L_SHAPE_ROW, "Row", 46);
+        self.radio(cx + 70, 412, L_SHAPE_COLUMN, "Column", 62);
+        self.radio(cx + 156, 412, L_SHAPE_GRID, "Grid", 46);
+        self.label("of", 640, 412, 18);
+        self.number(660, 412, 64, L_COUNT);
+        self.combo(732, 412, 132, L_BY, &["columns", "rows"]);
+        self.label("Place on the screen", lx, 448, 200);
+        self.help("Or drag its frame while unlocked", lx, 470, 205);
+        self.anchor_buttons(cx, 446);
+        self.label("Offset X", 490, 448, 52);
+        self.number(544, 448, 64, L_OFFSET_X);
+        self.label("Y", 618, 448, 14);
+        self.number(634, 448, 64, L_OFFSET_Y);
+        let screens = arrange::screens();
+        let labels: Vec<&str> = screens.iter().map(|s| s.label.as_str()).collect();
+        self.combo(710, 448, 154, L_SCREEN, &labels);
+        self.screens = screens.iter().map(|s| s.device.clone()).collect();
+        self.path(490, 474, 374, L_NOW);
+        self.label("Folders in it", lx, 512, 200);
+        self.create("STATIC", "", SS_NOPREFIX | SS_CENTERIMAGE, 0, (cx, 512, 60, 24), L_MEMBERS);
+        self.button("Choose…", 474, 510, 90, L_CHOOSE);
+        self.check_text(580, 512, L_JOIN, "New folders join it", 150);
+        self.button("Arrange all folders", cx, 548, 160, L_ARRANGE_ALL);
+        self.button("Free all folders", cx + 166, 548, 140, L_FREE_ALL);
+        self.help("Drag a folder out of the frame to free it, or into the frame to add it.", lx, 584, 664);
     }
 
     fn build_about(&mut self) {
@@ -1098,7 +1178,7 @@ impl Win {
         let panel = index.map(|i| &panels[i]);
         self.enable(F_UP, index.is_some_and(|i| i > 0));
         self.enable(F_DOWN, index.is_some_and(|i| i + 1 < panels.len()));
-        for id in [F_NAME, F_ICON, F_DELETE, F_WIDTH, F_WIDTH + 1, F_COLS, F_COLS + 1, F_FIT, F_X, F_Y, F_OPEN, S_ADD, S_LIST] {
+        for id in [F_NAME, F_ICON, F_DELETE, F_WIDTH, F_WIDTH + 1, F_COLS, F_COLS + 1, F_FIT, F_ARRANGED, F_X, F_Y, F_OPEN, S_ADD, S_LIST] {
             self.enable(id, panel.is_some());
         }
         self.enable(F_ARRANGE, !panels.is_empty());
@@ -1125,6 +1205,10 @@ impl Win {
         self.set_slider(F_COLS, p.columns);
         self.set_edit(F_X, &p.x.to_string());
         self.set_edit(F_Y, &p.y.to_string());
+        // In the arrangement, it places the folder.
+        self.set_check(F_ARRANGED, p.arranged);
+        self.enable(F_X, !p.arranged);
+        self.enable(F_Y, !p.arranged);
         let (storage, stored) =
             store::with(|s| (s.storage_of(p.id), p.items.iter().map(|it| s.is_stored(p.id, it)).collect::<Vec<_>>()));
         self.set_text(F_STORAGE, &storage.display().to_string());
@@ -1210,6 +1294,32 @@ impl Win {
         self.set_radio(L_OPEN_ALL, s.unlocked_open_all);
         self.set_slider(L_CELL, s.cell_width);
         self.set_slider(L_NEW_W, s.new_folder_width);
+
+        let spec = s.arrange_spec();
+        let grid = spec.shape == Shape::Grid;
+        self.set_radio(L_SHAPE_ROW, spec.shape == Shape::Row);
+        self.set_radio(L_SHAPE_COLUMN, spec.shape == Shape::Column);
+        self.set_radio(L_SHAPE_GRID, grid);
+        self.set_edit(L_COUNT, &s.arrange_count.to_string());
+        self.enable(L_COUNT, grid);
+        send(self.get(L_BY), CB_SETCURSEL, spec.by_rows as usize, 0);
+        self.enable(L_BY, grid);
+        self.anchor = spec.anchor;
+        for i in 0..9 {
+            unsafe { InvalidateRect(self.get(L_ANCHOR + i), null(), 0) };
+        }
+        self.set_edit(L_OFFSET_X, &s.arrange_offset_x.to_string());
+        self.set_edit(L_OFFSET_Y, &s.arrange_offset_y.to_string());
+        let screen = self.screens.iter().position(|d| d.eq_ignore_ascii_case(&s.arrange_screen)).unwrap_or(0);
+        send(self.get(L_SCREEN), CB_SETCURSEL, screen, 0);
+        let moved = if spec.offset != (0, 0) { format!(", moved by {}, {}", spec.offset.0, spec.offset.1) } else { String::new() };
+        self.set_text(L_NOW, &format!("Now: {}{moved}", anchor_label(spec.anchor)));
+        let (n, all) = store::with(|st| (st.panels.iter().filter(|p| p.arranged).count(), st.panels.len()));
+        self.set_text(L_MEMBERS, &format!("{n} of {all}"));
+        self.enable(L_CHOOSE, all > 0);
+        self.enable(L_ARRANGE_ALL, all > 0);
+        self.enable(L_FREE_ALL, n > 0);
+        self.set_check(L_JOIN, s.new_folders_join);
     }
 
     fn sync_about(&mut self) {
@@ -1271,6 +1381,9 @@ impl Win {
             (F_Y, Some(p)) => store::change(|s| s.update_panel(p, |panel| panel.y = v)),
             (A_LINES, _) => store::change(|s| s.update_settings(|st| st.title_lines = v)),
             (L_GAP, _) => store::change(|s| s.update_settings(|st| st.gap = v)),
+            (L_COUNT, _) => store::change(|s| s.update_settings(|st| st.arrange_count = v)),
+            (L_OFFSET_X, _) => store::change(|s| s.update_settings(|st| st.arrange_offset_x = v)),
+            (L_OFFSET_Y, _) => store::change(|s| s.update_settings(|st| st.arrange_offset_y = v)),
             // A slider's box.
             _ => self.commit_slider(id - 1, v),
         }
@@ -1309,12 +1422,24 @@ impl Win {
 
     /// The Arrange menu, under the button that opens it.
     fn arrange_menu(&self, under: i32) {
-        let entries: [MenuEntry; 3] = [(1, "In a row at the top", 0), (2, "In a column on the left", 0), (3, "As a grid", 0)];
+        let entries: [MenuEntry; 3] = [(1, "In a row", 0), (2, "In a column", 0), (3, "As a grid", 0)];
         match ui::popup_menu(self.hwnd, &entries, self.below(under)) {
-            1 => crate::arrange(Arrange::Row),
-            2 => crate::arrange(Arrange::Column),
-            3 => crate::arrange(Arrange::Grid),
+            1 => arrange::arrange_all(Some("row")),
+            2 => arrange::arrange_all(Some("column")),
+            3 => arrange::arrange_all(Some("grid")),
             _ => {}
+        }
+    }
+
+    /// The folders, checked when they are in the arrangement: picking one puts
+    /// it in or takes it out.
+    fn members_menu(&self) {
+        let list: Vec<(u32, String, bool)> = store::with(|s| s.panels.iter().map(|p| (p.id, ui::menu_text(&p.title), p.arranged)).collect());
+        let entries: Vec<MenuEntry> =
+            list.iter().enumerate().map(|(i, (_, title, on))| (i + 1, title.as_str(), if *on { MF_CHECKED } else { MF_UNCHECKED })).collect();
+        let pick = ui::popup_menu(self.hwnd, &entries, self.below(L_CHOOSE));
+        if let Some(&(id, _, on)) = pick.checked_sub(1).and_then(|i| list.get(i)) {
+            store::change(|s| s.set_arranged(&[id], !on));
         }
     }
 
@@ -1404,9 +1529,37 @@ impl Win {
             L_PUSH | L_COVER => store::change(|s| s.update_settings(|st| st.push_below = id == L_PUSH)),
             L_AUTO | L_DOWN => store::change(|s| s.update_settings(|st| st.open_upwards = id == L_AUTO)),
             L_CLOSED | L_OPEN_ALL => store::change(|s| s.update_settings(|st| st.unlocked_open_all = id == L_OPEN_ALL)),
-            L_ROW => crate::arrange(Arrange::Row),
-            L_COLUMN => crate::arrange(Arrange::Column),
-            L_GRID => crate::arrange(Arrange::Grid),
+            F_ARRANGED => {
+                let on = self.checked(F_ARRANGED);
+                if let Some(p) = panel {
+                    store::change(|s| s.set_arranged(&[p], on));
+                }
+            }
+            L_SHAPE_ROW | L_SHAPE_COLUMN | L_SHAPE_GRID => {
+                let shape = match id {
+                    L_SHAPE_ROW => "row",
+                    L_SHAPE_COLUMN => "column",
+                    _ => "grid",
+                };
+                store::change(|s| s.update_settings(|st| st.arrange_shape = shape.into()));
+            }
+            id if (L_ANCHOR..L_ANCHOR + 9).contains(&id) => {
+                let i = (id - L_ANCHOR) as usize;
+                store::change(|s| {
+                    s.update_settings(|st| {
+                        st.arrange_anchor = ANCHORS[i / 3][i % 3].into();
+                        st.arrange_offset_x = 0;
+                        st.arrange_offset_y = 0;
+                    })
+                });
+            }
+            L_CHOOSE => self.members_menu(),
+            L_JOIN => {
+                let on = self.checked(L_JOIN);
+                store::change(|s| s.update_settings(|st| st.new_folders_join = on));
+            }
+            L_ARRANGE_ALL => arrange::arrange_all(None),
+            L_FREE_ALL => arrange::free_all(),
             F_OPEN => {
                 if let Some(p) = panel {
                     let dir = store::with(|s| s.storage_of(p));
@@ -1613,6 +1766,18 @@ impl Win {
                     self.show_page(page);
                 }
             }
+            (L_BY, CBN_SELCHANGE) => {
+                let rows = send(self.get(L_BY), CB_GETCURSEL, 0, 0) == 1;
+                store::change(|s| s.update_settings(|st| st.arrange_by = if rows { "rows" } else { "columns" }.into()));
+                self.request_sync();
+            }
+            (L_SCREEN, CBN_SELCHANGE) => {
+                let index = usize::try_from(send(self.get(L_SCREEN), CB_GETCURSEL, 0, 0)).ok();
+                if let Some(device) = index.and_then(|i| self.screens.get(i)).cloned() {
+                    store::change(|s| s.update_settings(|st| st.arrange_screen = device));
+                }
+                self.request_sync();
+            }
             (V_BACKUPS, LBN_SELCHANGE) => {
                 let index = usize::try_from(send(self.get(V_BACKUPS), LB_GETCURSEL, 0, 0)).ok();
                 self.enable(V_RESTORE, index.is_some_and(|i| i < self.backups.len()));
@@ -1754,7 +1919,24 @@ impl Win {
         }
     }
 
+    /// Draws an anchor button: filled with the accent when it is the anchor.
+    fn draw_anchor(&self, d: &DRAWITEMSTRUCT) {
+        let i = d.CtlID as i32 - L_ANCHOR;
+        let on = (i % 3, i / 3) == (self.anchor.0 as i32, self.anchor.1 as i32);
+        unsafe {
+            let fill = CreateSolidBrush(if on { ACCENT } else { FIELD });
+            FillRect(d.hDC, &d.rcItem, fill);
+            DeleteObject(fill);
+            let edge = CreateSolidBrush(if on { ACCENT } else { 0x004D4D4D });
+            FrameRect(d.hDC, &d.rcItem, edge);
+            DeleteObject(edge);
+        }
+    }
+
     fn static_color(&self, hdc: HDC, ctl: HWND) -> LRESULT {
+        if unsafe { GetDlgCtrlID(ctl) } == L_LINE {
+            return self.line as LRESULT;
+        }
         if let Some(&(_, brush)) = self.swatches.iter().find(|(h, _)| *h == ctl)
             && !brush.is_null()
         {
@@ -1781,7 +1963,7 @@ impl Drop for Win {
                     DeleteObject(brush);
                 }
             }
-            for object in [self.font, self.heading, self.bg, self.pane, self.field] {
+            for object in [self.font, self.heading, self.strong, self.bg, self.line, self.pane, self.field] {
                 if !object.is_null() {
                     DeleteObject(object);
                 }
@@ -1829,7 +2011,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 }
             }
             WM_DRAWITEM => {
-                w.draw_list_item(&*(lparam as *const DRAWITEMSTRUCT));
+                let d = &*(lparam as *const DRAWITEMSTRUCT);
+                if d.CtlType == ODT_BUTTON {
+                    w.draw_anchor(d);
+                } else {
+                    w.draw_list_item(d);
+                }
                 return 1;
             }
             WM_CTLCOLORSTATIC => return w.static_color(wparam as HDC, lparam as HWND),

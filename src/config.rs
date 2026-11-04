@@ -6,6 +6,8 @@ use std::sync::OnceLock;
 
 use serde::Deserialize;
 
+use crate::layout::{Shape, Spec};
+
 pub const DEFAULT_CONFIG: &str = include_str!("../config.example.toml");
 
 #[derive(Deserialize, Clone, PartialEq)]
@@ -48,6 +50,38 @@ pub struct Settings {
     pub cell_width: i32,
     /// Width given to new folders.
     pub new_folder_width: i32,
+    /// The arrangement's shape: "row", "column" or "grid".
+    pub arrange_shape: String,
+    /// For a grid: the number of columns, or of rows with arrange_by = "rows".
+    pub arrange_count: i32,
+    /// For a grid: "columns" (filled left to right) or "rows" (top to bottom).
+    pub arrange_by: String,
+    /// Where it sits on the screen: "top_left", "top_center", ... "center", ... "bottom_right".
+    pub arrange_anchor: String,
+    /// Moved from its anchor by this much, in pixels.
+    pub arrange_offset_x: i32,
+    pub arrange_offset_y: i32,
+    /// The screen it is on: a monitor's device name, or empty for the main screen.
+    pub arrange_screen: String,
+    /// New folders join the arrangement, if it has folders.
+    pub new_folders_join: bool,
+}
+
+/// Anchor names, by [vertical][horizontal].
+pub const ANCHORS: [[&str; 3]; 3] = [
+    ["top_left", "top_center", "top_right"],
+    ["middle_left", "center", "middle_right"],
+    ["bottom_left", "bottom_center", "bottom_right"],
+];
+
+/// "Top left", "Center", "Bottom right"...
+pub fn anchor_label(anchor: (usize, usize)) -> &'static str {
+    const LABELS: [[&str; 3]; 3] = [
+        ["Top left", "Top center", "Top right"],
+        ["Middle left", "Center", "Middle right"],
+        ["Bottom left", "Bottom center", "Bottom right"],
+    ];
+    LABELS[anchor.1.min(2)][anchor.0.min(2)]
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -99,6 +133,14 @@ impl Default for Settings {
             unlocked_open_all: false,
             cell_width: 72,
             new_folder_width: DEFAULT_WIDTH,
+            arrange_shape: "grid".into(),
+            arrange_count: 3,
+            arrange_by: "columns".into(),
+            arrange_anchor: "top_left".into(),
+            arrange_offset_x: 0,
+            arrange_offset_y: 0,
+            arrange_screen: String::new(),
+            new_folders_join: true,
         }
     }
 }
@@ -118,6 +160,39 @@ impl Settings {
         self.gap = self.gap.clamp(0, 40);
         self.cell_width = self.cell_width.clamp(40, 200);
         self.new_folder_width = self.new_folder_width.clamp(MIN_WIDTH, 4000);
+        let spec = self.arrange_spec();
+        self.arrange_shape = match spec.shape {
+            Shape::Row => "row",
+            Shape::Column => "column",
+            Shape::Grid => "grid",
+        }
+        .into();
+        self.arrange_count = self.arrange_count.clamp(1, 20);
+        self.arrange_by = if spec.by_rows { "rows" } else { "columns" }.into();
+        self.arrange_anchor = ANCHORS[spec.anchor.1][spec.anchor.0].into();
+        self.arrange_offset_x = self.arrange_offset_x.clamp(-20000, 20000);
+        self.arrange_offset_y = self.arrange_offset_y.clamp(-20000, 20000);
+    }
+
+    /// The arrangement's shape and place; unknown names mean the defaults.
+    pub fn arrange_spec(&self) -> Spec {
+        let shape = match self.arrange_shape.trim().to_ascii_lowercase().as_str() {
+            "row" => Shape::Row,
+            "column" => Shape::Column,
+            _ => Shape::Grid,
+        };
+        let name = self.arrange_anchor.trim().to_ascii_lowercase();
+        let anchor = (0..3)
+            .flat_map(|v| (0..3).map(move |h| (h, v)))
+            .find(|&(h, v)| ANCHORS[v][h] == name)
+            .unwrap_or((0, 0));
+        Spec {
+            shape,
+            count: self.arrange_count.clamp(1, 20) as usize,
+            by_rows: self.arrange_by.trim().eq_ignore_ascii_case("rows"),
+            anchor,
+            offset: (self.arrange_offset_x, self.arrange_offset_y),
+        }
     }
 
     /// The title style; an unknown name means the default one.
@@ -151,6 +226,9 @@ pub struct Panel {
     /// The width follows the columns: columns × the cell width of the settings.
     #[serde(default)]
     pub fit_columns: bool,
+    /// In the arrangement: placed by it, and moved with it.
+    #[serde(default)]
+    pub arranged: bool,
     #[serde(default, rename = "item")]
     pub items: Vec<Item>,
 }
@@ -272,21 +350,27 @@ mod tests {
 
     #[test]
     fn layout_settings_are_read_and_kept_in_range() {
-        let text = "[settings]
-title_style = \"Icon_Above\"
-title_lines = 9
-gap = -3
-push_below = false
-                    [[panel]]
-title = \"A\"
-columns = 3
-fit_columns = true";
+        let text = "[settings]\ntitle_style = \"Icon_Above\"\ntitle_lines = 9\ngap = -3\npush_below = false\n\
+                    [[panel]]\ntitle = \"A\"\ncolumns = 3\nfit_columns = true";
         let config = parse(text).unwrap();
         let s = &config.settings;
         assert_eq!((s.title_style(), s.title_style.as_str(), s.title_lines, s.gap, s.push_below), (TitleStyle::IconAbove, "icon_above", 3, 0, false));
         assert_eq!(config.panels[0].shown_width(s), 3 * 72 + 12);
-        let odd = parse("[settings]
-title_style = \"sideways\"").unwrap();
+        let odd = parse("[settings]\ntitle_style = \"sideways\"").unwrap();
         assert_eq!(odd.settings.title_style(), TitleStyle::Centered);
+    }
+
+    #[test]
+    fn arrangement_settings_are_read_and_kept_in_range() {
+        let text = "[settings]\narrange_shape = \"Column\"\narrange_count = 50\narrange_by = \"rows\"\narrange_anchor = \"bottom_center\"\n\
+                    arrange_offset_x = -12\n[[panel]]\ntitle = \"A\"\narranged = true\n[[panel]]\ntitle = \"B\"";
+        let config = parse(text).unwrap();
+        let spec = config.settings.arrange_spec();
+        assert_eq!((spec.shape, spec.count, spec.by_rows, spec.anchor, spec.offset), (Shape::Column, 20, true, (1, 2), (-12, 0)));
+        assert_eq!(config.settings.arrange_shape, "column");
+        assert!(config.panels[0].arranged && !config.panels[1].arranged);
+        let odd = parse("[settings]\narrange_anchor = \"nowhere\"").unwrap();
+        assert_eq!((odd.settings.arrange_spec().anchor, odd.settings.arrange_anchor.as_str()), ((0, 0), "top_left"));
+        assert_eq!(anchor_label((1, 1)), "Center");
     }
 }
