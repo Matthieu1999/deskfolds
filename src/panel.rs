@@ -22,14 +22,17 @@ use windows_sys::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFE
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::System::SystemServices::{MK_CONTROL, MK_LBUTTON};
-use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows_sys::Win32::UI::Controls::{
+    TTF_ABSOLUTE, TTF_IDISHWND, TTF_TRACK, TTM_ADDTOOLW, TTM_GETBUBBLESIZE, TTM_SETMAXTIPWIDTH, TTM_TRACKACTIVATE, TTM_TRACKPOSITION,
+    TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW, WM_MOUSELEAVE,
+};
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_MENU,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::config::{MIN_WIDTH, PANEL_PAD, Panel, Settings, TitleStyle, parse_color};
+use crate::config::{FULL_NAME_LINES, MIN_WIDTH, PANEL_PAD, Panel, Settings, TitleStyle, parse_color};
 use crate::dragdrop::{self, DropHandler};
 use crate::layout;
 use crate::store::{self, WM_APP_REFRESH};
@@ -43,6 +46,8 @@ const OPEN_TIMER: usize = 1;
 const CLOSE_TIMER: usize = 2;
 const ANIM_TIMER: usize = 3;
 const DRAG_OPEN_TIMER: usize = 4;
+/// Shows the tooltip of the shortcut under the mouse.
+const TIP_TIMER: usize = 5;
 const ANIM_FRAME_MS: u32 = 15;
 /// Dragging a file over a closed panel opens it after this delay.
 const DRAG_OPEN_DELAY_MS: u32 = 300;
@@ -142,6 +147,19 @@ pub struct PanelState {
     /// shows its own label again).
     unlift_next: bool,
     label_window: HWND,
+    /// The shortcut selected by a click, with a double-click to open.
+    selected: Option<usize>,
+    /// The lines each shortcut's whole name takes, for the width they were
+    /// measured at (at most FULL_NAME_LINES).
+    name_lines: Vec<usize>,
+    name_lines_w: i32,
+    /// The release of a double-click's second press does nothing more.
+    swallow_up: bool,
+    /// The tooltip with a shortcut's full name and what it opens.
+    tooltip: HWND,
+    /// When a tooltip was last shown or hidden: the next one comes at once.
+    tip_seen: u64,
+    tip_item: Option<usize>,
     /// What the main window last heard about: position, size, upwards.
     last_reach: Option<((i32, i32), i32, i32, bool)>,
     /// The window's position and size as last given to Windows.
@@ -221,9 +239,18 @@ struct Layout {
     pad: i32,
     label_icon: i32,
     cell_w: i32,
+    /// Height of a row whose names take one line.
     cell_h: i32,
     icon: i32,
-    rows: i32,
+    /// Top of each row of shortcuts from the first one, then the bottom of the last.
+    row_tops: Vec<i32>,
+}
+
+impl Layout {
+    /// Height of all the rows of shortcuts.
+    fn content_h(&self) -> i32 {
+        self.row_tops.last().copied().unwrap_or(self.cell_h)
+    }
 }
 
 fn ease_out_cubic(t: f32) -> f32 {
@@ -302,10 +329,48 @@ impl PanelState {
             pad,
             label_icon: self.label_icon(),
             cell_w: (self.width_px() - pad * 2) / cols,
-            cell_h: self.scale(8) + icon + self.scale(4) + line + (s.item_lines.clamp(1, 2) - 1) * self.item_line_h + self.scale(4),
+            cell_h: self.scale(8) + icon + self.scale(4) + line + self.scale(4),
             icon,
             // An empty panel keeps one row for its "drop shortcuts here" hint.
-            rows: ((self.cfg.items.len() as i32 + cols - 1) / cols).max(1),
+            row_tops: {
+                let kept: Vec<usize> = (0..self.cfg.items.len()).map(|i| self.lines_of(i).1).collect();
+                layout::row_tops(&kept, cols as usize, self.scale(8) + icon + self.scale(4) + line + self.scale(4), self.item_line_h)
+            },
+        }
+    }
+
+    /// The lines shortcut `i`'s name shows, and the lines its row keeps for it.
+    fn lines_of(&self, i: usize) -> (usize, usize) {
+        let s = &self.settings;
+        let full = self.selected == Some(i) && s.open_on_double_click && s.show_selected_name;
+        layout::name_lines(self.name_lines.get(i).copied().unwrap_or(1), s.item_lines.max(1) as usize, full)
+    }
+
+    /// Width a shortcut's name is laid out in.
+    fn name_width(&self) -> i32 {
+        let pad = self.scale(PANEL_PAD);
+        (self.width_px() - pad * 2) / self.cfg.columns.max(1) - self.scale(4)
+    }
+
+    /// Measures again how many lines each name takes, if the names or the
+    /// width changed since.
+    fn refresh_names(&mut self) {
+        let w = self.name_width();
+        if self.name_lines_w == w && self.name_lines.len() == self.cfg.items.len() {
+            return;
+        }
+        self.name_lines_w = w;
+        unsafe {
+            let dc = GetDC(null_mut());
+            let old = SelectObject(dc, self.font);
+            self.name_lines = self
+                .cfg
+                .items
+                .iter()
+                .map(|it| layout::wrap(&it.name, w, FULL_NAME_LINES as usize, |t| text_width(dc, t)).len().max(1))
+                .collect();
+            SelectObject(dc, old);
+            ReleaseDC(null_mut(), dc);
         }
     }
 
@@ -318,9 +383,9 @@ impl PanelState {
     fn content_top(&self, l: &Layout) -> i32 {
         if self.lifted {
             // Where they are once open, counted from the top of the folder.
-            self.open_size().1 - l.title_h - l.rows * l.cell_h
+            self.open_size().1 - l.title_h - l.content_h()
         } else if self.up {
-            self.size().1 - l.title_h - l.rows * l.cell_h
+            self.size().1 - l.title_h - l.content_h()
         } else {
             l.title_h
         }
@@ -354,7 +419,7 @@ impl PanelState {
 
     fn open_size(&self) -> (i32, i32) {
         let l = self.layout();
-        (self.width_px(), l.title_h + l.rows * l.cell_h + l.pad)
+        (self.width_px(), l.title_h + l.content_h() + l.pad)
     }
 
     /// Where the window goes now.
@@ -399,8 +464,11 @@ impl PanelState {
         let col = i as i32 % cols;
         let row = i as i32 / cols;
         let left = l.pad + col * l.cell_w;
-        let top = self.content_top(l) + row * l.cell_h;
-        RECT { left, top, right: left + l.cell_w, bottom: top + l.cell_h }
+        let row = row as usize;
+        let top0 = self.content_top(l);
+        let top = top0 + l.row_tops.get(row).copied().unwrap_or(0);
+        let bottom = top0 + l.row_tops.get(row + 1).copied().unwrap_or(l.cell_h);
+        RECT { left, top, right: left + l.cell_w, bottom }
     }
 
     fn hit(&self, x: i32, y: i32) -> Hit {
@@ -493,6 +561,8 @@ impl PanelState {
             SelectObject(dc, old);
             ReleaseDC(null_mut(), dc);
         }
+        self.name_lines_w = 0;
+        self.refresh_names();
     }
 
     fn free_resources(&mut self) {
@@ -588,7 +658,8 @@ pub fn register_class() {
     unsafe { RegisterClassW(&lc) };
     let class = wide(CLASS_NAME);
     let wc = WNDCLASSW {
-        style: 0,
+        // Double-clicks, to open a shortcut with one when the settings say so.
+        style: CS_DBLCLKS,
         lpfnWndProc: Some(wnd_proc),
         cbClsExtra: 0,
         cbWndExtra: 0,
@@ -660,6 +731,13 @@ pub fn create(cfg: &Panel, settings: &Settings, desktop: HWND, main: HWND) -> HW
         lift_next: false,
         unlift_next: false,
         label_window: null_mut(),
+        selected: None,
+        name_lines: Vec::new(),
+        name_lines_w: 0,
+        swallow_up: false,
+        tooltip: null_mut(),
+        tip_seen: 0,
+        tip_item: None,
         last_reach: None,
         applied: None,
         moving: false,
@@ -760,6 +838,10 @@ pub fn update(hwnd: HWND, cfg: &Panel, settings: &Settings) {
     if st.hover.is_some_and(|i| i >= st.cfg.items.len()) {
         st.hover = None;
     }
+    if st.selected.is_some_and(|i| i >= st.cfg.items.len()) || !st.settings.open_on_double_click {
+        st.selected = None;
+    }
+    hide_tip(st);
     // A shortcut pressed before the change may be gone.
     if st.press.is_some_and(|(_, _, i)| i >= st.cfg.items.len()) {
         st.press = None;
@@ -841,6 +923,7 @@ pub fn place_for(hwnd: HWND, push: i32) -> Option<Placement> {
     if st.moving {
         return None;
     }
+    st.refresh_names();
     st.push = push;
     let (w, h) = st.size();
     let (x, y) = st.window_pos();
@@ -891,6 +974,8 @@ pub fn close_now(hwnd: HWND, moving: bool) {
     st.hover = None;
     st.progress = 0.0;
     st.up = false;
+    st.selected = None;
+    hide_tip(st);
     hide_label_window(st);
     apply_size(hwnd, st);
 }
@@ -1099,6 +1184,7 @@ fn state_ptr(hwnd: HWND) -> *mut PanelState {
 }
 
 fn apply_size(hwnd: HWND, st: &mut PanelState) {
+    st.refresh_names();
     let (w, h) = st.size();
     let (x, y) = st.window_pos();
     st.shown = (x, y);
@@ -1268,6 +1354,7 @@ fn set_open(hwnd: HWND, st: &mut PanelState, open: bool) {
     }
     st.open = open;
     st.hover = None;
+    hide_tip(st);
     if open {
         raise_above_panels(hwnd);
     }
@@ -1325,12 +1412,15 @@ fn animate(hwnd: HWND, st: &mut PanelState) {
     let p = if duration <= 0.0 { 1.0 } else { (elapsed as f32 / duration).min(1.0) };
     st.progress = st.anim_from + (target - st.anim_from) * p;
     let done = p >= 1.0;
+    let mut drop = false;
     if done {
         st.progress = target;
         st.up &= st.open;
+        if !st.open {
+            st.selected = None;
+        }
         if st.lifted {
-            // One more step takes the label window away (see drop_label).
-            drop_label(hwnd, st);
+            drop = true;
         } else {
             unsafe { KillTimer(hwnd, ANIM_TIMER) };
         }
@@ -1338,8 +1428,153 @@ fn animate(hwnd: HWND, st: &mut PanelState) {
     // This folder's new size and the folders it pushes move together, in one
     // batch: otherwise some are drawn moved and others not, and the glass flickers.
     crate::relayout();
+    // After the last size change, so that the picture Windows shows late at
+    // that size is still the lifted one; one more step takes the label window
+    // away (see drop_label).
+    if drop {
+        drop_label(hwnd, st);
+    }
     if st.lifted {
         draw_label_window(hwnd, st);
+    }
+}
+
+/// Opens shortcut `i`, and closes the folder if the settings say so.
+fn open_item(hwnd: HWND, st: &mut PanelState, i: usize) {
+    let Some(item) = st.cfg.items.get(i).cloned() else { return };
+    if st.settings.collapse_after_launch && !st.pinned && !st.highlighted {
+        set_open(hwnd, st, false);
+    }
+    // Last, and nothing of the panel is used after it: ShellExecute can run a
+    // message loop (a security prompt) in which the panel is destroyed.
+    launch(&item.path, &item.args);
+}
+
+/// Selects shortcut `item` (or none). Its full name may make its row taller,
+/// so the folder is laid out again.
+fn select(hwnd: HWND, st: &mut PanelState, item: Option<usize>) {
+    if st.selected == item {
+        return;
+    }
+    let before = st.open_size().1;
+    st.selected = item;
+    if st.open_size().1 == before {
+        unsafe { InvalidateRect(hwnd, null(), 0) };
+        return;
+    }
+    // A folder open upwards grows or shrinks at its top: as for an upwards
+    // opening, its label window shows the label meanwhile (see lifted).
+    if st.open && st.up && st.progress >= 1.0 && st.settings.animation_ms > 0 {
+        lift_label(hwnd, st);
+        st.anim_from = st.progress;
+        st.anim_start = unsafe { GetTickCount64() };
+        unsafe { SetTimer(hwnd, ANIM_TIMER, ANIM_FRAME_MS, None) };
+    } else {
+        apply_size(hwnd, st);
+    }
+}
+
+/// The tooltip window of this folder, made the first time it is needed.
+fn tooltip(hwnd: HWND, st: &mut PanelState) -> HWND {
+    if st.tooltip.is_null() || unsafe { IsWindow(st.tooltip) } == 0 {
+        let class = wide("tooltips_class32");
+        unsafe {
+            st.tooltip = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                class.as_ptr(),
+                null(),
+                WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+                0,
+                0,
+                0,
+                0,
+                hwnd,
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            if st.tooltip.is_null() {
+                return null_mut();
+            }
+            ui::dark_control(st.tooltip, false);
+            let mut ti: TTTOOLINFOW = std::mem::zeroed();
+            ti.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
+            ti.uFlags = TTF_TRACK | TTF_ABSOLUTE | TTF_IDISHWND;
+            ti.hwnd = hwnd;
+            ti.uId = hwnd as usize;
+            let empty = wide("");
+            ti.lpszText = empty.as_ptr() as *mut u16;
+            SendMessageW(st.tooltip, TTM_ADDTOOLW, 0, &ti as *const _ as isize);
+            SendMessageW(st.tooltip, TTM_SETMAXTIPWIDTH, 0, st.scale(380) as isize);
+        }
+    }
+    st.tooltip
+}
+
+/// The mouse went onto another shortcut (or off them): the tooltip follows,
+/// after the Windows hover time, or at once if one was just shown.
+fn hover_changed(hwnd: HWND, st: &mut PanelState) {
+    hide_tip(st);
+    unsafe { KillTimer(hwnd, TIP_TIMER) };
+    if st.hover.is_none() || !st.open || st.progress < 1.0 {
+        return;
+    }
+    let now = unsafe { GetTickCount64() };
+    let delay = if now.saturating_sub(st.tip_seen) < 500 {
+        30
+    } else {
+        let mut ms: u32 = 400;
+        unsafe { SystemParametersInfoW(SPI_GETMOUSEHOVERTIME, 0, &mut ms as *mut u32 as *mut c_void, 0) };
+        ms.clamp(100, 2000)
+    };
+    unsafe { SetTimer(hwnd, TIP_TIMER, delay, None) };
+}
+
+/// Shows the full name of shortcut `i` and what it opens, under it (above it
+/// when there is no room below).
+fn show_tip(hwnd: HWND, st: &mut PanelState, i: usize) {
+    let Some(item) = st.cfg.items.get(i) else { return };
+    let target = crate::util::expand_env(&item.path);
+    let opens = if item.args.trim().is_empty() { target } else { format!("{target} {}", item.args.trim()) };
+    let text = wide(&format!("{}\n{}", item.name, opens));
+    let l = st.layout();
+    let r = st.item_rect(&l, i);
+    let tip = tooltip(hwnd, st);
+    if tip.is_null() {
+        return;
+    }
+    unsafe {
+        let mut ti: TTTOOLINFOW = std::mem::zeroed();
+        ti.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
+        ti.hwnd = hwnd;
+        ti.uId = hwnd as usize;
+        ti.lpszText = text.as_ptr() as *mut u16;
+        SendMessageW(tip, TTM_UPDATETIPTEXTW, 0, &ti as *const _ as isize);
+        let size = SendMessageW(tip, TTM_GETBUBBLESIZE, 0, &ti as *const _ as isize) as u32;
+        let (w, h) = ((size & 0xFFFF) as i32, (size >> 16) as i32);
+        let (wx, wy) = st.shown;
+        let area = work_area_at(wx + r.left, wy + r.top);
+        let x = (wx + r.left + (r.right - r.left) / 2 - w / 2).clamp(area.x, (area.right() - w).max(area.x));
+        let below = wy + r.bottom + st.scale(4);
+        let y = if below + h <= area.bottom() { below } else { wy + r.top - h - st.scale(4) };
+        SendMessageW(tip, TTM_TRACKPOSITION, 0, ((x as u32 & 0xFFFF) | ((y as u32 & 0xFFFF) << 16)) as isize);
+        SendMessageW(tip, TTM_TRACKACTIVATE, 1, &ti as *const _ as isize);
+    }
+    st.tip_item = Some(i);
+    st.tip_seen = unsafe { GetTickCount64() };
+}
+
+fn hide_tip(st: &mut PanelState) {
+    if st.tip_item.take().is_some() && !st.tooltip.is_null() {
+        unsafe {
+            let mut ti: TTTOOLINFOW = std::mem::zeroed();
+            ti.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
+            // The tool is the folder window itself, the tooltip's owner.
+            ti.hwnd = GetWindow(st.tooltip, GW_OWNER);
+            ti.uId = ti.hwnd as usize;
+            SendMessageW(st.tooltip, TTM_TRACKACTIVATE, 0, &ti as *const _ as isize);
+        }
+        st.tip_seen = unsafe { GetTickCount64() };
     }
 }
 
@@ -1637,6 +1872,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 };
                 if hover != st.hover {
                     st.hover = hover;
+                    hover_changed(hwnd, st);
                     InvalidateRect(hwnd, null(), 0);
                 }
                 return 0;
@@ -1644,6 +1880,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             WM_MOUSELEAVE => {
                 st.tracking_mouse = false;
                 st.hover = None;
+                hide_tip(st);
                 InvalidateRect(hwnd, null(), 0);
                 // Moving onto the name while unlocked is not leaving.
                 if !cursor_inside(hwnd) {
@@ -1654,6 +1891,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             WM_TIMER => {
                 match wparam {
                     OPEN_TIMER => set_open(hwnd, st, true),
+                    TIP_TIMER => {
+                        KillTimer(hwnd, TIP_TIMER);
+                        if let Some(i) = st.hover
+                            && st.open
+                            && st.progress >= 1.0
+                            && !st.lifted
+                        {
+                            show_tip(hwnd, st, i);
+                        }
+                    }
                     CLOSE_TIMER => {
                         // Held open while the mouse is on a folder it pushed down: the
                         // folder under the mouse never moves.
@@ -1674,9 +1921,27 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 }
                 return 0;
             }
-            WM_LBUTTONDOWN => {
+            WM_LBUTTONDBLCLK if locked && st.settings.open_on_double_click => {
+                // The second press of a double-click opens the shortcut; its release does nothing.
                 let (x, y) = mouse();
+                hide_tip(st);
+                KillTimer(hwnd, TIP_TIMER);
+                if let Hit::Item(i) = st.hit(x, y) {
+                    st.swallow_up = true;
+                    open_item(hwnd, st, i);
+                }
+                return 0;
+            }
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+                let (x, y) = mouse();
+                // No tooltip after a click until the mouse goes onto another shortcut.
+                hide_tip(st);
+                KillTimer(hwnd, TIP_TIMER);
                 st.press = None;
+                // A single click opens: the second press of a double-click must not open it again.
+                if msg == WM_LBUTTONDBLCLK && locked && matches!(st.hit(x, y), Hit::Item(_)) {
+                    st.swallow_up = true;
+                }
                 match st.hit(x, y) {
                     Hit::Grip => {
                         st.resizing = Some((cursor_x(), st.cfg.width));
@@ -1688,15 +1953,27 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 return 0;
             }
             WM_LBUTTONUP => {
-                st.press = None;
+                let pressed = st.press.take();
                 if st.resizing.is_some() {
                     // Sends WM_CAPTURECHANGED, which saves the new width.
                     ReleaseCapture();
                     return 0;
                 }
+                if std::mem::take(&mut st.swallow_up) {
+                    return 0;
+                }
                 let (x, y) = mouse();
+                let double = st.settings.open_on_double_click;
                 if !locked {
-                    // Editing: shortcuts are dragged, not launched.
+                    // Editing: shortcuts are dragged, not launched. A click (no drag)
+                    // selects one, with a double-click to open.
+                    if double {
+                        match (st.hit(x, y), pressed) {
+                            (Hit::Item(i), Some((_, _, p))) if p == i => select(hwnd, st, Some(i)),
+                            (Hit::Nothing, _) => select(hwnd, st, None),
+                            _ => {}
+                        }
+                    }
                     return 0;
                 }
                 match st.hit(x, y) {
@@ -1711,15 +1988,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         }
                         InvalidateRect(hwnd, null(), 0);
                     }
-                    Hit::Item(i) => {
-                        let item = st.cfg.items[i].clone();
-                        if st.settings.collapse_after_launch && !st.pinned && !st.highlighted {
-                            set_open(hwnd, st, false);
-                        }
-                        // Last, and nothing of the panel is used after it: ShellExecute can
-                        // run a message loop (a security prompt) in which the panel is destroyed.
-                        launch(&item.path, &item.args);
-                    }
+                    // With a double-click to open, a click selects the shortcut.
+                    Hit::Item(i) if double => select(hwnd, st, Some(i)),
+                    Hit::Item(i) => open_item(hwnd, st, i),
+                    Hit::Nothing if double => select(hwnd, st, None),
                     Hit::Grip | Hit::Nothing => {}
                 }
                 return 0;
@@ -1730,6 +2002,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             WM_RBUTTONUP => {
                 let (x, y) = mouse();
+                hide_tip(st);
+                KillTimer(hwnd, TIP_TIMER);
                 match st.hit(x, y) {
                     Hit::Item(i) if !locked => {
                         item_menu(hwnd, st, i);
@@ -1988,8 +2262,18 @@ fn paint(hwnd: HWND, st: &PanelState, locked: bool) {
                 if r.bottom <= 0 {
                     continue;
                 }
-                if st.hover == Some(i) {
-                    let inset = RECT { left: r.left + 1, top: r.top + 1, right: r.right - 1, bottom: r.bottom - 1 };
+                let inset = RECT { left: r.left + 1, top: r.top + 1, right: r.right - 1, bottom: r.bottom - 1 };
+                if st.selected == Some(i) {
+                    // Selected: the accent, at half its brightness, and its outline.
+                    fill_round(mem, &inset, radius, (accent >> 1) & 0x7F7F7F);
+                    let pen = CreatePen(PS_SOLID, 1, accent);
+                    let old_pen = SelectObject(mem, pen);
+                    let old_brush = SelectObject(mem, GetStockObject(NULL_BRUSH));
+                    RoundRect(mem, inset.left, inset.top, inset.right, inset.bottom, radius, radius);
+                    SelectObject(mem, old_brush);
+                    SelectObject(mem, old_pen);
+                    DeleteObject(pen);
+                } else if st.hover == Some(i) {
                     fill_round(mem, &inset, radius, hover);
                 }
                 let icon_top = r.top + st.scale(8);
@@ -2000,8 +2284,9 @@ fn paint(hwnd: HWND, st: &PanelState, locked: bool) {
                 }
                 let label_top = icon_top + l.icon + st.scale(4);
                 let label = RECT { left: r.left + st.scale(2), top: label_top, right: r.right - st.scale(2), bottom: r.bottom };
-                if st.settings.item_lines >= 2 {
-                    let lines = layout::wrap(&item.name, label.right - label.left, 2, |t| text_width(mem, t));
+                let shown = st.lines_of(i).0;
+                if shown >= 2 {
+                    let lines = layout::wrap(&item.name, label.right - label.left, shown, |t| text_width(mem, t));
                     for (k, line) in lines.iter().enumerate() {
                         let top = label_top + k as i32 * st.item_line_h;
                         draw_text(mem, line, &RECT { top, bottom: top + st.item_line_h, ..label }, DT_CENTER | DT_TOP);

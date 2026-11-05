@@ -57,7 +57,9 @@ title_style = "centered"
 title_lines = 2
 show_count = false            # the number of shortcuts next to the name
 show_folder_icon = true       # the folder's icon next to its name (false: none)
-item_lines = 1                # lines for a shortcut's name under its icon (1 or 2)
+item_lines = 1                # lines for a shortcut's name under its icon: 1, 2, or 5 = in full
+open_on_double_click = false  # true: a double-click opens a shortcut and a click selects it
+show_selected_name = true     # with a double-click: a click shows the selected shortcut's full name
 
 # Arranging folders. While unlocked, a moved folder snaps to the edges of the
 # other folders and of the screen, gap pixels away (hold Alt to place it
@@ -72,6 +74,9 @@ open_upwards = true
 unlocked_open_all = false     # while unlocked: true = every folder open, false = open on hover
 cell_width = 72               # column width of panels with fit_columns = true
 new_folder_width = 300        # width of new folders
+new_folder_columns = 4        # columns of shortcuts in new folders
+new_folder_fit_columns = false # new folders as wide as their columns
+new_folder_icon = ""          # icon of new folders ("" = the default folder icon)
 
 # The arrangement: the folders with arranged = true are placed in it, in the
 # order of this file, and moved with it. Its frame can be dragged while

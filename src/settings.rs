@@ -16,7 +16,7 @@ use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::SystemServices::{SS_CENTERIMAGE, SS_ENDELLIPSIS, SS_NOPREFIX, SS_PATHELLIPSIS};
+use windows_sys::Win32::System::SystemServices::{SS_CENTERIMAGE, SS_ENDELLIPSIS, SS_ICON, SS_NOPREFIX, SS_PATHELLIPSIS};
 use windows_sys::Win32::UI::Controls::{
     DRAWITEMSTRUCT, EM_SETSEL, HIMAGELIST, MEASUREITEMSTRUCT, ODS_DISABLED, ODS_SELECTED, ODT_BUTTON, ODT_LISTBOX, I_IMAGENONE, ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ILC_COLOR32, ILC_MASK, INITCOMMONCONTROLSEX,
     ImageList_Create, ImageList_Destroy, ImageList_ReplaceIcon, InitCommonControlsEx, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
@@ -25,7 +25,7 @@ use windows_sys::Win32::UI::Controls::{
     LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVM_SETTEXTBKCOLOR,
     LVM_SETTEXTCOLOR, LVN_ITEMCHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP,
     LVS_NOCOLUMNHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, LVSIL_SMALL, NM_CLICK, NMHDR, NMLISTVIEW, TB_THUMBTRACK,
-    TBM_SETLINESIZE, TBM_SETPAGESIZE, TBM_SETPOS, TBM_SETRANGEMAX, TBM_SETRANGEMIN, TBS_NOTICKS, ICC_UPDOWN_CLASS, NMUPDOWN,
+    TBM_SETLINESIZE, TBM_SETPAGESIZE, TBM_SETPOS, TBM_SETRANGEMAX, TBM_SETRANGEMIN, TBS_FIXEDLENGTH, TBS_NOTICKS, NM_CUSTOMDRAW, ICC_UPDOWN_CLASS, NMUPDOWN,
     UDM_SETBUDDY, UDM_SETRANGE32, UDN_DELTAPOS, UDS_ALIGNRIGHT, UDS_ARROWKEYS, UDS_NOTHOUSANDS,
 };
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
@@ -133,6 +133,7 @@ const A_COUNT: i32 = 336;
 const A_NAMES_1: i32 = 337;
 const A_NAMES_2: i32 = 338;
 const A_FOLDER_ICON: i32 = 339;
+const A_NAMES_FULL: i32 = 340;
 
 const B_HOVER: i32 = 400;
 const B_OPEN: i32 = 401;
@@ -143,6 +144,16 @@ const B_AUTOSTART: i32 = 407;
 const B_STORAGE: i32 = 408;
 const B_BROWSE: i32 = 409;
 const B_STORAGE_DEFAULT: i32 = 410;
+const B_OPEN_SINGLE: i32 = 411;
+const B_OPEN_DOUBLE: i32 = 412;
+const B_SELECTED_NAME: i32 = 413;
+/// New folders: width (slider, its box is +1), columns, fit, icon.
+const N_WIDTH: i32 = 414;
+const N_COLS: i32 = 416;
+const N_FIT: i32 = 418;
+const N_ICON_V: i32 = 419;
+const N_ICON: i32 = 420;
+const N_ICON_DEFAULT: i32 = 421;
 
 const V_CONFIG: i32 = 500;
 const V_NOTEPAD: i32 = 501;
@@ -161,7 +172,6 @@ const L_DOWN: i32 = 606;
 const L_CLOSED: i32 = 607;
 const L_OPEN_ALL: i32 = 608;
 const L_CELL: i32 = 610;
-const L_NEW_W: i32 = 612;
 const L_SHAPE_ROW: i32 = 620;
 const L_SHAPE_COLUMN: i32 = 621;
 const L_SHAPE_GRID: i32 = 622;
@@ -187,7 +197,7 @@ const UPDOWN: i32 = 5000;
 
 const COLOR_BUTTONS: [i32; 5] = [A_TINT, A_ACCENT, A_TEXT, A_HOVER, A_BORDER];
 /// Check boxes that have a caption.
-const CAPTIONED_CHECKS: [i32; 6] = [F_FIT, F_ARRANGED, A_COUNT, A_FOLDER_ICON, L_SNAP, L_JOIN];
+const CAPTIONED_CHECKS: [i32; 8] = [F_FIT, F_ARRANGED, A_COUNT, A_FOLDER_ICON, L_SNAP, L_JOIN, B_SELECTED_NAME, N_FIT];
 const TITLE_STYLES: [(i32, TitleStyle); 4] = [
     (A_STYLE_CENTERED, TitleStyle::Centered),
     (A_STYLE_LEFT, TitleStyle::Left),
@@ -197,7 +207,7 @@ const TITLE_STYLES: [(i32, TitleStyle); 4] = [
 
 /// Number boxes: (id, smallest, largest, arrow step). Typed values may go past
 /// the slider next to it, up to what the config file accepts.
-const NUMBERS: [(i32, i32, i32, i32); 17] = [
+const NUMBERS: [(i32, i32, i32, i32); 18] = [
     (F_WIDTH + 1, MIN_WIDTH, 4000, 10),
     (F_COLS + 1, 1, 20, 1),
     (F_X, -32000, 32000, 1),
@@ -211,7 +221,8 @@ const NUMBERS: [(i32, i32, i32, i32); 17] = [
     (B_CLOSE + 1, 1, 10000, 50),
     (L_GAP, 0, 40, 1),
     (L_CELL + 1, 40, 200, 2),
-    (L_NEW_W + 1, MIN_WIDTH, 4000, 10),
+    (N_WIDTH + 1, MIN_WIDTH, 4000, 10),
+    (N_COLS, 1, 20, 1),
     (L_COUNT, 1, 20, 1),
     (L_OFFSET_X, -20000, 20000, 1),
     (L_OFFSET_Y, -20000, 20000, 1),
@@ -239,7 +250,7 @@ const SLIDERS: [SliderDef; 10] = [
     SliderDef { id: B_OPEN, min: 0, max: 1000, step: 50, unit: " ms" },
     SliderDef { id: B_CLOSE, min: 100, max: 2000, step: 50, unit: " ms" },
     SliderDef { id: L_CELL, min: 56, max: 120, step: 2, unit: " px" },
-    SliderDef { id: L_NEW_W, min: 120, max: 900, step: 10, unit: " px" },
+    SliderDef { id: N_WIDTH, min: 120, max: 900, step: 10, unit: " px" },
 ];
 
 fn slider_def(id: i32) -> Option<&'static SliderDef> {
@@ -315,6 +326,8 @@ struct Win {
     screens: Vec<String>,
     /// The arrangement's anchor, for drawing the anchor buttons.
     anchor: (usize, usize),
+    /// The icon shown for new folders in the Behavior page.
+    new_icon: HICON,
 }
 
 fn win<'a>(hwnd: HWND) -> Option<&'a mut Win> {
@@ -453,6 +466,7 @@ pub fn open(panel: Option<u32>, rename: bool) {
         controls: Vec::new(),
         dim: Vec::new(),
         swatches: Vec::new(),
+        new_icon: null_mut(),
         list_sigs: Default::default(),
         panel,
         item: None,
@@ -738,7 +752,8 @@ impl Win {
 
     /// A slider, its number box to the right of it, and the unit.
     fn slider(&mut self, x: i32, y: i32, w: i32, id: i32) {
-        let h = self.create("msctls_trackbar32", "", WS_TABSTOP | TBS_NOTICKS, 0, (x, y, w, 28), id);
+        let h = self.create("msctls_trackbar32", "", WS_TABSTOP | TBS_NOTICKS | TBS_FIXEDLENGTH, 0, (x, y, w, 28), id);
+        crate::slider::prepare(h);
         if let Some(d) = slider_def(id) {
             send(h, TBM_SETRANGEMIN, 0, d.min as isize);
             send(h, TBM_SETRANGEMAX, 1, d.max as isize);
@@ -867,6 +882,10 @@ impl Win {
             }
         }
         self.dim.clear();
+        if !self.new_icon.is_null() {
+            unsafe { DestroyIcon(self.new_icon) };
+            self.new_icon = null_mut();
+        }
         self.list_sigs = Default::default();
         self.dirty = None;
         self.syncing = false;
@@ -988,6 +1007,7 @@ impl Win {
         self.label("Shortcut names", lx, 588, 200);
         self.radio(cx, 588, A_NAMES_1, "One line", 70);
         self.radio(cx + 94, 588, A_NAMES_2, "Up to two lines", 120);
+        self.radio(cx + 234, 588, A_NAMES_FULL, "In full", 70);
     }
 
     fn build_behavior(&mut self) {
@@ -996,25 +1016,45 @@ impl Win {
         self.label("Open folders on hover", lx, 56, 200);
         self.help("Off: open and close a folder by clicking its name", lx, 78, 300);
         self.check(cx + 100, 56, B_HOVER);
-        self.label("Hover time before opening", lx, 104, 200);
-        self.slider(cx + 100, 102, 230, B_OPEN);
-        self.label("Time before closing", lx, 138, 200);
-        self.help("After the mouse leaves the folder", lx, 160, 200);
-        self.slider(cx + 100, 136, 230, B_CLOSE);
-        self.label("Close after launching a shortcut", lx, 186, 250);
-        self.help("Pinned folders stay open", lx, 208, 200);
-        self.check(cx + 100, 186, B_COLLAPSE);
-        self.label("Lock folders in place", lx, 234, 200);
-        self.help("Unlocked: move and resize folders, drag shortcuts", lx, 256, 300);
-        self.check(cx + 100, 234, B_LOCK);
-        self.label("Start with Windows", lx, 282, 200);
-        self.check(cx + 100, 282, B_AUTOSTART);
+        self.label("Hover time before opening", lx, 102, 200);
+        self.slider(cx + 100, 100, 230, B_OPEN);
+        self.label("Time before closing", lx, 136, 200);
+        self.help("After the mouse leaves the folder", lx, 158, 200);
+        self.slider(cx + 100, 134, 230, B_CLOSE);
+        self.label("Open shortcuts with", lx, 182, 200);
+        self.help("Double-click: a click selects a shortcut", lx, 204, 205);
+        self.radio(cx + 100, 182, B_OPEN_SINGLE, "Single click", 96);
+        self.radio(cx + 214, 182, B_OPEN_DOUBLE, "Double-click", 100);
+        self.label("Full name of a selected shortcut", lx, 228, 250);
+        self.help("With a double-click: shown under it", lx, 250, 205);
+        self.check_text(cx + 100, 228, B_SELECTED_NAME, "Show it, making room under it", 240);
+        self.label("Close after launching a shortcut", lx, 274, 250);
+        self.help("Pinned folders stay open", lx, 296, 200);
+        self.check(cx + 100, 274, B_COLLAPSE);
+        self.label("Lock folders in place", lx, 320, 200);
+        self.help("Unlocked: move and resize folders, drag shortcuts", lx, 342, 300);
+        self.check(cx + 100, 320, B_LOCK);
+        self.label("Start with Windows", lx, 366, 200);
+        self.check(cx + 100, 366, B_AUTOSTART);
 
-        self.label("Storage folder for new folders", lx, 322, 300);
-        self.path(lx, 344, 420, B_STORAGE);
-        self.help("Each folder keeps the storage folder it was created with.", lx, 368, 420);
-        self.button("Browse…", 640, 322, 110, B_BROWSE);
-        self.button("Default", 756, 322, 108, B_STORAGE_DEFAULT);
+        self.create("STATIC", "", SS_NOPREFIX, 0, (lx, 400, 664, 1), L_LINE);
+        let title = self.label("New folders", lx, 408, 200);
+        send(title, WM_SETFONT, self.strong as usize, 0);
+        self.help("For the folders you create from now on; the others keep theirs.", cx, 411, 454);
+        self.label("Storage folder", lx, 440, 300);
+        self.button("Browse…", 640, 438, 110, B_BROWSE);
+        self.button("Default", 756, 438, 108, B_STORAGE_DEFAULT);
+        self.path(lx, 464, 420, B_STORAGE);
+        self.help("Each folder keeps the storage folder it was created with.", lx, 488, 420);
+        self.label("Width", lx, 514, 200);
+        self.slider(cx + 100, 512, 230, N_WIDTH);
+        self.label("Columns", lx, 548, 200);
+        self.number(cx + 100, 548, 64, N_COLS);
+        self.check_text(cx + 196, 548, N_FIT, "Width follows the columns", 200);
+        self.label("Icon", lx, 582, 200);
+        self.create("STATIC", "", SS_ICON | SS_CENTERIMAGE, 0, (cx + 100, 582, 24, 24), N_ICON_V);
+        self.button("Choose…", cx + 132, 582, 100, N_ICON);
+        self.button("Default", cx + 238, 582, 90, N_ICON_DEFAULT);
     }
 
     fn build_layout(&mut self) {
@@ -1042,38 +1082,36 @@ impl Win {
         self.label("Cell width", lx, 288, 200);
         self.help("For folders sized by columns", lx, 310, 205);
         self.slider(cx, 288, 330, L_CELL);
-        self.label("Width of new folders", lx, 334, 200);
-        self.slider(cx, 332, 330, L_NEW_W);
-        self.create("STATIC", "", SS_NOPREFIX, 0, (lx, 372, 664, 1), L_LINE);
-        let title = self.label("Arrangement", lx, 380, 200);
+        self.create("STATIC", "", SS_NOPREFIX, 0, (lx, 326, 664, 1), L_LINE);
+        let title = self.label("Arrangement", lx, 334, 200);
         send(title, WM_SETFONT, self.strong as usize, 0);
-        self.help("The folders in it move and stay together.", cx, 383, 454);
-        self.label("Shape", lx, 412, 200);
-        self.radio(cx, 412, L_SHAPE_ROW, "Row", 46);
-        self.radio(cx + 70, 412, L_SHAPE_COLUMN, "Column", 62);
-        self.radio(cx + 156, 412, L_SHAPE_GRID, "Grid", 46);
-        self.label("of", 640, 412, 18);
-        self.number(660, 412, 64, L_COUNT);
-        self.combo(732, 412, 132, L_BY, &["columns", "rows"]);
-        self.label("Place on the screen", lx, 448, 200);
-        self.help("Or drag its frame while unlocked", lx, 470, 205);
-        self.anchor_buttons(cx, 446);
-        self.label("Offset X", 490, 448, 52);
-        self.number(544, 448, 64, L_OFFSET_X);
-        self.label("Y", 618, 448, 14);
-        self.number(634, 448, 64, L_OFFSET_Y);
+        self.help("The folders in it move and stay together.", cx, 337, 454);
+        self.label("Shape", lx, 366, 200);
+        self.radio(cx, 366, L_SHAPE_ROW, "Row", 46);
+        self.radio(cx + 70, 366, L_SHAPE_COLUMN, "Column", 62);
+        self.radio(cx + 156, 366, L_SHAPE_GRID, "Grid", 46);
+        self.label("of", 640, 366, 18);
+        self.number(660, 366, 64, L_COUNT);
+        self.combo(732, 366, 132, L_BY, &["columns", "rows"]);
+        self.label("Place on the screen", lx, 402, 200);
+        self.help("Or drag its frame while unlocked", lx, 424, 205);
+        self.anchor_buttons(cx, 400);
+        self.label("Offset X", 490, 402, 52);
+        self.number(544, 402, 64, L_OFFSET_X);
+        self.label("Y", 618, 402, 14);
+        self.number(634, 402, 64, L_OFFSET_Y);
         let screens = arrange::screens();
         let labels: Vec<&str> = screens.iter().map(|s| s.label.as_str()).collect();
-        self.combo(710, 448, 154, L_SCREEN, &labels);
+        self.combo(710, 402, 154, L_SCREEN, &labels);
         self.screens = screens.iter().map(|s| s.device.clone()).collect();
-        self.path(490, 474, 374, L_NOW);
-        self.label("Folders in it", lx, 512, 200);
-        self.create("STATIC", "", SS_NOPREFIX | SS_CENTERIMAGE, 0, (cx, 512, 60, 24), L_MEMBERS);
-        self.button("Choose…", 474, 510, 90, L_CHOOSE);
-        self.check_text(580, 512, L_JOIN, "New folders join it", 150);
-        self.button("Arrange all folders", cx, 548, 160, L_ARRANGE_ALL);
-        self.button("Free all folders", cx + 166, 548, 140, L_FREE_ALL);
-        self.help("Drag a folder out of the frame to free it, or into the frame to add it.", lx, 584, 664);
+        self.path(490, 428, 374, L_NOW);
+        self.label("Folders in it", lx, 466, 200);
+        self.create("STATIC", "", SS_NOPREFIX | SS_CENTERIMAGE, 0, (cx, 466, 60, 24), L_MEMBERS);
+        self.button("Choose…", 474, 464, 90, L_CHOOSE);
+        self.check_text(580, 466, L_JOIN, "New folders join it", 150);
+        self.button("Arrange all folders", cx, 502, 160, L_ARRANGE_ALL);
+        self.button("Free all folders", cx + 166, 502, 140, L_FREE_ALL);
+        self.help("Drag a folder out of the frame to free it, or into the frame to add it.", lx, 538, 664);
     }
 
     fn build_about(&mut self) {
@@ -1344,7 +1382,8 @@ impl Win {
         self.set_check(A_COUNT, s.show_count);
         self.set_check(A_FOLDER_ICON, s.show_folder_icon);
         self.set_radio(A_NAMES_1, s.item_lines < 2);
-        self.set_radio(A_NAMES_2, s.item_lines >= 2);
+        self.set_radio(A_NAMES_2, s.item_lines == 2);
+        self.set_radio(A_NAMES_FULL, s.item_lines > 2);
     }
 
     fn sync_behavior(&mut self, s: &Settings) {
@@ -1360,6 +1399,28 @@ impl Win {
         let shown = if s.storage_dir.trim().is_empty() { format!("{root}  (default)") } else { root };
         self.set_text(B_STORAGE, &shown);
         self.enable(B_STORAGE_DEFAULT, !s.storage_dir.trim().is_empty());
+        self.set_radio(B_OPEN_SINGLE, !s.open_on_double_click);
+        self.set_radio(B_OPEN_DOUBLE, s.open_on_double_click);
+        // A single click opens, so nothing is selected: grayed out and unchecked;
+        // the choice comes back with the double-click.
+        self.enable(B_SELECTED_NAME, s.open_on_double_click);
+        self.set_check(B_SELECTED_NAME, s.open_on_double_click && s.show_selected_name);
+        let width = if s.new_folder_fit_columns { s.new_folder_columns * s.cell_width + 2 * config::PANEL_PAD } else { s.new_folder_width };
+        self.set_slider(N_WIDTH, width);
+        self.enable(N_WIDTH, !s.new_folder_fit_columns);
+        self.enable(N_WIDTH + 1, !s.new_folder_fit_columns);
+        self.set_edit(N_COLS, &s.new_folder_columns.to_string());
+        self.set_check(N_FIT, s.new_folder_fit_columns);
+        // With folder icons off, there is no icon to choose.
+        let icon = s.new_folder_icon.trim();
+        self.enable(N_ICON, s.show_folder_icon);
+        self.enable(N_ICON_DEFAULT, s.show_folder_icon && !icon.is_empty());
+        if !self.new_icon.is_null() {
+            unsafe { DestroyIcon(self.new_icon) };
+        }
+        self.new_icon = load_icon(if icon.is_empty() { DEFAULT_PANEL_ICON } else { icon }, self.s(16));
+        send(self.get(N_ICON_V), STM_SETICON, self.new_icon as usize, 0);
+        unsafe { ShowWindow(self.get(N_ICON_V), if s.show_folder_icon { SW_SHOW } else { SW_HIDE }) };
     }
 
     fn sync_layout(&mut self, s: &Settings) {
@@ -1372,7 +1433,6 @@ impl Win {
         self.set_radio(L_CLOSED, !s.unlocked_open_all);
         self.set_radio(L_OPEN_ALL, s.unlocked_open_all);
         self.set_slider(L_CELL, s.cell_width);
-        self.set_slider(L_NEW_W, s.new_folder_width);
 
         let spec = s.arrange_spec();
         let grid = spec.shape == Shape::Grid;
@@ -1463,6 +1523,7 @@ impl Win {
             (L_COUNT, _) => store::change(|s| s.update_settings(|st| st.arrange_count = v)),
             (L_OFFSET_X, _) => store::change(|s| s.update_settings(|st| st.arrange_offset_x = v)),
             (L_OFFSET_Y, _) => store::change(|s| s.update_settings(|st| st.arrange_offset_y = v)),
+            (N_COLS, _) => store::change(|s| s.update_settings(|st| st.new_folder_columns = v)),
             // A slider's box.
             _ => self.commit_slider(id - 1, v),
         }
@@ -1493,7 +1554,7 @@ impl Win {
             (B_OPEN, _) => store::change(|s| s.update_settings(|st| st.open_delay_ms = v.max(0) as u32)),
             (B_CLOSE, _) => store::change(|s| s.update_settings(|st| st.close_delay_ms = v.max(0) as u32)),
             (L_CELL, _) => store::change(|s| s.update_settings(|st| st.cell_width = v)),
-            (L_NEW_W, _) => store::change(|s| s.update_settings(|st| st.new_folder_width = v)),
+            (N_WIDTH, _) => store::change(|s| s.update_settings(|st| st.new_folder_width = v)),
             _ => {}
         }
         self.request_sync();
@@ -1604,7 +1665,15 @@ impl Win {
                 let on = self.checked(A_FOLDER_ICON);
                 store::change(|s| s.update_settings(|st| st.show_folder_icon = on));
             }
-            A_NAMES_1 | A_NAMES_2 => store::change(|s| s.update_settings(|st| st.item_lines = if id == A_NAMES_2 { 2 } else { 1 })),
+            A_NAMES_1 | A_NAMES_2 | A_NAMES_FULL => store::change(|s| {
+                s.update_settings(|st| {
+                    st.item_lines = match id {
+                        A_NAMES_2 => 2,
+                        A_NAMES_FULL => config::FULL_NAME_LINES,
+                        _ => 1,
+                    }
+                })
+            }),
             L_SNAP => {
                 let on = self.checked(L_SNAP);
                 store::change(|s| s.update_settings(|st| st.snap = on));
@@ -1723,6 +1792,21 @@ impl Win {
                 let on = self.checked(B_HOVER);
                 store::change(|s| s.update_settings(|st| st.hover_open = on));
             }
+            B_OPEN_SINGLE | B_OPEN_DOUBLE => store::change(|s| s.update_settings(|st| st.open_on_double_click = id == B_OPEN_DOUBLE)),
+            B_SELECTED_NAME => {
+                let on = self.checked(B_SELECTED_NAME);
+                store::change(|s| s.update_settings(|st| st.show_selected_name = on));
+            }
+            N_FIT => {
+                let on = self.checked(N_FIT);
+                store::change(|s| s.update_settings(|st| st.new_folder_fit_columns = on));
+            }
+            N_ICON => {
+                if let Some(icon) = self.pick_icon() {
+                    store::change(|s| s.update_settings(|st| st.new_folder_icon = icon));
+                }
+            }
+            N_ICON_DEFAULT => store::change(|s| s.update_settings(|st| st.new_folder_icon.clear())),
             B_COLLAPSE => {
                 let on = self.checked(B_COLLAPSE);
                 store::change(|s| s.update_settings(|st| st.collapse_after_launch = on));
@@ -1851,6 +1935,12 @@ impl Win {
     }
 
     fn on_notify(&mut self, hdr: &NMHDR, lparam: LPARAM) -> LRESULT {
+        // Sliders are drawn by us, also while the page is being filled.
+        if hdr.code == NM_CUSTOMDRAW
+            && let Some(result) = crate::slider::custom_draw(lparam, BG, ACCENT)
+        {
+            return result;
+        }
         if self.syncing {
             return 0;
         }

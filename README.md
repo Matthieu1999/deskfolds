@@ -218,7 +218,8 @@ update: they are in `%APPDATA%\deskfolds`, not in the program.
 |---|---|
 | Open a panel | Hover it (it closes when the mouse leaves). With hover turned off in Settings, click its name to open or close it |
 | Keep a panel open | Click its name (a blue dot shows it is pinned); click again to unpin |
-| Launch a shortcut | Click it |
+| Launch a shortcut | Click it. With **Open shortcuts with: Double-click** (Settings > Behavior), double-click it: a click then selects it and shows its full name under it, making room for it |
+| See a shortcut's full name | Hover it for a moment: a tooltip shows its full name and what it opens. Or choose **Shortcut names: In full** in Settings > Appearance |
 | Open the menu | Right-click a panel or the tray icon, or click the tray icon once |
 | Open Settings | Double-click the tray icon, or menu > **Settings…** (from a panel's menu: **Edit '<name>'…**) |
 | Create a folder | Menu > **New folder**, or Settings > Folders > **New folder** |
@@ -248,8 +249,9 @@ Every change is saved as soon as you make it: when you press Enter or leave a
 field, release a slider, click an arrow, or click a button. There is no Save
 button. **Tab** moves between fields and **Enter** saves the field you are
 typing in. **Esc** puts back the previous value of that field; when you are
-not typing, it closes the window. Each slider has a number box next to it:
-type a value, or use its arrows or the Up/Down keys (Shift: ten steps). A
+not typing, it closes the window. A click anywhere on a slider's track puts
+it there, and you can drag on from it. Each slider has a number box next to
+it: type a value, or use its arrows or the Up/Down keys (Shift: ten steps). A
 typed value can go past the slider's range, up to what the config file
 accepts.
 
@@ -276,17 +278,23 @@ can see what you are editing.
   next to the name, or none (then no icon can be chosen, and the icons chosen
   before come back when it is turned on again); how many lines a long name
   may take (then it ends with "…"); the number of shortcuts next to the
-  name; and shortcut names on one or two lines.
+  name; and shortcut names on one line, up to two lines, or **In full** (up
+  to 5 lines, each row as tall as its longest name).
 - **Behavior**: open folders on hover (when off, a folder opens and closes by
-  clicking its name), the delays before opening and closing, close after
-  launching a shortcut, lock folders in place, start with Windows, and the
-  storage folder for new folders.
+  clicking its name), the delays before opening and closing, whether a
+  shortcut opens with a **Single click** (the default) or a **Double-click**,
+  and with a double-click whether a click shows the full name of the selected
+  shortcut, close after launching a shortcut, lock folders in place, and
+  start with Windows. **New folders**: the storage folder, the width, the
+  columns, whether the width follows the columns, and the icon given to the
+  folders created from then on (the others keep theirs).
 - **Layout**: snap when moving, the gap kept between folders, what happens
   when a folder opens over the ones under or above it (**Push the folders
   next to it** or **Cover them**), the open direction (**Automatic**: folders
   that touch open the same way, upwards when there is no room below them; or
   **Always down**), whether folders stay closed or all
-  open while unlocked, the cell width and the width of new folders.
+  open while unlocked, and the cell width (the width of one column, for the
+  folders whose width follows their columns).
   **Arrangement**: its shape (**Row**, **Column**, or **Grid** of N
   **columns**, filled left to right, or N **rows**, filled top to bottom),
   its place on the screen (one of 9 anchors, an offset in pixels and the

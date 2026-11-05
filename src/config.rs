@@ -37,8 +37,14 @@ pub struct Settings {
     /// Shows the folder's icon next to its name. Off, no icon is shown and none
     /// can be chosen; the icons chosen before are kept for when it is on again.
     pub show_folder_icon: bool,
-    /// Lines a shortcut name may take under its icon (1 or 2).
+    /// Lines a shortcut name takes under its icon: 1, 2, or FULL_NAME_LINES
+    /// for "in full" (each row as tall as its longest name).
     pub item_lines: i32,
+    /// A double-click opens a shortcut, and a click selects it; otherwise a
+    /// single click opens it.
+    pub open_on_double_click: bool,
+    /// With a double-click to open: a click shows the selected shortcut's full name.
+    pub show_selected_name: bool,
     /// A folder being moved snaps to the edges of the others and of the screen.
     pub snap: bool,
     /// Space kept between folders by snapping, pushing and arranging.
@@ -53,6 +59,12 @@ pub struct Settings {
     pub cell_width: i32,
     /// Width given to new folders.
     pub new_folder_width: i32,
+    /// Columns of shortcuts in new folders.
+    pub new_folder_columns: i32,
+    /// New folders are as wide as their columns.
+    pub new_folder_fit_columns: bool,
+    /// The icon of new folders; empty for the default folder icon.
+    pub new_folder_icon: String,
     /// The arrangement's shape: "row", "column" or "grid".
     pub arrange_shape: String,
     /// For a grid: the number of columns, or of rows with arrange_by = "rows".
@@ -130,6 +142,8 @@ impl Default for Settings {
             show_count: false,
             show_folder_icon: true,
             item_lines: 1,
+            open_on_double_click: false,
+            show_selected_name: true,
             snap: true,
             gap: 8,
             push_below: true,
@@ -137,6 +151,9 @@ impl Default for Settings {
             unlocked_open_all: false,
             cell_width: 72,
             new_folder_width: DEFAULT_WIDTH,
+            new_folder_columns: DEFAULT_COLUMNS,
+            new_folder_fit_columns: false,
+            new_folder_icon: String::new(),
             arrange_shape: "grid".into(),
             arrange_count: 3,
             arrange_by: "columns".into(),
@@ -160,10 +177,11 @@ impl Settings {
         self.icon_size = self.icon_size.clamp(16, 128);
         self.title_style = self.title_style().name().to_string();
         self.title_lines = self.title_lines.clamp(1, 3);
-        self.item_lines = self.item_lines.clamp(1, 2);
+        self.item_lines = if self.item_lines >= 3 { FULL_NAME_LINES } else { self.item_lines.max(1) };
         self.gap = self.gap.clamp(0, 40);
         self.cell_width = self.cell_width.clamp(40, 200);
         self.new_folder_width = self.new_folder_width.clamp(MIN_WIDTH, 4000);
+        self.new_folder_columns = self.new_folder_columns.clamp(1, 20);
         let spec = self.arrange_spec();
         self.arrange_shape = match spec.shape {
             Shape::Row => "row",
@@ -276,6 +294,8 @@ pub struct Config {
 
 pub const DEFAULT_WIDTH: i32 = 300;
 pub const DEFAULT_COLUMNS: i32 = 4;
+/// The most lines a shortcut name shows in full; past them it ends with "…".
+pub const FULL_NAME_LINES: i32 = 5;
 pub const MIN_WIDTH: i32 = 80;
 
 fn default_width() -> i32 {

@@ -7,6 +7,7 @@ mod frame;
 mod layout;
 mod panel;
 mod settings;
+mod slider;
 mod store;
 mod ui;
 mod util;
