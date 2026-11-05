@@ -159,6 +159,36 @@ pub fn group_opens_up(labels: &[Rect], extras: &[i32], group: &[usize], me: usiz
     }
 }
 
+/// How many lines a shortcut's name shows, and how many its row keeps for it.
+/// `needed`: the lines its whole name takes (at most the full-name limit);
+/// `setting`: 1, 2, or more for "in full"; `full`: it is the selected shortcut
+/// whose full name is shown. With 2 lines, every row keeps 2, as before.
+pub fn name_lines(needed: usize, setting: usize, full: bool) -> (usize, usize) {
+    let needed = needed.max(1);
+    if full || setting >= 3 {
+        return (needed, needed);
+    }
+    let shown = needed.min(setting.max(1));
+    (shown, shown.max(setting.clamp(1, 2)))
+}
+
+/// The top of each row of shortcuts, then the bottom of the last one: each
+/// row as tall as the most lines one of its names keeps (`lines`, one per
+/// shortcut), `cols` shortcuts to a row. An empty folder keeps one row.
+pub fn row_tops(lines: &[usize], cols: usize, base: i32, line_h: i32) -> Vec<i32> {
+    let cols = cols.max(1);
+    let rows = lines.len().div_ceil(cols).max(1);
+    let mut tops = Vec::with_capacity(rows + 1);
+    let mut y = 0;
+    for r in 0..rows {
+        tops.push(y);
+        let most = lines.iter().skip(r * cols).take(cols).copied().max().unwrap_or(1).max(1);
+        y += base + (most as i32 - 1) * line_h;
+    }
+    tops.push(y);
+    tops
+}
+
 /// Whether folders pushed by `by` pixels (negative: up) all stay on the screen.
 pub fn pushes_fit(labels: &[Rect], pushed: &[usize], by: i32, area: Rect) -> bool {
     pushed.iter().all(|&j| labels[j].y + by >= area.y && labels[j].bottom() + by <= area.bottom())
@@ -526,6 +556,30 @@ mod tests {
         assert!(pushes_fit(&labels, &[0, 1], -300, SCREEN));
         assert!(!pushes_fit(&labels, &[3], 20, SCREEN));
         assert!(!pushes_fit(&labels, &[0], -2000, SCREEN));
+    }
+
+    #[test]
+    fn names_show_the_lines_chosen_and_the_selected_one_in_full() {
+        // One line: a long name is cut to 1; selected, it shows its 4 lines.
+        assert_eq!(name_lines(4, 1, false), (1, 1));
+        assert_eq!(name_lines(4, 1, true), (4, 4));
+        // Two lines: every row keeps 2, even for a short name.
+        assert_eq!(name_lines(1, 2, false), (1, 2));
+        assert_eq!(name_lines(4, 2, false), (2, 2));
+        // In full: each name as long as it needs.
+        assert_eq!(name_lines(3, 5, false), (3, 3));
+        assert_eq!(name_lines(1, 5, false), (1, 1));
+    }
+
+    #[test]
+    fn each_row_is_as_tall_as_its_longest_name() {
+        // 4 a row: the first row has a name on 3 lines, the second only 1 line each.
+        let lines = [1, 3, 1, 1, 1, 1];
+        assert_eq!(row_tops(&lines, 4, 60, 15), vec![0, 90, 150]);
+        // Nothing selected and one line: rows as before.
+        assert_eq!(row_tops(&[1; 8], 4, 60, 15), vec![0, 60, 120]);
+        // An empty folder keeps one row for its hint.
+        assert_eq!(row_tops(&[], 4, 60, 15), vec![0, 60]);
     }
 
     #[test]

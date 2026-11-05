@@ -230,6 +230,8 @@ fn sync_settings(t: &mut Table, s: &Settings) {
     put(t, "show_count", V::Bool(s.show_count), s.show_count == d.show_count);
     put(t, "show_folder_icon", V::Bool(s.show_folder_icon), s.show_folder_icon == d.show_folder_icon);
     put(t, "item_lines", V::Int(s.item_lines as i64), s.item_lines == d.item_lines);
+    put(t, "open_on_double_click", V::Bool(s.open_on_double_click), s.open_on_double_click == d.open_on_double_click);
+    put(t, "show_selected_name", V::Bool(s.show_selected_name), s.show_selected_name == d.show_selected_name);
     put(t, "snap", V::Bool(s.snap), s.snap == d.snap);
     put(t, "gap", V::Int(s.gap as i64), s.gap == d.gap);
     put(t, "push_below", V::Bool(s.push_below), s.push_below == d.push_below);
@@ -237,6 +239,9 @@ fn sync_settings(t: &mut Table, s: &Settings) {
     put(t, "unlocked_open_all", V::Bool(s.unlocked_open_all), s.unlocked_open_all == d.unlocked_open_all);
     put(t, "cell_width", V::Int(s.cell_width as i64), s.cell_width == d.cell_width);
     put(t, "new_folder_width", V::Int(s.new_folder_width as i64), s.new_folder_width == d.new_folder_width);
+    put(t, "new_folder_columns", V::Int(s.new_folder_columns as i64), s.new_folder_columns == d.new_folder_columns);
+    put(t, "new_folder_fit_columns", V::Bool(s.new_folder_fit_columns), s.new_folder_fit_columns == d.new_folder_fit_columns);
+    put(t, "new_folder_icon", V::Str(&s.new_folder_icon), s.new_folder_icon == d.new_folder_icon);
     for (key, value, default) in [
         ("arrange_shape", &s.arrange_shape, &d.arrange_shape),
         ("arrange_by", &s.arrange_by, &d.arrange_by),
@@ -653,10 +658,11 @@ impl Store {
             x,
             y,
             width: width.clamp(config::MIN_WIDTH, 4000),
-            columns: DEFAULT_COLUMNS,
-            icon: None,
+            // The settings for new folders: columns, width from the columns, icon.
+            columns: self.settings.new_folder_columns,
+            icon: Some(self.settings.new_folder_icon.trim()).filter(|i| !i.is_empty()).map(String::from),
             storage: Some(storage),
-            fit_columns: false,
+            fit_columns: self.settings.new_folder_fit_columns,
             arranged: false,
             items: Vec::new(),
         });
@@ -1055,6 +1061,46 @@ icon = \"shell32.dll,3\"
         assert!(!config.settings.show_folder_icon, "{text}");
         // The icon chosen for the folder is kept for when icons are on again.
         assert_eq!(config.panels[0].icon.as_deref(), Some("shell32.dll,3"));
+    }
+
+    #[test]
+    fn new_folders_get_the_settings_for_new_folders() {
+        let mut store = store_from("[settings]\nfont_size = 13\n");
+        store.update_settings(|s| s.storage_dir = std::env::temp_dir().join("deskfolds-test-none").to_string_lossy().to_string());
+        let plain = store.add_panel("A", 0, 0, 300);
+        let p = store.panel(plain).unwrap();
+        assert_eq!((p.columns, p.fit_columns, p.icon.clone()), (4, false, None));
+        store.update_settings(|s| {
+            s.new_folder_columns = 6;
+            s.new_folder_fit_columns = true;
+            s.new_folder_icon = "shell32.dll,12".into();
+        });
+        let set = store.add_panel("B", 0, 0, 300);
+        let p = store.panel(set).unwrap();
+        assert_eq!((p.columns, p.fit_columns, p.icon.as_deref()), (6, true, Some("shell32.dll,12")));
+        // The folder made before keeps what it had.
+        assert_eq!(store.panel(plain).unwrap().columns, 4);
+        let text = saved_text(&mut store);
+        let config = config::parse(&text).unwrap();
+        assert_eq!((config.settings.new_folder_columns, config.settings.new_folder_fit_columns), (6, true));
+        assert_eq!(config.settings.new_folder_icon, "shell32.dll,12");
+    }
+
+    #[test]
+    fn click_and_name_settings_are_saved_and_read_back() {
+        let mut store = store_from("[settings]\nfont_size = 13\n");
+        let text = saved_text(&mut store);
+        assert!(!text.contains("open_on_double_click") && !text.contains("show_selected_name"), "{text}");
+        store.update_settings(|s| {
+            s.open_on_double_click = true;
+            s.show_selected_name = false;
+            s.item_lines = config::FULL_NAME_LINES;
+        });
+        let config = config::parse(&saved_text(&mut store)).unwrap();
+        let s = &config.settings;
+        assert_eq!((s.open_on_double_click, s.show_selected_name, s.item_lines), (true, false, config::FULL_NAME_LINES));
+        // Any value past 2 lines means "in full".
+        assert_eq!(config::parse("[settings]\nitem_lines = 3\n").unwrap().settings.item_lines, config::FULL_NAME_LINES);
     }
 
     #[test]
