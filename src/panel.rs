@@ -1326,7 +1326,7 @@ fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
             // (not after Open: a program's hidden lock file is not one).
             let dir = if stored && !shell.opens_only(chosen) { file.parent().map(Path::to_path_buf) } else { None };
             let before = dir.as_deref().map(crate::shellmenu::listing).unwrap_or_default();
-            shell.invoke(main, chosen, file.parent(), at);
+            shell.invoke(main, &tracked, file.parent(), at);
             if let Some(dir) = &dir {
                 let made: Vec<String> = crate::shellmenu::made(&before, &crate::shellmenu::listing(dir))
                     .into_iter()

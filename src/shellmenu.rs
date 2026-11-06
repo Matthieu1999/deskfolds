@@ -283,8 +283,9 @@ impl ShellMenu {
         ids
     }
 
-    /// Runs one of its entries, chosen in the popup menu.
-    pub fn invoke(&self, owner: HWND, id: u32, dir: Option<&Path>, at: POINT) -> bool {
+    /// Runs the entry chosen in its popup menu, which must still be there.
+    pub fn invoke(&self, owner: HWND, chosen: &Chosen, dir: Option<&Path>, at: POINT) -> bool {
+        let id = chosen.id;
         let dir_w = dir.map(|d| wide(&d.to_string_lossy()));
         let info = InvokeInfo {
             size: std::mem::size_of::<InvokeInfo>() as u32,
