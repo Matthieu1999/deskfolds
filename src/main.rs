@@ -147,8 +147,10 @@ fn rebuild_panels(main: HWND) {
     // open in can take the others into account.
     for hwnd in panels() {
         panel::reposition(hwnd);
+        // An open folder (a pinned one) is above its neighbours.
+        panel::raise_if_open(hwnd);
     }
-    LAST_LABELS.with(|l| *l.borrow_mut() = labels_now());
+    remember_labels();
     // The frame belonged to the old desktop window (Explorer restarted).
     frame::hide();
     arrange::rearrange();
@@ -286,6 +288,13 @@ fn reposition_panels() {
         panel::reposition(hwnd);
     }
     arrange::rearrange();
+    remember_labels();
+}
+
+/// The labels as they are now are the ones the next size change is compared to
+/// (a new DPI changes them without a change in the config).
+fn remember_labels() {
+    LAST_LABELS.with(|l| *l.borrow_mut() = labels_now());
 }
 
 /// Keeps the folder selected in the settings window open and outlined.
@@ -635,10 +644,9 @@ pub fn notify(main: HWND, title: &str, text: &str, kind: Option<Balloon>) {
 }
 
 fn show_balloon(main: HWND, title: &str, text: &str, icon: u32, kind: Balloon) {
-    // A new notification replaces the one about shortcuts for all users.
-    if BALLOON.replace(kind) == Balloon::Shared && kind != Balloon::Shared {
-        watch::forget_refused();
-    }
+    // A click on this notification does what it says; the shortcuts for all
+    // users still wait for the next question about them.
+    BALLOON.set(kind);
     let mut nid = tray_data(main);
     nid.uFlags = NIF_INFO;
     nid.dwInfoFlags = icon;
@@ -856,6 +864,11 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             }
             WM_APP_ARRANGE => {
                 arrange::rearrange();
+                remember_labels();
+                0
+            }
+            watch::WM_APP_ASK_SHARED => {
+                watch::ask_for_shared(hwnd);
                 0
             }
             WM_DISPLAYCHANGE => {

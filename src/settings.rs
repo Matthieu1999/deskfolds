@@ -915,6 +915,7 @@ impl Win {
             self.new_icon = null_mut();
         }
         self.list_sigs = Default::default();
+        self.shortcut_targets.clear();
         self.dirty = None;
         self.syncing = false;
     }
@@ -1461,7 +1462,6 @@ impl Win {
         self.enable(B_CLOSE, s.hover_open);
         self.set_check(B_COLLAPSE, s.collapse_after_launch);
         self.set_check(B_LOCK, LOCKED.load(std::sync::atomic::Ordering::Relaxed));
-        self.set_check(B_AUTOSTART, util::autostart_enabled());
         let root = storage_root(&s.storage_dir).display().to_string();
         let shown = if s.storage_dir.trim().is_empty() { format!("{root}  (default)") } else { root };
         self.set_text(B_STORAGE, &shown);

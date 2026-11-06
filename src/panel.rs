@@ -980,8 +980,15 @@ pub fn clear_solo(hwnd: HWND) {
 /// After a move: a folder held open (pinned, or unlocked by itself) opens again.
 pub fn reopen_held(hwnd: HWND) {
     let Some(st) = state(hwnd) else { return };
-    if (st.pinned || st.solo) && !st.open {
+    if st.held_open() && !st.open {
         set_open(hwnd, st, true);
+    }
+}
+
+/// An open folder (pinned at start) goes above the other folders.
+pub fn raise_if_open(hwnd: HWND) {
+    if state(hwnd).is_some_and(|st| st.open) {
+        raise_above_panels(hwnd);
     }
 }
 
@@ -1132,12 +1139,15 @@ pub fn drop_files(panel_id: u32, index: usize, files: Vec<String>, effect: u32) 
     } else {
         files.into_iter().partition(|f| crate::watch::is_shortcut(Path::new(f)) && crate::watch::on_shared_desktop(Path::new(f)))
     };
-    let mut errors = store::change(|s| s.add_files(panel_id, index, &files, link));
-    if !shared.is_empty() {
-        errors.extend(crate::watch::move_shared_now(crate::main_window(), panel_id, &shared));
-    }
+    let errors = store::change(|s| s.add_files(panel_id, index, &files, link));
     if !errors.is_empty() {
         error_box(&format!("Some files could not be moved, so they were added as links:\n\n{}", errors.join("\n")));
+    }
+    if !shared.is_empty() {
+        let errors = crate::watch::move_shared_now(crate::main_window(), panel_id, &shared);
+        if !errors.is_empty() {
+            error_box(&format!("Some shortcuts could not be moved; they stay on the desktop:\n\n{}", errors.join("\n")));
+        }
     }
     if link { effect } else { 0 }
 }
@@ -1344,7 +1354,9 @@ pub fn check_new_links(main: HWND) {
             let _ = std::fs::remove_file(&link.placeholder);
         }
         // Only the shortcuts it made: not the files that came into the folder meanwhile.
-        let known = |p: &Path| store::with(|s| s.panels.iter().any(|panel| panel.items.iter().any(|it| Path::new(&it.path) == p)));
+        let known = |p: &Path| {
+            crate::watch::is_pending_copy(p) || store::with(|s| s.panels.iter().any(|panel| panel.items.iter().any(|it| Path::new(&it.path) == p)))
+        };
         let made: Vec<String> = crate::shellmenu::made(&link.before, &crate::shellmenu::listing(&link.dir))
             .into_iter()
             .chain(std::iter::once(link.placeholder.clone()).filter(|p| p.exists()))
@@ -1435,15 +1447,23 @@ fn rename_item_file(item: crate::config::Item, panel_id: u32, rect: RECT, font: 
     };
     let Some(typed) = prompt_text(rect, &file_name, font, Some(stem_len)) else { return };
     // Windows drops trailing dots and spaces from file names: so does this.
-    let mut new_name = typed.trim_end_matches(['.', ' ']).trim().to_string();
+    let mut new_name = typed.clone();
+    loop {
+        let trimmed = new_name.trim().trim_end_matches(['.', ' ']).to_string();
+        if trimmed == new_name {
+            break;
+        }
+        new_name = trimmed;
+    }
+    // The file keeps its type: "Report v1.2" stays a .docx.
     if let Some(e) = &ext
-        && std::path::Path::new(&new_name).extension().is_none()
+        && !new_name.to_lowercase().ends_with(&format!(".{}", e.to_lowercase()))
     {
         new_name = format!("{new_name}.{e}");
     }
-    let stem = new_name.split('.').next().unwrap_or("").trim().to_ascii_uppercase();
-    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || ((stem.starts_with("COM") || stem.starts_with("LPT")) && stem.len() == 4 && stem.ends_with(|c: char| c.is_ascii_digit()));
+    let stem = new_name.split('.').next().unwrap_or("").trim().to_uppercase();
+    let numbered = |prefix: &str| stem.strip_prefix(prefix).is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"));
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") || numbered("COM") || numbered("LPT");
     let bad = new_name.is_empty() || reserved || new_name.chars().any(|c| c.is_control() || "<>:\"/\\|?*".contains(c));
     if bad || new_name == file_name {
         return;

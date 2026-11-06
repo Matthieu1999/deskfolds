@@ -284,6 +284,7 @@ fn render(hwnd: HWND, st: &mut State, target: Option<HDC>) {
     let mut y = 0;
     let mut tops = Vec::new();
     unsafe {
+        let old_font = SelectObject(dc, st.font);
         SetBkMode(dc, TRANSPARENT as _);
         for topic in TOPICS {
             tops.push(y);
@@ -323,6 +324,7 @@ fn render(hwnd: HWND, st: &mut State, target: Option<HDC>) {
             TextOutW(dc, st.s(4), top + y, t.as_ptr(), t.len() as i32 - 1);
         }
         y += size.cy + st.s(12);
+        SelectObject(dc, old_font);
         if target.is_none() {
             ReleaseDC(hwnd, dc);
         }

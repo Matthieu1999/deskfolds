@@ -79,7 +79,7 @@ struct FileOperationVtbl {
     set_progress_message: usize,
     set_progress_dialog: usize,
     set_properties: usize,
-    set_owner_window: usize,
+    set_owner_window: unsafe extern "system" fn(*mut c_void, HWND) -> HRESULT,
     apply_properties_to_item: usize,
     apply_properties_to_items: usize,
     rename_item: usize,
@@ -196,9 +196,9 @@ impl ShellMenu {
         Self { menu, handler, keep_file: false }
     }
 
-    /// For a shortcut that is only a link to its file: Windows' menu leaves
-    /// that file alone (no Delete, Cut or Rename), as the file is not the
-    /// folder's but the original.
+    /// For a shortcut that is only a link to its file: Windows' menu keeps only
+    /// the entries that leave that file as it is (open, run as administrator,
+    /// copy, properties...), as the file is not the folder's but the original.
     pub fn keeping_the_file(mut self) -> Self {
         self.keep_file = true;
         self
@@ -206,6 +206,9 @@ impl ShellMenu {
 
     /// The verb of one of its entries ("delete", "open"...), if it has one.
     fn verb(&self, id: u32) -> Option<String> {
+        if !(FIRST_ID..=LAST_ID).contains(&id) {
+            return None;
+        }
         let mut buf = [0u16; 64];
         let get = self.menu.vtbl::<ContextMenuVtbl>().get_command_string;
         let ok = unsafe { get(self.menu.0, (id - FIRST_ID) as usize, GCS_VERBW, null_mut(), buf.as_mut_ptr() as *mut u8, buf.len() as u32) } == S_OK;
@@ -242,10 +245,32 @@ impl ShellMenu {
         let query = self.menu.vtbl::<ContextMenuVtbl>().query_context_menu;
         let filled = unsafe { query(self.menu.0, menu, index, FIRST_ID, LAST_ID, CMF_NORMAL) >= 0 };
         if filled && self.keep_file {
-            for pos in (0..unsafe { GetMenuItemCount(menu) }.max(0)).rev() {
-                let id = unsafe { GetMenuItemID(menu, pos) };
-                if (FIRST_ID..=LAST_ID).contains(&id) && self.verb(id).is_some_and(|v| matches!(v.as_str(), "delete" | "cut" | "rename")) {
-                    unsafe { DeleteMenu(menu, pos as u32, MF_BYPOSITION) };
+            const KEEP: [&str; 13] =
+                ["open", "opennew", "openas", "edit", "print", "printto", "runas", "runasuser", "copy", "copyaspath", "properties", "pintostartscreen", "pintohome"];
+            unsafe {
+                // Submenus (Send to, Open with...) and entries with no known verb go.
+                for pos in (0..GetMenuItemCount(menu).max(0)).rev() {
+                    let id = GetMenuItemID(menu, pos);
+                    let separator = id == 0;
+                    if !separator && !self.verb(id).is_some_and(|v| (FIRST_ID..=LAST_ID).contains(&id) && KEEP.contains(&v.as_str())) {
+                        DeleteMenu(menu, pos as u32, MF_BYPOSITION);
+                    }
+                }
+                // No line at the top, at the bottom, or twice in a row.
+                let mut previous_line = true;
+                let mut pos = 0;
+                while pos < GetMenuItemCount(menu).max(0) {
+                    let line = GetMenuItemID(menu, pos) == 0;
+                    if line && previous_line {
+                        DeleteMenu(menu, pos as u32, MF_BYPOSITION);
+                        continue;
+                    }
+                    previous_line = line;
+                    pos += 1;
+                }
+                let last = GetMenuItemCount(menu) - 1;
+                if last >= 0 && GetMenuItemID(menu, last) == 0 {
+                    DeleteMenu(menu, last as u32, MF_BYPOSITION);
                 }
             }
         }
@@ -625,11 +650,10 @@ fn create_shortcut_window(link: &Path) -> Option<HANDLE> {
 /// change them, Windows asks for permission with its own prompt, and does it
 /// with its own rights: no code of deskfolds runs as administrator. Check
 /// afterwards which files are gone.
-pub fn recycle_with_windows(files: &[PathBuf], recycle: bool) {
+pub fn recycle_with_windows(owner: HWND, files: &[PathBuf], recycle: bool) {
     const FOF_SILENT: u32 = 0x4;
     const FOF_NOCONFIRMATION: u32 = 0x10;
     const FOF_ALLOWUNDO: u32 = 0x40;
-    const FOF_NOERRORUI: u32 = 0x400;
     const FOFX_SHOWELEVATIONPROMPT: u32 = 0x0004_0000;
     const FOFX_RECYCLEONDELETE: u32 = 0x0008_0000;
     unsafe {
@@ -640,7 +664,11 @@ pub fn recycle_with_windows(files: &[PathBuf], recycle: bool) {
         let op = Com(object);
         let vt = op.vtbl::<FileOperationVtbl>();
         let undo = if recycle { FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE } else { 0 };
-        (vt.set_operation_flags)(op.0, FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOFX_SHOWELEVATIONPROMPT | undo);
+        // Windows' own dialogs stay: they name the file it asks permission for.
+        (vt.set_operation_flags)(op.0, FOF_SILENT | FOF_NOCONFIRMATION | FOFX_SHOWELEVATIONPROMPT | undo);
+        if !owner.is_null() {
+            (vt.set_owner_window)(op.0, owner);
+        }
         let mut any = false;
         for file in files {
             let path = wide(&file.to_string_lossy());
@@ -711,7 +739,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("a.lnk");
         std::fs::write(&file, b"x").unwrap();
-        recycle_with_windows(std::slice::from_ref(&file), false);
+        recycle_with_windows(null_mut(), std::slice::from_ref(&file), false);
         assert!(!file.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -138,14 +138,27 @@ pub fn copy_suffix() -> Option<String> {
     if usual_copy() {
         return None;
     }
-    Some(format!("{:016x}", stable_hash(&crate::config::app_dir().to_string_lossy().to_lowercase())))
+    // The folder as Windows resolves it (links, short names), so every way of
+    // writing it gives the same name.
+    let dir = crate::config::app_dir();
+    let root = dir.parent().map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.to_path_buf())).unwrap_or_default();
+    let root = root.to_string_lossy();
+    let root = root.strip_prefix(r"\\?\").unwrap_or(&root);
+    Some(format!("{:016x}", stable_hash(&format!("{root}\\deskfolds").to_lowercase())))
 }
 
 /// What deskfolds adds to Windows starts it with these arguments: none for
 /// the usual copy; a test copy gives its APPDATA, so it starts as itself.
 pub fn launch_args() -> String {
     match (usual_copy(), crate::config::app_dir().parent()) {
-        (false, Some(root)) => format!("{APPDATA_ARG} \"{}\"", root.display()),
+        (false, Some(root)) => {
+            // A folder ending in "\\" (a drive) would escape the closing quote.
+            let mut root = root.display().to_string();
+            if root.ends_with('\\') {
+                root.push('\\');
+            }
+            format!("{APPDATA_ARG} \"{root}\"")
+        }
         _ => String::new(),
     }
 }
