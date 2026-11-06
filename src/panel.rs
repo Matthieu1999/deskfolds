@@ -1253,11 +1253,12 @@ fn drag_item_out(hwnd: HWND, st: &PanelState, index: usize) {
 ///   Rename only changes its name in the folder. Neither touches the original;
 ///   Windows' other entries act on it as they do on the desktop.
 ///
-/// A shortcut with no file (a web address, a missing file) has deskfolds' own
-/// Rename and Delete instead. Remove from folder puts a moved file back on the
-/// desktop, and for a link makes a shortcut to the original there. What one
-/// of Windows' entries makes next to a moved file (Create shortcut, a zip)
-/// joins the folder.
+/// When Windows' menu has no Rename or Delete (a web address, a missing file),
+/// deskfolds adds its own. Remove from folder puts a moved file back on the
+/// desktop, and for a link makes a shortcut to the original there, unless the
+/// original is on a desktop already or is missing. What one of Windows'
+/// entries makes next to a moved file (Create shortcut, a zip) joins the
+/// folder.
 fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
     let Some((panel_id, item)) = store::with(|s| s.item(item_id).map(|(p, it)| (p, it.clone()))) else { return };
     let path = resolve(&item.path);
@@ -1266,17 +1267,23 @@ fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
     // A shortcut whose file is missing gets only deskfolds' entries.
     let shell = file.exists().then(|| crate::shellmenu::ShellMenu::of_file(main, file)).flatten();
     let mut ids = crate::shellmenu::ItemIds::default();
+    // deskfolds' own Rename and Delete, only where Windows has none: an entry
+    // with their ids from elsewhere does nothing.
+    let (mut own_rename, mut own_delete) = (false, false);
     let chosen = crate::shellmenu::track(main, at, shell.as_ref(), |menu| unsafe {
         let add = |id: usize, text: &str| {
             let text = wide(text);
             AppendMenuW(menu, MF_STRING, id, text.as_ptr());
         };
-        match &shell {
-            Some(s) => ids = s.fill_for_item(menu, 0, extended),
-            None => {
-                add(ID_RENAME, "Rename");
-                add(ID_DELETE, "Delete");
-            }
+        if let Some(s) = &shell {
+            ids = s.fill_for_item(menu, 0, extended);
+        }
+        (own_rename, own_delete) = (ids.rename.is_empty(), ids.delete.is_empty());
+        if own_rename {
+            add(ID_RENAME, "Rename");
+        }
+        if own_delete {
+            add(ID_DELETE, "Delete");
         }
         if GetMenuItemCount(menu) > 0 {
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
@@ -1285,8 +1292,8 @@ fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
         add(ID_SETTINGS, "Folder settings…");
     });
     after_menu();
-    let delete = chosen as usize == ID_DELETE || ids.delete.contains(&chosen);
-    let rename = chosen as usize == ID_RENAME || ids.rename.contains(&chosen);
+    let delete = (own_delete && chosen as usize == ID_DELETE) || ids.delete.contains(&chosen);
+    let rename = (own_rename && chosen as usize == ID_RENAME) || ids.rename.contains(&chosen);
     match chosen as usize {
         ID_REMOVE => remove_from_folder(item_id, &item, stored),
         ID_SETTINGS => crate::settings::open_item(panel_id, item_id),
@@ -1342,8 +1349,8 @@ fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
 
 /// Remove from folder: a file moved into the folder goes back to the desktop;
 /// a link leaves the folder, and a shortcut to its original appears on the
-/// desktop, unless the original is already there or is missing. Nothing is
-/// deleted.
+/// desktop, unless the original is on the desktop or the shared one already,
+/// or is missing. Nothing is deleted.
 fn remove_from_folder(item_id: u32, item: &crate::config::Item, stored: bool) {
     if !stored {
         let Some(desktop) = dragdrop::desktop_dir() else {
@@ -1352,7 +1359,10 @@ fn remove_from_folder(item_id: u32, item: &crate::config::Item, stored: bool) {
         };
         let target = resolve(&item.path);
         let original = Path::new(&target);
-        let wanted = crate::util::is_uri(&target) || (original.exists() && original.parent() != Some(desktop.as_path()));
+        let folder = original.parent().map(|d| d.to_string_lossy().to_lowercase());
+        let (_, shared) = crate::watch::desktops();
+        let on_a_desktop = [Some(desktop.clone()), shared].into_iter().flatten().any(|d| folder.as_deref() == Some(d.to_string_lossy().to_lowercase().as_str()));
+        let wanted = crate::util::is_uri(&target) || (original.exists() && !on_a_desktop);
         // The desktop watcher leaves it there: deskfolds put it.
         if wanted && let Err(e) = crate::integration::make_shortcut(&desktop, &item.name, &target, &item.args, item.icon.as_deref()) {
             error_box(&e);
@@ -1492,7 +1502,8 @@ fn rename_item_file(item: crate::config::Item, panel_id: u32, rect: RECT, font: 
     let stored = store::with(|s| s.is_stored(panel_id, &item));
     let path = std::path::PathBuf::from(crate::util::expand_env(&item.path));
     let file_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| item.name.clone());
-    if !stored {
+    // A link, or a moved file that is gone: only its name in the folder.
+    if !stored || !path.exists() {
         if let Some(name) = prompt_text(rect, &item.name, font, None) {
             store::change(|s| s.update_item(item_id, |it| it.name = name));
         }
