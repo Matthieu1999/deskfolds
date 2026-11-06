@@ -269,10 +269,18 @@ pub fn make_shortcut(dir: &Path, name: &str, target: &str, args: &str, icon: Opt
     }
     let uri = crate::util::is_uri(target);
     let file = format!("{}.{}", file_name_for(name), if uri { "url" } else { "lnk" });
+    // A test copy's own Desktop folder may not be there yet.
+    std::fs::create_dir_all(dir).map_err(|e| fail(&e.to_string()))?;
     let path = crate::dragdrop::free_name(dir, std::ffi::OsStr::new(&file));
     crate::watch::note_put_back(&path);
     // The name is taken first, so a file that appeared meanwhile is never replaced.
-    let mut reserved = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| fail(&e.to_string()))?;
+    let mut reserved = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::watch::forget_put_back(&path);
+            return Err(fail(&e.to_string()));
+        }
+    };
     let written = if uri {
         use std::io::Write;
         let text = format!("[InternetShortcut]\r\nURL={target}\r\n");
@@ -284,6 +292,7 @@ pub fn make_shortcut(dir: &Path, name: &str, target: &str, args: &str, icon: Opt
     if let Err(e) = written {
         // Only the file made just above.
         let _ = std::fs::remove_file(&path);
+        crate::watch::forget_put_back(&path);
         return Err(e);
     }
     Ok(path)

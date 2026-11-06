@@ -63,6 +63,9 @@ const SNAP_REACH: i32 = 10;
 /// deskfolds' entries at the end of a shortcut's Windows menu.
 const ID_REMOVE: usize = 1;
 const ID_SETTINGS: usize = 2;
+/// For a shortcut with no Windows menu (a web address, a missing file).
+const ID_RENAME: usize = 3;
+const ID_DELETE: usize = 4;
 /// The main window's timer that waits for Windows' « Create Shortcut » window.
 pub const NEW_LINK_TIMER: usize = 40;
 /// Icon shown next to the name when the panel sets none: any folder works.
@@ -1250,10 +1253,12 @@ fn drag_item_out(hwnd: HWND, st: &PanelState, index: usize) {
 ///   Rename only changes its name in the folder. Neither touches the original;
 ///   Windows' other entries act on it as they do on the desktop.
 ///
-/// Remove from folder puts a moved file back on the desktop, and for a link
-/// makes a shortcut to the original there. What one of Windows' entries makes
-/// next to a moved file (Create shortcut, a zip) joins the folder.
-pub fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
+/// A shortcut with no file (a web address, a missing file) has deskfolds' own
+/// Rename and Delete instead. Remove from folder puts a moved file back on the
+/// desktop, and for a link makes a shortcut to the original there. What one
+/// of Windows' entries makes next to a moved file (Create shortcut, a zip)
+/// joins the folder.
+fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
     let Some((panel_id, item)) = store::with(|s| s.item(item_id).map(|(p, it)| (p, it.clone()))) else { return };
     let path = resolve(&item.path);
     let file = Path::new(&path);
@@ -1262,23 +1267,31 @@ pub fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
     let shell = file.exists().then(|| crate::shellmenu::ShellMenu::of_file(main, file)).flatten();
     let mut ids = crate::shellmenu::ItemIds::default();
     let chosen = crate::shellmenu::track(main, at, shell.as_ref(), |menu| unsafe {
-        if let Some(s) = &shell {
-            ids = s.fill_for_item(menu, 0, extended);
-            if GetMenuItemCount(menu) > 0 {
-                AppendMenuW(menu, MF_SEPARATOR, 0, null());
-            }
-        }
-        for (id, text) in [(ID_REMOVE, "Remove from folder"), (ID_SETTINGS, "Folder settings…")] {
+        let add = |id: usize, text: &str| {
             let text = wide(text);
             AppendMenuW(menu, MF_STRING, id, text.as_ptr());
+        };
+        match &shell {
+            Some(s) => ids = s.fill_for_item(menu, 0, extended),
+            None => {
+                add(ID_RENAME, "Rename");
+                add(ID_DELETE, "Delete");
+            }
         }
+        if GetMenuItemCount(menu) > 0 {
+            AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        }
+        add(ID_REMOVE, "Remove from folder");
+        add(ID_SETTINGS, "Folder settings…");
     });
     after_menu();
+    let delete = chosen as usize == ID_DELETE || ids.delete.contains(&chosen);
+    let rename = chosen as usize == ID_RENAME || ids.rename.contains(&chosen);
     match chosen as usize {
         ID_REMOVE => remove_from_folder(item_id, &item, stored),
         ID_SETTINGS => crate::settings::open_item(panel_id, item_id),
-        _ if ids.delete.contains(&chosen) => {
-            if stored {
+        _ if delete => {
+            if stored && file.exists() {
                 let outcome = crate::shellmenu::delete_to_recycle_bin(&[file.to_path_buf()]);
                 if file.exists() {
                     // Windows was told No, or could not: the shortcut stays.
@@ -1294,20 +1307,21 @@ pub fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
                 error_box(&e);
             }
         }
-        _ if ids.rename.contains(&chosen) => unsafe {
+        _ if rename => unsafe {
             // Once the menu is gone: the name is typed in place.
             PostMessageW(main, WM_APP_RENAME_ITEM, item_id as usize, 0);
         },
         _ if (crate::shellmenu::FIRST_ID..=crate::shellmenu::LAST_ID).contains(&chosen) => {
             let Some(shell) = &shell else { return };
-            // What one of Windows' entries makes next to a moved file joins the folder.
-            let dir = if stored { file.parent().map(Path::to_path_buf) } else { None };
+            // What one of Windows' entries makes next to a moved file joins the folder
+            // (not after Open: a program's hidden lock file is not one).
+            let dir = if stored && !shell.opens_only(chosen) { file.parent().map(Path::to_path_buf) } else { None };
             let before = dir.as_deref().map(crate::shellmenu::listing).unwrap_or_default();
             shell.invoke(main, chosen, file.parent(), at);
             if let Some(dir) = &dir {
                 let made: Vec<String> = crate::shellmenu::made(&before, &crate::shellmenu::listing(dir))
                     .into_iter()
-                    .filter(|p| !known_file(p))
+                    .filter(|p| !known_file(p) && !hidden_file(p))
                     .map(|p| p.to_string_lossy().to_string())
                     .collect();
                 if !made.is_empty() && store::with(|s| s.panel(panel_id).is_some()) {
@@ -1328,7 +1342,8 @@ pub fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
 
 /// Remove from folder: a file moved into the folder goes back to the desktop;
 /// a link leaves the folder, and a shortcut to its original appears on the
-/// desktop. Nothing is deleted.
+/// desktop, unless the original is already there or is missing. Nothing is
+/// deleted.
 fn remove_from_folder(item_id: u32, item: &crate::config::Item, stored: bool) {
     if !stored {
         let Some(desktop) = dragdrop::desktop_dir() else {
@@ -1336,8 +1351,10 @@ fn remove_from_folder(item_id: u32, item: &crate::config::Item, stored: bool) {
             return;
         };
         let target = resolve(&item.path);
+        let original = Path::new(&target);
+        let wanted = crate::util::is_uri(&target) || (original.exists() && original.parent() != Some(desktop.as_path()));
         // The desktop watcher leaves it there: deskfolds put it.
-        if let Err(e) = crate::integration::make_shortcut(&desktop, &item.name, &target, &item.args, item.icon.as_deref()) {
+        if wanted && let Err(e) = crate::integration::make_shortcut(&desktop, &item.name, &target, &item.args, item.icon.as_deref()) {
             error_box(&e);
             return;
         }
@@ -1345,6 +1362,13 @@ fn remove_from_folder(item_id: u32, item: &crate::config::Item, stored: bool) {
     if let Err(e) = store::change(|s| s.remove_item(item_id, stored)) {
         error_box(&e);
     }
+}
+
+/// A hidden or system file (a program's lock file such as ~$report.docx).
+fn hidden_file(p: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const HIDDEN_OR_SYSTEM: u32 = 0x2 | 0x4;
+    std::fs::metadata(p).is_ok_and(|m| m.file_attributes() & HIDDEN_OR_SYSTEM != 0)
 }
 
 /// A file already in a folder, or a copy waiting for Windows' answer: not one
@@ -1474,13 +1498,15 @@ fn rename_item_file(item: crate::config::Item, panel_id: u32, rect: RECT, font: 
         }
         return;
     }
-    // The name without its extension is selected, as in Explorer.
+    // The name without its extension is selected, as in Explorer; a
+    // shortcut's .lnk or .url is not shown at all.
     let ext = if path.is_dir() { None } else { path.extension().map(|e| e.to_string_lossy().to_string()) };
     let stem_len = match &ext {
         Some(e) => file_name.encode_utf16().count() - e.encode_utf16().count() - 1,
         None => file_name.encode_utf16().count(),
     };
-    let Some(typed) = prompt_text(rect, &file_name, font, Some(stem_len)) else { return };
+    let shown = if crate::watch::is_shortcut(&path) { path.file_stem().map_or_else(|| file_name.clone(), |s| s.to_string_lossy().to_string()) } else { file_name.clone() };
+    let Some(typed) = prompt_text(rect, &shown, font, Some(stem_len)) else { return };
     // Windows drops trailing dots and spaces from file names: so does this.
     let mut new_name = typed.clone();
     loop {

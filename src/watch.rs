@@ -266,6 +266,14 @@ pub fn note_put_back(path: &Path) {
     }
 }
 
+/// deskfolds did not put it there after all.
+pub fn forget_put_back(path: &Path) {
+    let key = path.to_string_lossy().to_lowercase();
+    if let Ok(mut list) = PUT_BACK.lock() {
+        list.retain(|p| *p != key);
+    }
+}
+
 fn was_put_back(path: &Path) -> bool {
     let key = path.to_string_lossy().to_lowercase();
     PUT_BACK.lock().is_ok_and(|l| l.contains(&key))

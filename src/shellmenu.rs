@@ -190,7 +190,7 @@ thread_local! {
 /// A Windows menu of a folder or a file, ready to go into a popup menu.
 pub struct ShellMenu {
     menu: Com,
-    /// IContextMenu3 or IContextMenu2, for the submenus (« New », « Send to »).
+    /// IContextMenu3 or IContextMenu2, for the submenus (« Send to », « Open with »).
     handler: Option<(Com, u8)>,
 }
 
@@ -206,6 +206,13 @@ impl ShellMenu {
     fn new(menu: Com) -> Self {
         let handler = menu.query(&IID_ICONTEXT_MENU3).map(|m| (m, 3)).or_else(|| menu.query(&IID_ICONTEXT_MENU2).map(|m| (m, 2)));
         Self { menu, handler }
+    }
+
+    /// The entry opens, prints or shows the file, and makes no file next to it.
+    pub fn opens_only(&self, id: u32) -> bool {
+        const OPENING: [&str; 14] =
+            ["open", "opennew", "opennewwindow", "opennewtab", "explore", "edit", "print", "printto", "runas", "runasuser", "openas", "properties", "play", "preview"];
+        self.verb(id).is_some_and(|v| OPENING.contains(&v.as_str()))
     }
 
     /// The verb of one of its entries ("delete", "open"...), if it has one.
@@ -326,8 +333,8 @@ pub fn handle_menu_message(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<L
         return None;
     }
     let (handler, kind, top) = ACTIVE.get();
-    // Our own popup menu is ours to fill: Windows' « New » menu waits forever
-    // when asked to fill it. Only its own submenus go to it.
+    // Only Windows' own submenus go to it: the top menu holds deskfolds'
+    // entries too, and is filled by deskfolds.
     if handler.is_null() || (msg == WM_INITMENUPOPUP && wparam as HMENU == top) {
         return None;
     }
@@ -701,8 +708,13 @@ pub enum Outcome {
     Done,
     /// The user said No to one of Windows' questions.
     Cancelled,
+    /// Not done, and not because of the user (Windows may stop silently).
     Failed,
 }
+
+/// PerformOperations when the user said No (COPYENGINE_E_USER_CANCELLED),
+/// or a cancelled operation in general.
+const USER_CANCELLED: [HRESULT; 2] = [0x8027_0000_u32 as HRESULT, 0x8007_04C7_u32 as HRESULT];
 
 fn file_operation(owner: HWND, files: &[PathBuf], flags: u32) -> Outcome {
     unsafe {
@@ -728,11 +740,14 @@ fn file_operation(owner: HWND, files: &[PathBuf], flags: u32) -> Outcome {
         if !any {
             return Outcome::Failed;
         }
-        let done = (vt.perform_operations)(op.0) >= 0;
+        let hr = (vt.perform_operations)(op.0);
+        // Windows may stop an operation without a word (no error dialogs): it
+        // then says it succeeded, but that something was aborted.
         let mut aborted = 0;
-        if (vt.get_any_operations_aborted)(op.0, &mut aborted) >= 0 && aborted != 0 {
+        (vt.get_any_operations_aborted)(op.0, &mut aborted);
+        if USER_CANCELLED.contains(&hr) {
             Outcome::Cancelled
-        } else if done {
+        } else if hr >= 0 && aborted == 0 {
             Outcome::Done
         } else {
             Outcome::Failed
