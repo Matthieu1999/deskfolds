@@ -83,12 +83,12 @@ pub const TOPICS: &[Topic] = &[
             ("Reorder them", "While the folder is unlocked, drag them within it, or onto another folder."),
             (
                 "Take one out",
-                "Right-click it > deskfolds > Remove from folder: a file you moved in goes back to the desktop; for a link, a shortcut to the original appears there. Or, while the folder is unlocked, drag it onto the desktop.",
+                "Right-click it > deskfolds > Remove from folder: a file you moved in goes back to the desktop; for a link, a shortcut to the original appears there, unless the original is on the desktop already. Or, while the folder is unlocked, drag it onto the desktop.",
             ),
             ("Its menu", "Right-click it: Windows' menu for its file, then deskfolds > Remove from folder or Folder settings. With [Shift], Windows' extended entries."),
             (
                 "Delete and Rename",
-                "For a file moved into the folder: Delete sends it to the Recycle Bin, Rename renames it. For a link: Delete only takes it out of the folder and Rename only changes its name here; neither touches the original. Windows' other entries act on the original, as on the desktop.",
+                "For a file moved into the folder: Delete sends it to the Recycle Bin (Windows asks first when it can only delete it for good), Rename renames it. For a link: Delete only takes it out of the folder and Rename only changes its name here; neither touches the original. Windows' other entries act on the original, as on the desktop.",
             ),
             ("Made next to a file", "What Windows' menu makes next to a file you moved in (Create shortcut, a zip from Send to) joins the folder."),
             ("A web address", "It has no Windows menu: right-click it for Rename, Delete and deskfolds."),
@@ -126,7 +126,7 @@ pub const TOPICS: &[Topic] = &[
         rows: &[
             (
                 "Your files",
-                "deskfolds never overwrites a file: a name already taken becomes \"name (2)\". It deletes one only when you choose Delete, and then sends it to the Recycle Bin.",
+                "deskfolds never overwrites a file: a name already taken becomes \"name (2)\". Apart from its own files, it deletes one only when you choose Delete, or the original of a shortcut for all users you move in. It goes to the Recycle Bin; Windows asks first when it can only delete it for good.",
             ),
             ("A mistake?", "About & advanced > Previous versions > Restore…"),
             ("Find deskfolds", "In the Start menu and Windows search, if you chose so in Windows integration."),

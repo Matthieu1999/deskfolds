@@ -44,8 +44,11 @@ them or one by one.
   as backups.
   A hand edit of the config file is never silently overwritten.
 - **Never overwrites a file**: files dragged into a folder are moved there,
-  and a name already taken becomes "name (2)". A file is deleted only when you
-  choose **Delete** on it in a folder, and it then goes to the Recycle Bin.
+  and a name already taken becomes "name (2)". Apart from its own files
+  (backups, its Start menu shortcut), deskfolds deletes a file only when you
+  choose **Delete** on it in a folder, or the original of a shortcut for all
+  users that you move into a folder. It goes to the Recycle Bin; Windows asks
+  first when it can only delete it for good.
 - **DPI aware**: panels and the settings window scale with each monitor's DPI.
 
 ## Requirements
@@ -277,7 +280,8 @@ update: they are in `%APPDATA%\deskfolds`, not in the program.
 | Undo a mistake | Settings > About & advanced > **Previous versions** > **Restore…** |
 
 deskfolds never overwrites a file (a name already taken becomes "name (2)").
-It deletes a file only when you choose **Delete** on a file, folder or shortcut
+Apart from its own files (config backups, its Start menu shortcut), it deletes
+a file only when you choose **Delete** on a file, folder or shortcut
 moved into a folder, and then sends it to the Recycle Bin; Windows asks first
 when it can only delete it for good. A shortcut for all users that you move
 into a folder is copied there, and its original goes to the Recycle Bin.
