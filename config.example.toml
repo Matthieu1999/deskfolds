@@ -63,11 +63,14 @@ show_selected_name = true     # with a double-click: a click shows the selected 
 
 # Arranging folders. While unlocked, a moved folder snaps to the edges of the
 # other folders and of the screen, gap pixels away (hold Alt to place it
-# freely). An opening folder pushes the folders stacked right under or above
-# it out of its way (push_below = false: it covers them). Folders that touch
-# open the same way, upwards when there is no room below them
+# freely). Folders snapped next to one that gets bigger move aside, and go to
+# a new line rather than off the screen (snap_make_room = false: they stay
+# and get covered). An opening folder pushes the folders stacked right under
+# or above it out of its way (push_below = false: it covers them). Folders
+# that touch open the same way, upwards when there is no room below them
 # (open_upwards = false: always downwards).
 snap = true
+snap_make_room = true
 gap = 8
 push_below = true
 open_upwards = true
@@ -77,6 +80,12 @@ new_folder_width = 300        # width of new folders
 new_folder_columns = 4        # columns of shortcuts in new folders
 new_folder_fit_columns = false # new folders as wide as their columns
 new_folder_icon = ""          # icon of new folders ("" = the default folder icon)
+
+# New desktop shortcuts (from an installer, for example) go into the folder of
+# this name 2 seconds after they appear; it is made when first needed. Empty:
+# they stay on the desktop. Shortcuts for all users need Windows' permission
+# each time (click the notification).
+new_shortcuts_folder = ""
 
 # The arrangement: the folders with arranged = true are placed in it, in the
 # order of this file, and moved with it. Its frame can be dragged while
@@ -96,6 +105,7 @@ arrange_screen = ""
 new_folders_join = true       # new folders join the arrangement (if it has folders)
 
 # A panel with fit_columns = true is columns x cell_width wide (plus 12 px).
+# pinned = true: it stays open (click its name to pin or unpin it).
 [[panel]]
 title = "Apps"
 x = 40

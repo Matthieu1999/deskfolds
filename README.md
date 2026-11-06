@@ -4,8 +4,9 @@ Tiny foldable shortcut panels for the Windows desktop.
 
 Each panel is a small frosted-glass folder label on the desktop, as wide as
 the folder. Hover it and it unrolls a glass card of shortcuts; move the mouse
-away and it folds back. Click its name to pin it open. Panels are locked in
-place: they don't move unless you unlock them.
+away and it folds back. Click its name to pin it open, also after a restart.
+Panels are locked in place: they don't move unless you unlock them, all of
+them or one by one.
 
 - **Native and light**: one small program, with no framework or runtime to
   install: [download](#option-a-download-it) one file and run it. About 750 KB
@@ -21,7 +22,15 @@ place: they don't move unless you unlock them.
   screen; drag its frame to move them all at once. An opening folder pushes
   the folders stacked under or above it out of its way instead of covering
   them. Folders that touch open the same way, upwards near the bottom of the
-  screen, and are never pushed off it.
+  screen, and are never pushed off it. Folders snapped side by side make room
+  when one of them gets bigger, and go to a new line rather than off the
+  screen.
+- **Part of Windows, if you want it**: deskfolds can show in the Start menu
+  and in Windows search, add **New deskfolds folder** to the desktop's
+  right-click menu, and put new desktop shortcuts into a folder by themselves.
+  Each is turned on in Settings > **Windows integration**, for your account
+  only, with no administrator rights. Inside a folder, the right-click menu
+  has Windows' own **New** menu, and a shortcut has its Windows menu.
 - **Any shortcut**: programs, documents, folders, `.lnk` files and URIs
   (`https://…`, `ms-settings:…`), with their real Windows icons.
 - **Glass look**: the blurred acrylic background used by the Start menu,
@@ -29,7 +38,8 @@ place: they don't move unless you unlock them.
   during the 200 ms animation).
 - **Settings window**: create, delete, resize and arrange folders, edit their
   shortcuts, and change the look and behavior, without touching a config
-  file. Native Windows controls in dark mode, built only while it is open.
+  file. Native Windows controls in dark mode, built only while it is open. Its
+  **Help** page lists what deskfolds can do, and the keys.
 - **Safe saves**: saved at once, atomically, with the last 5 versions kept
   as backups.
   A hand edit of the config file is never silently overwritten.
@@ -149,18 +159,33 @@ appears in the notification area, next to the clock. If you don't see the
 icon, it may be hidden under the **^** arrow; to keep it visible, turn it on
 in Windows Settings > Personalization > Taskbar > Other system tray icons.
 
+The first time, a **Welcome** window offers what deskfolds can add to
+Windows: the Start menu shortcut (checked), **Start with Windows** and the
+desktop menu entry (not checked). Nothing is added unless you click
+**Start**; the same choices are in Settings > **Windows integration**. Its
+**See what deskfolds can do** opens Settings > **Help**.
+
 Only one copy of deskfolds runs at a time: starting it again does nothing.
 
 ### Start it with Windows
 
-Tray menu > **Start with Windows**, or Settings > Behavior > **Start with
-Windows**.
+Tray menu > **Start with Windows**, or Settings > Windows integration >
+**Start with Windows**.
 
 Windows then starts deskfolds from the place it is in now. Keep
 `deskfolds.exe` (or the `deskfolds` folder you built it in) where it is: if
 you move or delete it, deskfolds no longer starts with Windows. To use another
 place, quit deskfolds, move `deskfolds.exe` there, start it from there, and
 turn **Start with Windows** off and on again.
+
+### Find it in the Start menu and Windows search
+
+Settings > **Windows integration** > **Show deskfolds in the Start menu and in
+Windows search** adds a shortcut to `deskfolds.exe` in your own Start menu
+folder (`%APPDATA%\Microsoft\Windows\Start Menu\Programs`). Windows search
+then finds deskfolds as an app, and you can pin it to Start or to the taskbar.
+No administrator rights and no signature are needed. If you move
+`deskfolds.exe`, the shortcut follows it the next time deskfolds starts.
 
 ### Update
 
@@ -200,9 +225,13 @@ update: they are in `%APPDATA%\deskfolds`, not in the program.
 
 ### Uninstall
 
-1. Turn **Start with Windows** off, then quit deskfolds. (If you forgot and
-   already deleted it, turn deskfolds off in Windows Settings > Apps >
-   Startup.)
+1. Turn off what deskfolds added to Windows, then quit deskfolds: in
+   Settings > **Windows integration**, uncheck **Start menu and search**,
+   **Start with Windows** and **Desktop menu**. If you forgot and already
+   deleted it: turn deskfolds off in Windows Settings > Apps > Startup, delete
+   `deskfolds.lnk` in `%APPDATA%\Microsoft\Windows\Start Menu\Programs`,
+   and delete the registry key
+   `HKEY_CURRENT_USER\Software\Classes\DesktopBackground\Shell\deskfolds.newfolder`.
 2. Get back the files you dragged into folders. They are in each folder's
    storage folder: by default `deskfolds\<folder name>` inside your Documents
    folder (which may be in OneDrive). Deleting a folder in Settings with
@@ -217,27 +246,34 @@ update: they are in `%APPDATA%\deskfolds`, not in the program.
 | Action | How |
 |---|---|
 | Open a panel | Hover it (it closes when the mouse leaves). With hover turned off in Settings, click its name to open or close it |
-| Keep a panel open | Click its name (a blue dot shows it is pinned); click again to unpin |
+| Keep a panel open | Click its name (a blue dot shows it is pinned); click again to unpin. A pinned folder stays pinned after a restart |
 | Launch a shortcut | Click it. With **Open shortcuts with: Double-click** (Settings > Behavior), double-click it: a click then selects it and shows its full name under it, making room for it |
 | See a shortcut's full name | Hover it for a moment: a tooltip shows its full name and what it opens. Or choose **Shortcut names: In full** in Settings > Appearance |
-| Open the menu | Right-click a panel or the tray icon, or click the tray icon once |
+| Open the menu | Right-click a panel or the tray icon, or click the tray icon once. A folder's menu starts with Windows' **New** menu |
 | Open Settings | Double-click the tray icon, or menu > **Settings…** (from a panel's menu: **Edit '<name>'…**) |
-| Create a folder | Menu > **New folder**, or Settings > Folders > **New folder** |
+| Create a folder | Right-click the desktop > **New deskfolds folder** (once turned on in Settings > Windows integration; on Windows 11 under **Show more options**, or with Shift + right-click), or menu > **New folder**, and type its name right away. Or Settings > Folders > **New folder** |
+| Rename a folder | Right-click it > **Rename '…'** and type the new name (**Enter** keeps it, **Esc** keeps the old one), or Settings > Folders |
 | Delete a folder | Right-click it > **Delete '…'…**, or Settings > Folders > **Delete…**. Both ask first. Files you moved into it go back to the desktop, or stay in its storage folder if you choose so |
-| Rename, resize, reorder folders | Settings > Folders: name, width, columns, position, ▲ ▼. Type a number in the box next to a slider, or use its arrows or the Up/Down keys (Shift: ten steps) |
+| Resize, reorder folders | Settings > Folders: name, width, columns, position, ▲ ▼. Type a number in the box next to a slider, or use its arrows or the Up/Down keys (Shift: ten steps) |
 | Arrange folders | Settings > Folders > **Arrange all…** (row, column or grid), or Settings > Layout > **Arrange all folders**. The folders form an **arrangement**: they stay in its shape and place, and are placed again when one is added, removed, renamed or resized |
-| Move the whole arrangement | While unlocked, drag its frame (the dashed outline with a blue tab). It snaps to the corners, edges and center of the screen; hold **Alt** to place it freely, press **Esc** to put it back. Or pick its place, offset and screen in Settings > Layout |
+| Move the whole arrangement | While all folders are unlocked, drag its frame (the dashed outline with a blue tab). It snaps to the corners, edges and center of the screen; hold **Alt** to place it freely, press **Esc** to put it back. Or pick its place, offset and screen in Settings > Layout |
 | Change a folder's place in the arrangement | While unlocked, drag the folder inside the frame: a dashed slot shows where it goes and the others make room. The Folders list follows |
 | Take a folder out of the arrangement, or add one | While unlocked, drag it out of the frame (it stays where you drop it) or into it; hold **Alt** to drop it over the frame and keep it out. Or tick **In the arrangement** in Settings > Folders, or use **Choose…** in Settings > Layout |
 | Add a shortcut | Drag a file, folder or shortcut onto a panel (a closed panel opens) or onto the shortcut list in Settings. It is **moved** into the folder's storage folder; hold **Ctrl** to keep it where it is and only add a link. Works even while locked. Settings > **Add…** adds links |
+| Make a new file in a folder | Right-click the folder > **New**: Windows' own menu (folder, shortcut, text document, Word document…, as on the desktop). It is made in the folder's storage folder and joins the folder, its name ready to type. **Shortcut** opens Windows' **Create Shortcut** window |
+| A shortcut's Windows menu | Right-click it > **Show more options**: the menu Windows shows for its file (Open file location, Run as administrator, Properties…) |
+| Put new desktop shortcuts away | Settings > Windows integration > **New desktop shortcuts**: pick a folder, or a new one, **New apps**. A shortcut that appears on the desktop from then on (from an installer, for example) moves into it 2 seconds later, with a notification. A shortcut for all users is on the shared desktop, which usually only an administrator can change: click the notification, and Windows asks for your permission, each time. A shortcut deskfolds puts back on the desktop is never taken again |
 | Edit a shortcut | Settings > Folders: select it, then change its name, arguments or icon |
-| Edit panels on the desktop | Menu > **Unlock panels (move and edit)**, or Settings > Folders > **Move on the desktop**: every panel gets a blue border and opens when you hover it (Settings > Layout can open them all instead) |
+| Edit panels on the desktop | Menu > **Unlock all folders (move and edit)**, or Settings > Folders > **Move on the desktop**: every panel gets a blue border and opens when you hover it (Settings > Layout can open them all instead) |
+| Unlock one folder | Right-click it > **Unlock '…' (move and edit)**: only that folder gets a blue border, stays open, and can be moved, resized and edited. Right-click it > **Lock '…'** when you are done. Everything is locked again when deskfolds starts |
 | Move a panel | While unlocked, drag it by its name. It snaps to the edges of the other folders and of the screen, keeping a small gap; the folder it snaps to lights up. Hold **Alt** to place it freely, press **Esc** to put it back |
+| Room for a bigger folder | When a folder gets wider (its width, its columns, the resize grip, or a longer name in the **Fit the name** style), the folders snapped on its right move with it, keeping the gap; one that no longer fits on the screen goes to a new line, under the row's first folder. A taller name moves the folders snapped under it down. Turn it off in Settings > Layout |
 | Resize a panel | While unlocked, drag its right edge (not for a folder whose width follows its columns) |
 | Reorder or move shortcuts | While unlocked, drag a shortcut within the panel or onto another panel |
 | Take a shortcut out | While unlocked, drag it onto the desktop or an Explorer window. A file that was moved into the folder goes there. For a link, a shortcut to it is created there and the original stays where it is. Hold **Ctrl** to copy it and keep it in the panel |
 | Rename or remove a shortcut | While unlocked, right-click it. **Remove from folder** puts a moved file back on the desktop; a link is just removed |
-| Finish editing | Menu > **Lock panels**, or **Done** in Settings |
+| Finish editing | Menu > **Lock all folders**, or **Done** in Settings |
+| See what deskfolds can do | Settings > **Help**: everything above, and the keys |
 | Undo a mistake | Settings > About & advanced > **Previous versions** > **Restore…** |
 
 deskfolds never deletes a file: it only moves files, and never overwrites one
@@ -284,11 +320,12 @@ can see what you are editing.
   clicking its name), the delays before opening and closing, whether a
   shortcut opens with a **Single click** (the default) or a **Double-click**,
   and with a double-click whether a click shows the full name of the selected
-  shortcut, close after launching a shortcut, lock folders in place, and
-  start with Windows. **New folders**: the storage folder, the width, the
+  shortcut, close after launching a shortcut, and lock folders in place.
+  **New folders**: the storage folder, the width, the
   columns, whether the width follows the columns, and the icon given to the
   folders created from then on (the others keep theirs).
-- **Layout**: snap when moving, the gap kept between folders, what happens
+- **Layout**: snap when moving, whether snapped folders make room when one
+  gets bigger, the gap kept between folders, what happens
   when a folder opens over the ones under or above it (**Push the folders
   next to it** or **Cover them**), the open direction (**Automatic**: folders
   that touch open the same way, upwards when there is no room below them; or
@@ -303,6 +340,13 @@ can see what you are editing.
   it) or **Free all folders**. Each column is as wide as its widest folder,
   and an incomplete last row follows the anchor (on the left, centered or on
   the right).
+- **Windows integration**: what deskfolds adds to Windows, each only once
+  checked here, for your account only: **Show deskfolds in the Start menu and
+  in Windows search**, **Start with Windows**, **New deskfolds folder** in the
+  desktop's right-click menu, and where **New desktop shortcuts** go (they
+  stay on the desktop by default).
+- **Help**: what deskfolds can do, and the keys that change what a drag
+  does, by topic. Text only, built into `deskfolds.exe`.
 - **About & advanced**: the config file, with **Open in Notepad** and
   **Reload**; the previous versions, with **Restore…**; and **Reset…** for the
   appearance, behavior and layout (folders and shortcuts are kept).
@@ -356,7 +400,8 @@ icon = "%SystemRoot%\\ImmersiveControlPanel\\SystemSettings.exe"
 Panel fields: `title`, `x`, `y`, `width`, `columns`, optional `fit_columns`
 (`true`: the width is `columns` × `cell_width`, plus 12 px), optional
 `arranged` (`true`: in the arrangement; its `x` and `y` are then written by
-deskfolds each time it places the arrangement), optional `icon`
+deskfolds each time it places the arrangement), optional `pinned` (`true`:
+it stays open, also after a restart), optional `icon`
 (shown next to the name instead of a folder), and `storage`, the folder that holds
 the files dropped into the panel. deskfolds picks it when the panel is created
 (or, in an older config without it, when it is first loaded) and writes it on
@@ -392,6 +437,30 @@ unlocked; it is kept just under the folders, so they still get the mouse.
 Dragging it moves the folders with it, and on release its anchor and offset
 are saved.
 
+Windows' menus inside a folder (`src/shellmenu.rs`): the **New** menu lists
+what Explorer lists on the desktop (**Folder**, **Shortcut**, and the file
+types apps registered with a `ShellNew` key), read from the registry when the
+menu opens. It makes the file the way Explorer does: empty, from the data the
+app registered, or as a copy of its template; **Shortcut** opens Windows'
+**Create Shortcut** window. A shortcut's menu is its file's own
+`IContextMenu`, loaded only while the menu is open; its submenus are filled
+through the menu's owner window.
+
+The desktop menu entry is a plain verb under
+`HKEY_CURRENT_USER\Software\Classes\DesktopBackground\Shell`: Explorer runs
+`deskfolds.exe --new-folder`, which tells the running deskfolds where the
+mouse is, then quits. Nothing of deskfolds is loaded into Explorer.
+
+New desktop shortcuts (`src/watch.rs`): only while the option is on, a thread
+waits for Windows to tell it about new files on the desktop and on the shared
+desktop (`ReadDirectoryChangesW`); it uses no CPU meanwhile. When Windows
+refuses to move a shortcut of the shared desktop, a click on the notification
+copies it into the folder, then starts deskfolds again with administrator
+rights (`runas`) and `--remove-shared` and the file names. That copy only
+deletes plain `.lnk` and `.url` files directly in the shared desktop, then
+quits; if it is refused or fails, the copy is taken away and the shortcut
+stays where it was.
+
 The data lives in one store (`src/store.rs`) that every change goes through:
 panels, drag and drop and the settings window all call it, and it tells the
 app which panel to redraw. Panels and shortcuts get ids in memory only, so a
@@ -413,6 +482,20 @@ change always reaches the right one and the config file stays clean.
   on the nearest one; they return when it comes back. An arrangement on a
   screen that is unplugged goes to the main screen, and back when it returns.
 - There is one arrangement. Folders that are not in it are placed by hand.
+- Folders put on a new line to make room are remembered until deskfolds
+  quits: after a restart they stay where they are, and no longer come back
+  onto the row when there is room again.
+- On Windows 11, the desktop's short right-click menu only shows apps
+  installed from a signed package: **New deskfolds folder** is under **Show
+  more options**, or straight away with Shift + right-click.
+- Moving a shortcut installed for all users asks for Windows' permission each
+  time, unless your account may change the shared desktop.
+- The **New** menu offers the file types that can be made the way Explorer
+  makes them (empty, from registered data, or from a template); a type made
+  by a program's own command is left out.
+- A shortcut's Windows menu (**Show more options**) loads the menu
+  extensions of the apps installed, as Explorer does: their code runs in
+  deskfolds while that menu is open.
 - The settings window is always dark. Windows' own dialogs (color picker,
   file picker, confirmations) follow their own theme.
 - So far tested only at 100 % display scaling.

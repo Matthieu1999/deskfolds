@@ -35,8 +35,9 @@ pub fn error_box(text: &str) {
 }
 
 /// Shows a one-line text box over `rect` (screen pixels). Enter confirms,
-/// Esc or clicking elsewhere cancels.
-pub fn prompt_text(rect: RECT, initial: &str, font: HFONT) -> Option<String> {
+/// Esc or clicking elsewhere cancels. `select`: how many characters (UTF-16
+/// units) are selected from the start; all of them by default.
+pub fn prompt_text(rect: RECT, initial: &str, font: HFONT, select: Option<usize>) -> Option<String> {
     let class = wide("EDIT");
     let text = wide(initial);
     unsafe {
@@ -60,7 +61,7 @@ pub fn prompt_text(rect: RECT, initial: &str, font: HFONT) -> Option<String> {
         SendMessageW(edit, WM_SETFONT, font as usize, 1);
         SetForegroundWindow(edit);
         SetFocus(edit);
-        SendMessageW(edit, EM_SETSEL, 0, -1);
+        SendMessageW(edit, EM_SETSEL, 0, select.map_or(-1, |n| n as isize));
 
         let mut confirmed = false;
         let mut msg: MSG = std::mem::zeroed();
@@ -210,9 +211,18 @@ pub fn open_in_notepad(path: &Path) {
     launch("notepad.exe", &format!("\"{}\"", path.display()));
 }
 
+/// The name of the "start with Windows" entry: a test copy (another APPDATA)
+/// has one of its own, so it never changes the usual copy's.
+fn run_value() -> String {
+    match crate::integration::copy_suffix() {
+        Some(s) => format!("{RUN_VALUE}.{s}"),
+        None => RUN_VALUE.to_string(),
+    }
+}
+
 pub fn autostart_enabled() -> bool {
     let key = wide(RUN_KEY);
-    let value = wide(RUN_VALUE);
+    let value = wide(&run_value());
     unsafe {
         RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr(), RRF_RT_REG_SZ, null_mut(), null_mut(), null_mut())
             == 0
@@ -221,7 +231,7 @@ pub fn autostart_enabled() -> bool {
 
 pub fn set_autostart(enabled: bool) {
     let key = wide(RUN_KEY);
-    let value = wide(RUN_VALUE);
+    let value = wide(&run_value());
     unsafe {
         if enabled {
             let Ok(exe) = std::env::current_exe() else { return };

@@ -80,6 +80,12 @@ pub struct Settings {
     pub arrange_screen: String,
     /// New folders join the arrangement, if it has folders.
     pub new_folders_join: bool,
+    /// Folders snapped next to one that gets bigger move aside, and go to a
+    /// new line rather than off the screen.
+    pub snap_make_room: bool,
+    /// The folder new desktop shortcuts go into, by name; empty = they stay on
+    /// the desktop. A folder of that name is made when it is first needed.
+    pub new_shortcuts_folder: String,
 }
 
 /// Anchor names, by [vertical][horizontal].
@@ -162,6 +168,8 @@ impl Default for Settings {
             arrange_offset_y: 0,
             arrange_screen: String::new(),
             new_folders_join: true,
+            snap_make_room: true,
+            new_shortcuts_folder: String::new(),
         }
     }
 }
@@ -194,6 +202,7 @@ impl Settings {
         self.arrange_anchor = ANCHORS[spec.anchor.1][spec.anchor.0].into();
         self.arrange_offset_x = self.arrange_offset_x.clamp(-20000, 20000);
         self.arrange_offset_y = self.arrange_offset_y.clamp(-20000, 20000);
+        self.new_shortcuts_folder = self.new_shortcuts_folder.trim().chars().take(MAX_TITLE).collect();
     }
 
     /// The arrangement's shape and place; unknown names mean the defaults.
@@ -251,6 +260,9 @@ pub struct Panel {
     /// In the arrangement: placed by it, and moved with it.
     #[serde(default)]
     pub arranged: bool,
+    /// Pinned open: it stays open, also after a restart.
+    #[serde(default)]
+    pub pinned: bool,
     #[serde(default, rename = "item")]
     pub items: Vec<Item>,
 }
@@ -297,6 +309,8 @@ pub const DEFAULT_COLUMNS: i32 = 4;
 /// The most lines a shortcut name shows in full; past them it ends with "…".
 pub const FULL_NAME_LINES: i32 = 5;
 pub const MIN_WIDTH: i32 = 80;
+/// The longest folder name kept from the config, in characters.
+pub const MAX_TITLE: usize = 200;
 
 fn default_width() -> i32 {
     DEFAULT_WIDTH

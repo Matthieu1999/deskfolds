@@ -91,7 +91,7 @@ fn state<'a>(hwnd: HWND) -> Option<&'a mut State> {
 /// Shows the frame around `block` (while unlocked), with a dashed slot where a
 /// dragged folder would go.
 pub fn show(block: Rect, text: &str, slot: Option<Rect>, dpi: u32) {
-    if LOCKED.load(std::sync::atomic::Ordering::Relaxed) {
+    if !crate::frame_wanted() {
         hide();
         return;
     }
@@ -311,7 +311,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         match msg {
             WM_MOUSEACTIVATE => return MA_NOACTIVATE as LRESULT,
             // The whole frame is a handle to move it.
-            WM_NCHITTEST => return HTCAPTION as LRESULT,
+            // It moves only while all folders are unlocked; with one folder
+            // unlocked by itself, it only shows where that folder can go.
+            WM_NCHITTEST => {
+                return if LOCKED.load(std::sync::atomic::Ordering::Relaxed) { HTCLIENT } else { HTCAPTION } as LRESULT;
+            }
             WM_WINDOWPOSCHANGING => {
                 let pos = &mut *(lparam as *mut WINDOWPOS);
                 pos.hwndInsertAfter = HWND_BOTTOM;

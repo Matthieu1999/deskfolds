@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::{DRAGDROP_S_DROP, E_NOINTERFACE, GetLastError, HWND, POINT, POINTL, S_OK};
-use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_COPY_ALLOWED, MoveFileExW};
+use windows_sys::Win32::Storage::FileSystem::{CopyFileW, MOVEFILE_COPY_ALLOWED, MoveFileExW};
 use windows_sys::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, FORMATETC, STGMEDIUM};
 use windows_sys::Win32::System::Ole::{
     CF_HDROP, RegisterDragDrop, ReleaseStgMedium, RevokeDragDrop,
@@ -296,7 +296,7 @@ pub fn cursor_over_desktop() -> bool {
     }
 }
 
-fn known_folder(id: &GUID) -> Option<PathBuf> {
+pub fn known_folder(id: &GUID) -> Option<PathBuf> {
     unsafe {
         let mut raw = null_mut();
         if SHGetKnownFolderPath(id, 0, null_mut(), &mut raw) != S_OK {
@@ -348,11 +348,8 @@ pub fn is_stored(path: &str, root: &Path) -> bool {
     expanded.to_lowercase().starts_with(&format!("{}\\", root.trim_end_matches('\\')))
 }
 
-/// Moves a file or folder into `dir`, renaming it "name (2)" if the name is taken.
-/// Never overwrites anything.
-pub fn move_into(src: &Path, dir: &Path) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
-    let file_name = src.file_name().ok_or_else(|| format!("Invalid path {}", src.display()))?;
+/// A free name for `file_name` in `dir`: itself, or "name (2)", "name (3)"...
+pub fn free_name(dir: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
     let mut dest = dir.join(file_name);
     let stem = Path::new(file_name).file_stem().unwrap_or(file_name).to_string_lossy().to_string();
     let ext = Path::new(file_name).extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
@@ -361,10 +358,42 @@ pub fn move_into(src: &Path, dir: &Path) -> Result<PathBuf, String> {
         dest = dir.join(format!("{stem} ({n}){ext}"));
         n += 1;
     }
+    dest
+}
+
+/// Moves a file or folder into `dir`, renaming it "name (2)" if the name is taken.
+/// Never overwrites anything.
+pub fn move_into(src: &Path, dir: &Path) -> Result<PathBuf, String> {
+    move_file(src, dir).map_err(|(e, _)| e)
+}
+
+/// `move_into`, with the Windows error code when it fails.
+pub fn move_file(src: &Path, dir: &Path) -> Result<PathBuf, (String, u32)> {
+    std::fs::create_dir_all(dir).map_err(|e| (format!("Cannot create {}: {e}", dir.display()), e.raw_os_error().unwrap_or(0) as u32))?;
+    let file_name = src.file_name().ok_or_else(|| (format!("Invalid path {}", src.display()), 0))?;
+    let dest = free_name(dir, file_name);
     let (from, to) = (wide(&src.to_string_lossy()), wide(&dest.to_string_lossy()));
     if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_COPY_ALLOWED) } == 0 {
         let code = unsafe { GetLastError() };
-        return Err(format!("Cannot move {} (Windows error {code}).", src.display()));
+        return Err((format!("Cannot move {} (Windows error {code}).", src.display()), code));
+    }
+    // A file put back on the desktop is not a new desktop shortcut.
+    if desktop_dir().is_some_and(|d| d == dir) {
+        crate::watch::note_put_back(&dest);
+    }
+    Ok(dest)
+}
+
+/// Copies a file into `dir` under a free name. Never overwrites anything.
+pub fn copy_into(src: &Path, dir: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
+    let file_name = src.file_name().ok_or_else(|| format!("Invalid path {}", src.display()))?;
+    let dest = free_name(dir, file_name);
+    let (from, to) = (wide(&src.to_string_lossy()), wide(&dest.to_string_lossy()));
+    // Fails if the name was taken meanwhile; the copy gets the folder's permissions.
+    if unsafe { CopyFileW(from.as_ptr(), to.as_ptr(), 1) } == 0 {
+        let code = unsafe { GetLastError() };
+        return Err(format!("Cannot copy {} (Windows error {code}).", src.display()));
     }
     Ok(dest)
 }
