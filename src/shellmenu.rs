@@ -98,7 +98,7 @@ struct FileOperationVtbl {
     delete_items: usize,
     new_item: usize,
     perform_operations: unsafe extern "system" fn(*mut c_void) -> HRESULT,
-    get_any_operations_aborted: usize,
+    get_any_operations_aborted: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
 }
 
 #[repr(C)]
@@ -194,12 +194,12 @@ pub struct ShellMenu {
     handler: Option<(Com, u8)>,
 }
 
-/// Where Windows put its Delete and Rename in a shortcut's menu: deskfolds
-/// does those itself.
+/// Where Windows put its Delete and Rename entries in a shortcut's menu (all
+/// of them, if a handler adds another): deskfolds does those itself.
 #[derive(Default)]
 pub struct ItemIds {
-    pub delete: Option<u32>,
-    pub rename: Option<u32>,
+    pub delete: Vec<u32>,
+    pub rename: Vec<u32>,
 }
 
 impl ShellMenu {
@@ -266,8 +266,8 @@ impl ShellMenu {
                     Some("cut") => {
                         DeleteMenu(menu, pos as u32, MF_BYPOSITION);
                     }
-                    Some("delete") => ids.delete = Some(id),
-                    Some("rename") => ids.rename = Some(id),
+                    Some("delete") => ids.delete.push(id),
+                    Some("rename") => ids.rename.push(id),
                     _ => {}
                 }
             }
@@ -666,6 +666,8 @@ fn create_shortcut_window(link: &Path) -> Option<HANDLE> {
 const FOF_SILENT: u32 = 0x4;
 const FOF_NOCONFIRMATION: u32 = 0x10;
 const FOF_ALLOWUNDO: u32 = 0x40;
+/// No error dialogs, and so no prompt for administrator rights either.
+const FOF_NOERRORUI: u32 = 0x400;
 /// Windows asks first when it would delete for good rather than recycle.
 const FOF_WANTNUKEWARNING: u32 = 0x4000;
 const FOFX_SHOWELEVATIONPROMPT: u32 = 0x0004_0000;
@@ -684,16 +686,29 @@ pub fn recycle_with_windows(owner: HWND, files: &[PathBuf], recycle: bool) {
 
 /// Delete from a shortcut's menu: its file goes to the Recycle Bin, with no
 /// question. When Windows cannot recycle it (too big for the Recycle Bin, a
-/// USB stick, a network drive), it asks before deleting it for good.
-pub fn delete_to_recycle_bin(owner: HWND, files: &[PathBuf]) {
-    file_operation(owner, files,FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING);
+/// USB stick, a network drive), it asks before deleting it for good. It never
+/// asks for administrator rights: a file of the user's own storage folder does
+/// not need them, and while such a prompt is open the path could be pointed
+/// elsewhere. The file is still there if the user said No or Windows could not.
+pub fn delete_to_recycle_bin(files: &[PathBuf]) -> Outcome {
+    // No owner: the hidden main window would put Windows' question behind others.
+    file_operation(null_mut(), files, FOF_SILENT | FOF_NOERRORUI | FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING)
 }
 
-fn file_operation(owner: HWND, files: &[PathBuf], flags: u32) {
+/// What Windows' file operation did.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Outcome {
+    Done,
+    /// The user said No to one of Windows' questions.
+    Cancelled,
+    Failed,
+}
+
+fn file_operation(owner: HWND, files: &[PathBuf], flags: u32) -> Outcome {
     unsafe {
         let mut object = null_mut();
         if CoCreateInstance(&CLSID_FILE_OPERATION, null_mut(), CLSCTX_INPROC_SERVER, &IID_IFILE_OPERATION, &mut object) != S_OK || object.is_null() {
-            return;
+            return Outcome::Failed;
         }
         let op = Com(object);
         let vt = op.vtbl::<FileOperationVtbl>();
@@ -710,8 +725,17 @@ fn file_operation(owner: HWND, files: &[PathBuf], flags: u32) {
                 any |= (vt.delete_item)(op.0, item.0, null_mut()) == S_OK;
             }
         }
-        if any {
-            (vt.perform_operations)(op.0);
+        if !any {
+            return Outcome::Failed;
+        }
+        let done = (vt.perform_operations)(op.0) >= 0;
+        let mut aborted = 0;
+        if (vt.get_any_operations_aborted)(op.0, &mut aborted) >= 0 && aborted != 0 {
+            Outcome::Cancelled
+        } else if done {
+            Outcome::Done
+        } else {
+            Outcome::Failed
         }
     }
 }
@@ -752,8 +776,10 @@ mod tests {
             let (ids, verbs) = verbs(extended);
             assert!(!verbs.iter().any(|v| v == "cut"), "{verbs:?}");
             assert!(verbs.iter().any(|v| v == "properties"), "{verbs:?}");
-            let (delete, rename) = (ids.delete.expect("Delete"), ids.rename.expect("Rename"));
-            assert_eq!((shell.verb(delete).as_deref(), shell.verb(rename).as_deref()), (Some("delete"), Some("rename")));
+            assert!(!ids.delete.is_empty() && !ids.rename.is_empty(), "{verbs:?}");
+            for (ids, verb) in [(&ids.delete, "delete"), (&ids.rename, "rename")] {
+                assert!(ids.iter().all(|&id| shell.verb(id).as_deref() == Some(verb)));
+            }
         }
         drop(shell);
         std::fs::remove_dir_all(&dir).unwrap();

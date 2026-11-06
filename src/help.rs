@@ -85,7 +85,7 @@ pub const TOPICS: &[Topic] = &[
             ("Its menu", "Right-click it: Windows' menu for its file, then Remove from folder and Folder settings. With [Shift], Windows' extended entries."),
             (
                 "Delete and Rename",
-                "For a file moved into the folder: Delete sends it to the Recycle Bin, Rename renames it. For a link: Delete only takes it out of the folder, Rename only changes its name here; the original is never touched.",
+                "For a file moved into the folder: Delete sends it to the Recycle Bin, Rename renames it. For a link: Delete only takes it out of the folder and Rename only changes its name here; neither touches the original. Windows' other entries act on the original, as on the desktop.",
             ),
         ],
     },

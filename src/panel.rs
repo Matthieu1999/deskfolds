@@ -1247,8 +1247,8 @@ fn drag_item_out(hwnd: HWND, st: &PanelState, index: usize) {
 /// - a file, folder or shortcut moved into the folder: Delete sends it to the
 ///   Recycle Bin; Rename renames it in place, file and name together;
 /// - a link (its original elsewhere): Delete only takes it out of the folder;
-///   Rename only changes its name in the folder. The original is never
-///   deleted or renamed from here.
+///   Rename only changes its name in the folder. Neither touches the original;
+///   Windows' other entries act on it as they do on the desktop.
 ///
 /// Remove from folder puts a moved file back on the desktop, and for a link
 /// makes a shortcut to the original there. What one of Windows' entries makes
@@ -1264,7 +1264,9 @@ pub fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
     let chosen = crate::shellmenu::track(main, at, shell.as_ref(), |menu| unsafe {
         if let Some(s) = &shell {
             ids = s.fill_for_item(menu, 0, extended);
-            AppendMenuW(menu, MF_SEPARATOR, 0, null());
+            if GetMenuItemCount(menu) > 0 {
+                AppendMenuW(menu, MF_SEPARATOR, 0, null());
+            }
         }
         for (id, text) in [(ID_REMOVE, "Remove from folder"), (ID_SETTINGS, "Folder settings…")] {
             let text = wide(text);
@@ -1275,11 +1277,14 @@ pub fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
     match chosen as usize {
         ID_REMOVE => remove_from_folder(item_id, &item, stored),
         ID_SETTINGS => crate::settings::open_item(panel_id, item_id),
-        _ if Some(chosen) == ids.delete => {
+        _ if ids.delete.contains(&chosen) => {
             if stored {
-                crate::shellmenu::delete_to_recycle_bin(main, &[file.to_path_buf()]);
+                let outcome = crate::shellmenu::delete_to_recycle_bin(&[file.to_path_buf()]);
                 if file.exists() {
                     // Windows was told No, or could not: the shortcut stays.
+                    if outcome != crate::shellmenu::Outcome::Cancelled {
+                        error_box(&format!("Windows could not delete '{}'.\n\n{path}", ui::short_name(&item.name, 60)));
+                    }
                     return;
                 }
             }
@@ -1289,7 +1294,7 @@ pub fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
                 error_box(&e);
             }
         }
-        _ if Some(chosen) == ids.rename => unsafe {
+        _ if ids.rename.contains(&chosen) => unsafe {
             // Once the menu is gone: the name is typed in place.
             PostMessageW(main, WM_APP_RENAME_ITEM, item_id as usize, 0);
         },
@@ -1302,7 +1307,7 @@ pub fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
             if let Some(dir) = &dir {
                 let made: Vec<String> = crate::shellmenu::made(&before, &crate::shellmenu::listing(dir))
                     .into_iter()
-                    .filter(|p| !crate::watch::is_pending_copy(p))
+                    .filter(|p| !known_file(p))
                     .map(|p| p.to_string_lossy().to_string())
                     .collect();
                 if !made.is_empty() && store::with(|s| s.panel(panel_id).is_some()) {
@@ -1331,18 +1336,21 @@ fn remove_from_folder(item_id: u32, item: &crate::config::Item, stored: bool) {
             return;
         };
         let target = resolve(&item.path);
-        match crate::integration::make_shortcut(&desktop, &item.name, &target, &item.args, item.icon.as_deref()) {
-            // deskfolds put it there: the desktop watcher does not take it back.
-            Ok(link) => crate::watch::note_put_back(&link),
-            Err(e) => {
-                error_box(&e);
-                return;
-            }
+        // The desktop watcher leaves it there: deskfolds put it.
+        if let Err(e) = crate::integration::make_shortcut(&desktop, &item.name, &target, &item.args, item.icon.as_deref()) {
+            error_box(&e);
+            return;
         }
     }
     if let Err(e) = store::change(|s| s.remove_item(item_id, stored)) {
         error_box(&e);
     }
+}
+
+/// A file already in a folder, or a copy waiting for Windows' answer: not one
+/// that a command just made.
+fn known_file(p: &Path) -> bool {
+    crate::watch::is_pending_copy(p) || store::with(|s| s.panels.iter().any(|panel| panel.items.iter().any(|it| Path::new(&it.path) == p)))
 }
 
 /// A file made by the « New » menu in a folder's storage folder joins the
@@ -1384,13 +1392,10 @@ pub fn check_new_links(main: HWND) {
             let _ = std::fs::remove_file(&link.placeholder);
         }
         // Only the shortcuts it made: not the files that came into the folder meanwhile.
-        let known = |p: &Path| {
-            crate::watch::is_pending_copy(p) || store::with(|s| s.panels.iter().any(|panel| panel.items.iter().any(|it| Path::new(&it.path) == p)))
-        };
         let made: Vec<String> = crate::shellmenu::made(&link.before, &crate::shellmenu::listing(&link.dir))
             .into_iter()
             .chain(std::iter::once(link.placeholder.clone()).filter(|p| p.exists()))
-            .filter(|p| !empty(p) && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) && !known(p))
+            .filter(|p| !empty(p) && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) && !known_file(p))
             .map(|p| p.to_string_lossy().to_string())
             .collect();
         if !made.is_empty() && store::with(|s| s.panel(link.panel_id).is_some()) {
@@ -1491,10 +1496,7 @@ fn rename_item_file(item: crate::config::Item, panel_id: u32, rect: RECT, font: 
     {
         new_name = format!("{new_name}.{e}");
     }
-    let stem = new_name.split('.').next().unwrap_or("").trim().to_uppercase();
-    let numbered = |prefix: &str| stem.strip_prefix(prefix).is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"));
-    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") || numbered("COM") || numbered("LPT");
-    let bad = new_name.is_empty() || reserved || new_name.chars().any(|c| c.is_control() || "<>:\"/\\|?*".contains(c));
+    let bad = new_name.is_empty() || crate::util::reserved_name(&new_name) || new_name.chars().any(|c| c.is_control() || "<>:\"/\\|?*".contains(c));
     if bad || new_name == file_name {
         return;
     }

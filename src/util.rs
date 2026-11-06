@@ -109,6 +109,14 @@ pub fn expand_env(s: &str) -> String {
     String::from_utf16_lossy(&buf[..n as usize - 1])
 }
 
+/// A name Windows keeps for a device (CON, NUL, COM1...), with or without an
+/// extension: a file of that name would not be a file.
+pub fn reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").trim().to_uppercase();
+    let numbered = |prefix: &str| stem.strip_prefix(prefix).is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"));
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") || numbered("COM") || numbered("LPT")
+}
+
 /// True for "https://...", "ms-settings:" and the like, but not for "C:\...".
 pub fn is_uri(s: &str) -> bool {
     match s.find(':') {

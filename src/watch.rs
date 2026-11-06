@@ -27,7 +27,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects};
-use windows_sys::Win32::UI::Shell::FOLDERID_PublicDesktop;
+use windows_sys::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_PublicDesktop};
 use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, PostMessageW, SetTimer, WM_APP};
 
 use crate::util::wide;
@@ -107,7 +107,7 @@ thread_local! {
 /// APPDATA) watches folders of its own, so it never takes the real shortcuts.
 pub fn desktops() -> (Option<PathBuf>, Option<PathBuf>) {
     if crate::integration::usual_copy() {
-        (crate::dragdrop::desktop_dir(), shared_desktop())
+        (crate::dragdrop::known_folder(&FOLDERID_Desktop), shared_desktop())
     } else {
         let root = crate::config::app_dir().parent().map(Path::to_path_buf);
         (root.as_ref().map(|r| r.join("Desktop")), root.map(|r| r.join("Public Desktop")))

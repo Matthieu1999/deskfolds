@@ -246,33 +246,46 @@ fn write_start_menu(link: &Path, exe: &str) -> Result<(), String> {
     write_link(link, exe, &launch_args(), "Tiny foldable shortcut panels for the desktop", Some(exe)).map_err(|e| fail(&e))
 }
 
-/// A file name made from a shortcut's name: what Windows refuses becomes "_".
+/// A file name made from a shortcut's name: what Windows refuses becomes "_",
+/// a device name (NUL, CON...) gets a "_", and it is at most 120 characters.
 fn file_name_for(name: &str) -> String {
-    let clean: String = name.chars().map(|c| if "<>:\"/\\|?*".contains(c) || c.is_control() { '_' } else { c }).collect();
-    let clean = clean.trim().trim_end_matches(['.', ' ']).to_string();
+    let clean: String = name.chars().map(|c| if "<>:\"/\\|?*".contains(c) || c.is_control() { '_' } else { c }).take(120).collect();
+    let mut clean = clean.trim().trim_end_matches(['.', ' ']).to_string();
+    if crate::util::reserved_name(&clean) {
+        clean.insert(clean.find('.').unwrap_or(clean.len()), '_');
+    }
     if clean.is_empty() { "Shortcut".into() } else { clean }
 }
 
-/// Makes a shortcut in `dir` named after `name`, to `target` (a file, a
-/// folder, or a URI such as https://, which gets a .url file), under a free
-/// name. Never replaces a file. Returns where it is.
+/// Makes a shortcut on the desktop `dir` named after `name`, to `target` (a
+/// file, a folder, or a URI such as https://, which gets a .url file), under a
+/// free name, and tells the desktop watcher it is deskfolds'. Never replaces a
+/// file. Returns where it is.
 pub fn make_shortcut(dir: &Path, name: &str, target: &str, args: &str, icon: Option<&str>) -> Result<PathBuf, String> {
     let fail = |what: &str| format!("A shortcut to {target} could not be made on the desktop ({what}).");
+    // A line break would add lines of its own to a .url file.
+    if target.chars().chain(args.chars()).chain(icon.unwrap_or("").chars()).any(char::is_control) {
+        return Err(fail("its target has a control character"));
+    }
     let uri = crate::util::is_uri(target);
     let file = format!("{}.{}", file_name_for(name), if uri { "url" } else { "lnk" });
     let path = crate::dragdrop::free_name(dir, std::ffi::OsStr::new(&file));
-    if uri {
+    crate::watch::note_put_back(&path);
+    // The name is taken first, so a file that appeared meanwhile is never replaced.
+    let mut reserved = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| fail(&e.to_string()))?;
+    let written = if uri {
         use std::io::Write;
         let text = format!("[InternetShortcut]\r\nURL={target}\r\n");
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| fail(&e.to_string()))?;
-        f.write_all(text.as_bytes()).map_err(|e| fail(&e.to_string()))?;
-        return Ok(path);
+        reserved.write_all(text.as_bytes()).map_err(|e| fail(&e.to_string()))
+    } else {
+        drop(reserved);
+        write_link(&path, target, args, "", icon).map_err(|e| fail(&e))
+    };
+    if let Err(e) = written {
+        // Only the file made just above.
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
     }
-    // Saving would replace a file that appeared meanwhile: check just before.
-    if path.exists() {
-        return Err(fail("the name is taken"));
-    }
-    write_link(&path, target, args, "", icon).map_err(|e| fail(&e))?;
     Ok(path)
 }
 
@@ -410,6 +423,8 @@ mod tests {
     fn shortcuts_on_the_desktop_get_a_free_file_name() {
         assert_eq!(file_name_for("Projects: 2026/1"), "Projects_ 2026_1");
         assert_eq!(file_name_for(" .. "), "Shortcut");
+        assert_eq!((file_name_for("NUL"), file_name_for("com1.old"), file_name_for("Console")), ("NUL_".into(), "com1_.old".into(), "Console".into()));
+        assert_eq!(file_name_for(&"x".repeat(300)).len(), 120);
         unsafe { windows_sys::Win32::System::Com::CoInitializeEx(std::ptr::null(), windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32) };
         let dir = std::env::temp_dir().join(format!("deskfolds-shortcut-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -420,6 +435,9 @@ mod tests {
         assert!(same_path(&link_target(&first).unwrap(), &target));
         let site = make_shortcut(&dir, "Site", "https://example.com", "", None).unwrap();
         assert!(std::fs::read_to_string(&site).unwrap().contains("URL=https://example.com"));
+        // A line break in the target is refused, and nothing is left.
+        assert!(make_shortcut(&dir, "Bad", "https://x\r\nIconFile=y", "", None).is_err());
+        assert!(!dir.join("Bad.url").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
