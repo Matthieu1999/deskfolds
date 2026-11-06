@@ -4,13 +4,18 @@ mod arrange;
 mod config;
 mod dragdrop;
 mod frame;
+mod help;
+mod integration;
 mod layout;
 mod panel;
 mod settings;
+mod shellmenu;
 mod slider;
 mod store;
 mod ui;
 mod util;
+mod watch;
+mod welcome;
 
 use std::cell::{Cell, RefCell};
 use std::ptr::{null, null_mut};
@@ -24,7 +29,7 @@ use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, SetProcessDpiAwarenessContext};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, IsWindowEnabled};
 use windows_sys::Win32::UI::Shell::{
-    ExtractIconExW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    ExtractIconExW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -48,8 +53,33 @@ const ID_LOCK: usize = 103;
 const ID_AUTOSTART: usize = 104;
 const ID_QUIT: usize = 105;
 const ID_DELETE_FOLDER: usize = 106;
+const ID_RENAME_FOLDER: usize = 107;
+const ID_UNLOCK_ONE: usize = 108;
+const ID_SHARED: usize = 110;
+/// The « New » submenu's entries: NEW_BASE + their index.
+const NEW_BASE: usize = 0x800;
+
+/// Posted to the main window: make a folder at (wparam, lparam), the place
+/// the desktop menu was used, and name it there.
+pub const WM_APP_NEW_FOLDER_AT: u32 = WM_APP + 5;
+/// Posted to the main window: type the name of folder `wparam` in place.
+pub const WM_APP_RENAME: u32 = WM_APP + 6;
+/// NIN_BALLOONUSERCLICK, from the tray icon.
+const BALLOON_CLICK: u32 = WM_USER + 5;
+
+/// What a click on the tray icon's notification does.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Balloon {
+    Plain,
+    /// Asks Windows to move the shortcuts for all users (see `watch`).
+    Shared,
+}
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+
+/// The first folder of a row, and the folders `make_room` put on new lines
+/// under it, with where it put them.
+type Wrapped = (u32, Vec<(u32, i32, i32)>);
 
 thread_local! {
     static MAIN: Cell<HWND> = const { Cell::new(null_mut()) };
@@ -60,6 +90,14 @@ thread_local! {
     static SKIP_CLICK: Cell<bool> = const { Cell::new(false) };
     /// (open folder, folder it pushes away), from the last push update.
     static STACKS: RefCell<Vec<(HWND, HWND)>> = const { RefCell::new(Vec::new()) };
+    /// The notification on screen.
+    static BALLOON: Cell<Balloon> = const { Cell::new(Balloon::Plain) };
+    /// Folders put on a new line by `make_room`, by the first folder of their
+    /// row: (folder, where it was put). Kept while they stay there.
+    static WRAPS: RefCell<Vec<Wrapped>> = const { RefCell::new(Vec::new()) };
+    /// Every folder's label as last seen after a change, to tell which one
+    /// changed size (a resize with the grip shows the new size before saving it).
+    static LAST_LABELS: RefCell<Vec<(u32, layout::Rect, bool, u32)>> = const { RefCell::new(Vec::new()) };
 }
 
 fn main_window() -> HWND {
@@ -105,6 +143,14 @@ fn rebuild_panels(main: HWND) {
     let created: Vec<HWND> =
         list.iter().map(|p| panel::create(p, &settings, desktop, main)).filter(|h| !h.is_null()).collect();
     PANELS.with(|p| *p.borrow_mut() = created);
+    // Pinned folders opened before the others existed: now the direction they
+    // open in can take the others into account.
+    for hwnd in panels() {
+        panel::reposition(hwnd);
+        // An open folder (a pinned one) is above its neighbours.
+        panel::raise_if_open(hwnd);
+    }
+    remember_labels();
     // The frame belonged to the old desktop window (Explorer restarted).
     frame::hide();
     arrange::rearrange();
@@ -122,6 +168,58 @@ fn apply_changes(main: HWND, changes: &[Change]) {
     apply_panel_changes(main, changes);
     // A folder joined, left, moved in the list or changed size: place the arrangement again.
     arrange::rearrange();
+}
+
+/// Every folder's label: (id, label, can be moved by `make_room`, DPI).
+fn labels_now() -> Vec<(u32, layout::Rect, bool, u32)> {
+    panels()
+        .into_iter()
+        .filter_map(|h| {
+            let g = panel::geometry(h)?;
+            Some((panel::id_of(h)?, g.label, !g.arranged && !g.moving, g.dpi))
+        })
+        .collect()
+}
+
+/// A folder's label changed size: the folders snapped to it move aside, or
+/// back, and go to a new line rather than off the screen (see `layout::make_room`).
+/// `before`: the labels as they are, with that folder's old size.
+fn make_room(grown: u32, before: &[(u32, layout::Rect, bool, u32)], size: (i32, i32)) {
+    let Some(gi) = before.iter().position(|b| b.0 == grown) else { return };
+    if !before[gi].2 {
+        return;
+    }
+    let labels: Vec<layout::Rect> = before.iter().map(|b| b.1).collect();
+    let movable: Vec<bool> = before.iter().map(|b| b.2).collect();
+    let gap = scale(store::with(|s| s.settings.gap), before[gi].3);
+    let row = layout::snapped_row(&labels, &movable, gi, gap);
+    let head = before[row[0]].0;
+    // The folders this row put on new lines, if they are still where they were put.
+    let wrapped: Vec<usize> = WRAPS.with(|w| {
+        w.borrow()
+            .iter()
+            .find(|(h, _)| *h == head)
+            .map(|(_, list)| {
+                list.iter().filter_map(|&(id, x, y)| before.iter().position(|b| b.0 == id && (b.1.x, b.1.y) == (x, y))).collect()
+            })
+            .unwrap_or_default()
+    });
+    let g = labels[gi];
+    let area = panel::work_area_at(g.x + g.w / 2, g.y + g.h / 2);
+    let (moves, lines) = layout::make_room(&labels, &movable, gi, size, &row, &wrapped, area, gap);
+    let at = |i: usize| moves.iter().find(|m| m.0 == i).map_or((labels[i].x, labels[i].y), |m| (m.1, m.2));
+    let kept: Vec<(u32, i32, i32)> = lines.iter().map(|&i| (before[i].0, at(i).0, at(i).1)).collect();
+    WRAPS.with(|w| {
+        let mut w = w.borrow_mut();
+        w.retain(|(h, _)| *h != head);
+        if !kept.is_empty() {
+            w.push((head, kept));
+        }
+    });
+    let positions: Vec<(u32, i32, i32)> = moves.iter().map(|&(i, x, y)| (before[i].0, x, y)).collect();
+    if !positions.is_empty() {
+        store::change(|s| s.set_positions(&positions));
+    }
 }
 
 fn apply_panel_changes(main: HWND, changes: &[Change]) {
@@ -164,6 +262,25 @@ fn apply_panel_changes(main: HWND, changes: &[Change]) {
         // The gap or the push setting may have changed.
         update_pushes();
     }
+    // A folder that changed size makes room for itself (not for a change of
+    // the shared settings, which changes them all).
+    let after = labels_now();
+    let last = LAST_LABELS.with(|l| std::mem::replace(&mut *l.borrow_mut(), after.clone()));
+    if settings.snap_make_room {
+        for change in changes {
+            if let Change::Panel(id) = *change
+                && let (Some(old), Some(gi)) = (last.iter().find(|b| b.0 == id), after.iter().position(|a| a.0 == id))
+                && (old.1.w, old.1.h) != (after[gi].1.w, after[gi].1.h)
+                && (old.1.x, old.1.y) == (after[gi].1.x, after[gi].1.y)
+            {
+                // The others as they are now, this one with its old size.
+                let mut before = after.clone();
+                before[gi].1.w = old.1.w;
+                before[gi].1.h = old.1.h;
+                make_room(id, &before, (after[gi].1.w, after[gi].1.h));
+            }
+        }
+    }
 }
 
 fn reposition_panels() {
@@ -171,6 +288,13 @@ fn reposition_panels() {
         panel::reposition(hwnd);
     }
     arrange::rearrange();
+    remember_labels();
+}
+
+/// The labels as they are now are the ones the next size change is compared to
+/// (a new DPI changes them without a change in the config).
+fn remember_labels() {
+    LAST_LABELS.with(|l| *l.borrow_mut() = labels_now());
 }
 
 /// Keeps the folder selected in the settings window open and outlined.
@@ -181,10 +305,12 @@ pub fn highlight_panel(id: Option<u32>) {
 }
 
 /// Unlocked, every panel opens with a blue border and can be moved, resized
-/// and edited. Positions are saved as soon as a panel is moved.
+/// and edited. Positions are saved as soon as a panel is moved. Locking or
+/// unlocking them all also ends the folders unlocked one by one.
 pub fn set_locked(locked: bool) {
     LOCKED.store(locked, Ordering::Relaxed);
     for hwnd in panels() {
+        panel::clear_solo(hwnd);
         panel::set_editing(hwnd, !locked);
     }
     // Shows or hides the arrangement's frame.
@@ -192,8 +318,28 @@ pub fn set_locked(locked: bool) {
     settings::on_store_changed();
 }
 
+/// Some folder can be moved now: all of them, or one unlocked by itself.
+pub fn any_unlocked() -> bool {
+    !LOCKED.load(Ordering::Relaxed) || panels().into_iter().any(panel::is_solo)
+}
+
+/// The arrangement's frame shows while folders are unlocked, or while one of
+/// its folders is unlocked by itself (it can then take another place in it).
+pub fn frame_wanted() -> bool {
+    !LOCKED.load(Ordering::Relaxed) || panels().into_iter().any(|h| panel::is_solo(h) && panel::geometry(h).is_some_and(|g| g.arranged))
+}
+
 pub fn toggle_lock() {
-    set_locked(!LOCKED.load(Ordering::Relaxed));
+    set_locked(any_unlocked());
+}
+
+/// Unlocks one folder by itself, or locks it again.
+fn toggle_solo(id: u32) {
+    if let Some(hwnd) = panel_window(id) {
+        panel::set_solo(hwnd, !panel::is_solo(hwnd));
+    }
+    arrange::rearrange();
+    settings::on_store_changed();
 }
 
 fn scale(v: i32, dpi: u32) -> i32 {
@@ -202,21 +348,53 @@ fn scale(v: i32, dpi: u32) -> i32 {
 
 /// Creates "New folder" at a free spot on the main screen and returns its id.
 pub fn new_folder() -> u32 {
+    make_folder(None, None)
+}
+
+/// Creates a folder of this name at a free spot (for new desktop shortcuts).
+pub fn new_folder_named(title: &str) -> u32 {
+    make_folder(Some(title), None)
+}
+
+/// Creates a folder (named `title`, or "New folder", "New folder (2)"...) with
+/// its label at `at` if there is room there, otherwise at a free spot.
+fn make_folder(title: Option<&str>, at: Option<POINT>) -> u32 {
     let (width, font, gap) = store::with(|s| (s.settings.new_folder_width, s.settings.font_size, s.settings.gap));
     let taken: Vec<layout::Rect> = panels().into_iter().filter_map(panel::geometry).map(|g| g.label).collect();
     let dpi = unsafe { GetDpiForSystem() }.max(96);
-    let area = panel::primary_work_area();
-    let (x, y) = layout::free_spot(&taken, scale(width, dpi), scale(font + 20, dpi), area, scale(gap.max(8), dpi));
+    let (w, h, gap) = (scale(width, dpi), scale(font + 20, dpi), scale(gap.max(8), dpi));
+    let (x, y) = match at {
+        Some(pt) => {
+            let area = panel::work_area_at(pt.x, pt.y);
+            let x = pt.x.clamp(area.x + gap, (area.right() - w - gap).max(area.x + gap));
+            let y = pt.y.clamp(area.y + gap, (area.bottom() - h - gap).max(area.y + gap));
+            let spot = layout::Rect { x, y, w, h };
+            let free = !taken.iter().any(|t| t.x < spot.right() + gap && spot.x < t.right() + gap && t.y < spot.bottom() + gap && spot.y < t.bottom() + gap);
+            if free { (x, y) } else { layout::free_spot(&taken, w, h, area, gap) }
+        }
+        None => layout::free_spot(&taken, w, h, panel::primary_work_area(), gap),
+    };
     // It joins the arrangement, if there is one and the settings say so.
     let join = arrange::has_members() && store::with(|s| s.settings.new_folders_join);
     store::change(|s| {
-        let title = s.unique_title("New folder");
+        let title = match title {
+            Some(t) => t.to_string(),
+            None => s.unique_title("New folder"),
+        };
         let id = s.add_panel(&title, x, y, width);
         if join {
             s.set_arranged(&[id], true);
         }
         id
     })
+}
+
+/// The desktop menu's « New deskfolds folder »: a folder where it was used,
+/// named in place.
+fn new_folder_at(main: HWND, at: POINT) {
+    let id = make_folder(None, Some(at));
+    // Once its window is made (WM_APP_REFRESH comes first).
+    unsafe { PostMessageW(main, WM_APP_RENAME, id as usize, 0) };
 }
 
 fn update_pushes() {
@@ -350,6 +528,10 @@ pub fn after_move() {
             panel::set_editing(hwnd, true);
         }
     }
+    // Pinned folders, and the ones unlocked by themselves, open again.
+    for hwnd in panels() {
+        panel::reopen_held(hwnd);
+    }
 }
 
 /// A folder (or the arrangement's frame, with a null `moving`) is about to be
@@ -452,10 +634,23 @@ fn remove_tray_icon(main: HWND) {
 
 /// A notification from the tray icon, for problems that need no answer.
 fn tray_notice(main: HWND, text: &str) {
+    show_balloon(main, "deskfolds", text, NIIF_WARNING, Balloon::Plain);
+}
+
+/// A Windows notification from the tray icon. With `Balloon::Shared`, a click
+/// on it asks Windows to move the shortcuts for all users.
+pub fn notify(main: HWND, title: &str, text: &str, kind: Option<Balloon>) {
+    show_balloon(main, title, text, NIIF_INFO, kind.unwrap_or(Balloon::Plain));
+}
+
+fn show_balloon(main: HWND, title: &str, text: &str, icon: u32, kind: Balloon) {
+    // A click on this notification does what it says; the shortcuts for all
+    // users still wait for the next question about them.
+    BALLOON.set(kind);
     let mut nid = tray_data(main);
     nid.uFlags = NIF_INFO;
-    nid.dwInfoFlags = NIIF_WARNING;
-    copy_wide(&mut nid.szInfoTitle, "deskfolds");
+    nid.dwInfoFlags = icon;
+    copy_wide(&mut nid.szInfoTitle, title);
     copy_wide(&mut nid.szInfo, text);
     unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
 }
@@ -468,45 +663,104 @@ fn tray_data(main: HWND) -> NOTIFYICONDATAW {
     nid
 }
 
-/// The tray menu. Opened from a panel, it starts with that folder's settings.
+/// The tray menu. Opened from a folder (not from one of its shortcuts, which
+/// has Windows' menu), it starts with the « New » menu for its storage folder
+/// and that folder's commands.
 fn show_menu(main: HWND, panel: Option<u32>) {
     check_config_file();
     let title = panel.and_then(|id| store::with(|s| s.panel(id).map(|p| p.title.clone())));
     // The name from the config, on one line and not too long, for the menu.
     let name = title.as_ref().map(|t| ui::menu_text(&ui::short_name(t, 40)));
-    let edit_label = name.as_ref().map(|t| format!("Edit '{t}'…"));
-    let delete_label = name.as_ref().map(|t| format!("Delete '{t}'…"));
     let locked = LOCKED.load(Ordering::Relaxed);
+    let hwnd = panel.and_then(panel_window);
+    let solo = hwnd.is_some_and(panel::is_solo);
     let autostart = if util::autostart_enabled() { MF_CHECKED } else { MF_UNCHECKED };
+    let labels = name.as_ref().map(|t| {
+        (
+            format!("Edit '{t}'…"),
+            format!("Rename '{t}'"),
+            format!("Delete '{t}'…"),
+            if solo { format!("Lock '{t}'") } else { format!("Unlock '{t}' (move and edit)") },
+        )
+    });
     let mut entries: Vec<MenuEntry> = Vec::new();
-    if let (Some(edit), Some(delete)) = (&edit_label, &delete_label) {
-        entries.extend([(ID_EDIT_FOLDER, edit.as_str(), 0), (ID_DELETE_FOLDER, delete.as_str(), 0), ui::SEPARATOR]);
+    // Shortcuts for all users wait for their question: here too, at the top,
+    // in case another notification hid it.
+    let waiting = watch::refused_waiting();
+    let shared_label =
+        if waiting == 1 { "Move 1 shortcut for all users…".to_string() } else { format!("Move {waiting} shortcuts for all users…") };
+    if waiting > 0 {
+        entries.extend([(ID_SHARED, shared_label.as_str(), 0), ui::SEPARATOR]);
     }
-    entries.extend([
-        (ID_SETTINGS, "Settings…", 0),
-        (ID_NEW_FOLDER, "New folder", 0),
-        (ID_LOCK, if locked { "Unlock panels (move and edit)" } else { "Lock panels" }, 0),
-        ui::SEPARATOR,
-        (ID_AUTOSTART, "Start with Windows", autostart),
-        ui::SEPARATOR,
-        (ID_QUIT, "Quit", 0),
-    ]);
+    if let Some((edit, rename, delete, unlock)) = &labels {
+        entries.extend([(ID_EDIT_FOLDER, edit.as_str(), 0), (ID_RENAME_FOLDER, rename.as_str(), 0), (ID_DELETE_FOLDER, delete.as_str(), 0), ui::SEPARATOR]);
+        // One folder by itself: only while the others are locked.
+        if locked {
+            entries.push((ID_UNLOCK_ONE, unlock.as_str(), 0));
+        }
+    }
+    let lock_label = if any_unlocked() { "Lock all folders" } else { "Unlock all folders (move and edit)" };
+    if labels.is_some() {
+        entries.extend([(ID_LOCK, lock_label, 0), ui::SEPARATOR, (ID_SETTINGS, "Settings…", 0), (ID_NEW_FOLDER, "New folder", 0)]);
+    } else {
+        entries.extend([(ID_SETTINGS, "Settings…", 0), (ID_NEW_FOLDER, "New folder", 0), (ID_LOCK, lock_label, 0)]);
+    }
+    entries.extend([ui::SEPARATOR, (ID_AUTOSTART, "Start with Windows", autostart), ui::SEPARATOR, (ID_QUIT, "Quit", 0)]);
     let mut at = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut at) };
-    let chosen = ui::popup_menu(main, &entries, at);
+    // Windows' « New » menu for the folder's storage folder, at the top.
+    let storage = panel.map(|id| store::with(|s| s.storage_of(id)));
+    let kinds = if storage.is_some() { shellmenu::new_kinds() } else { Vec::new() };
+    let chosen = shellmenu::track(main, at, None, |menu| unsafe {
+        if !kinds.is_empty() {
+            let sub = CreatePopupMenu();
+            for (i, kind) in kinds.iter().enumerate() {
+                // Folder and Shortcut, then the file types.
+                if i == 2 {
+                    AppendMenuW(sub, MF_SEPARATOR, 0, null());
+                }
+                let text = wide(&ui::menu_text(&ui::short_name(&kind.label, 60)));
+                AppendMenuW(sub, MF_STRING, NEW_BASE + i, text.as_ptr());
+            }
+            let text = wide("New");
+            AppendMenuW(menu, MF_POPUP, sub as usize, text.as_ptr());
+            AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        }
+        for (id, text, flags) in &entries {
+            let text = wide(text);
+            AppendMenuW(menu, MF_STRING | flags, *id, text.as_ptr());
+        }
+    })
+    .id as usize;
     // The mouse may have left the folder while the menu was open.
     panel::after_menu();
+    if let (Some(kind), Some(id), Some(dir)) = (chosen.checked_sub(NEW_BASE).and_then(|i| kinds.get(i)), panel, &storage) {
+        new_from_menu(main, kind, id, dir);
+        return;
+    }
     match chosen {
+        ID_SHARED => watch::ask_for_shared(main),
         ID_EDIT_FOLDER => open_settings(panel),
+        ID_RENAME_FOLDER => {
+            if let Some(h) = hwnd {
+                panel::rename_in_place(h);
+            }
+        }
         ID_DELETE_FOLDER => {
             if let Some(id) = panel {
                 settings::delete_folder(settings::owner().unwrap_or(main), id);
             }
         }
+        ID_UNLOCK_ONE => {
+            if let Some(id) = panel {
+                toggle_solo(id);
+            }
+        }
         ID_SETTINGS => open_settings(None),
         ID_NEW_FOLDER => {
             let id = new_folder();
-            settings::open(Some(id), true);
+            // Named in place, once its window is made.
+            unsafe { PostMessageW(main, WM_APP_RENAME, id as usize, 0) };
         }
         ID_LOCK => toggle_lock(),
         ID_AUTOSTART => {
@@ -518,8 +772,22 @@ fn show_menu(main: HWND, panel: Option<u32>) {
     }
 }
 
+/// An entry of the « New » menu was chosen: the new file is made in the
+/// folder's storage folder, and joins the folder, its name ready to type.
+fn new_from_menu(main: HWND, kind: &shellmenu::NewKind, panel_id: u32, dir: &std::path::Path) {
+    let before = shellmenu::listing(dir);
+    match shellmenu::make_new(dir, kind) {
+        Ok(made) => panel::adopt_new(main, panel_id, dir, before, made),
+        Err(e) => error_box(&e),
+    }
+}
+
 unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
+        // Windows' menus on screen fill their submenus through their owner.
+        if let Some(result) = shellmenu::handle_menu_message(msg, wparam, lparam) {
+            return result;
+        }
         if msg != 0 && msg == TASKBAR_CREATED.load(Ordering::Relaxed) {
             // Explorer restarted: the tray icon and the desktop window are new.
             add_tray_icon(hwnd);
@@ -541,6 +809,9 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                         open_settings(None);
                     }
                     WM_RBUTTONUP => show_menu(hwnd, None),
+                    // Also from the notification center later: the question stays
+                    // until another notification replaces it.
+                    BALLOON_CLICK if BALLOON.replace(Balloon::Plain) == Balloon::Shared => watch::ask_for_shared(hwnd),
                     _ => {}
                 }
                 0
@@ -549,12 +820,37 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 show_menu(hwnd, (wparam != 0).then_some(wparam as u32));
                 0
             }
+            WM_APP_NEW_FOLDER_AT => {
+                new_folder_at(hwnd, POINT { x: wparam as i32, y: lparam as i32 });
+                0
+            }
+            WM_APP_RENAME => {
+                if let Some(h) = panel_window(wparam as u32) {
+                    panel::rename_in_place(h);
+                }
+                0
+            }
+            panel::WM_APP_RENAME_ITEM => {
+                let item = wparam as u32;
+                if let Some(id) = store::with(|s| s.item(item).map(|(p, _)| p))
+                    && let Some(h) = panel_window(id)
+                {
+                    panel::rename_item_in_place(h, item);
+                }
+                0
+            }
+            watch::WM_APP_DESKTOP_FILE => {
+                watch::on_found(hwnd);
+                0
+            }
             WM_APP_REFRESH => {
                 // While a shortcut is dragged out of a panel, the drag's end posts this again.
                 if !panel::dragging() {
                     let changes = store::with(|s| s.take_changes());
                     apply_changes(hwnd, &changes);
                     settings::on_store_changed();
+                    // New desktop shortcuts may have been turned on or off.
+                    watch::sync(hwnd);
                 }
                 0
             }
@@ -568,6 +864,11 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             }
             WM_APP_ARRANGE => {
                 arrange::rearrange();
+                remember_labels();
+                0
+            }
+            watch::WM_APP_ASK_SHARED => {
+                watch::ask_dropped(hwnd);
                 0
             }
             WM_DISPLAYCHANGE => {
@@ -586,6 +887,8 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                         settings::on_store_changed();
                     }
                     TRAY_CLICK_TIMER => show_menu(hwnd, None),
+                    watch::PUT_AWAY_TIMER => watch::on_timer(hwnd),
+                    panel::NEW_LINK_TIMER => panel::check_new_links(hwnd),
                     _ => {}
                 }
                 0
@@ -608,26 +911,55 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
 fn instance_name() -> String {
     const NAME: &str = "Local\\deskfolds.single-instance";
     // Compared after resolving links, mapped drives and short names.
-    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().to_lowercase();
-    let usual = dragdrop::roaming_app_data();
-    let ours = config::app_dir();
-    let our_root = ours.parent().map(canon);
-    if usual.as_deref().is_none_or(|d| Some(canon(d)) == our_root) {
-        return NAME.into();
+    match integration::copy_suffix() {
+        None => NAME.into(),
+        Some(suffix) => format!("{NAME}.{suffix}"),
     }
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(&ours.to_string_lossy().to_lowercase(), &mut h);
-    format!("{NAME}.{:016x}", std::hash::Hasher::finish(&h))
+}
+
+/// The desktop menu started this second deskfolds: the one running makes the
+/// folder, where the menu was used.
+fn send_new_folder(at: POINT) {
+    let (class, title) = (wide(MAIN_CLASS), wide(&instance_name()));
+    unsafe {
+        let running = FindWindowW(class.as_ptr(), title.as_ptr());
+        if running.is_null() {
+            return;
+        }
+        // Explorer let this deskfolds come to the front: the running one may
+        // too, for the name box.
+        let mut pid = 0;
+        GetWindowThreadProcessId(running, &mut pid);
+        AllowSetForegroundWindow(pid);
+        PostMessageW(running, WM_APP_NEW_FOLDER_AT, at.x as isize as usize, at.y as isize);
+    }
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // A copy with its own APPDATA (a test copy), started by what it added to
+    // Windows: it gives its folder, so it starts as itself.
+    if let Some(i) = args.iter().position(|a| a == integration::APPDATA_ARG)
+        && let Some(dir) = args.get(i + 1)
+        && std::path::Path::new(dir).is_absolute()
+    {
+        // Nothing else runs yet: no other thread reads the environment.
+        unsafe { std::env::set_var("APPDATA", dir) };
+    }
+    let new_folder_asked = args.iter().any(|a| a == integration::NEW_FOLDER_ARG);
     unsafe {
         // Also set by the manifest; kept for builds without it.
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // Where the desktop menu was used, before anything else moves the mouse.
+        let mut cursor = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut cursor);
 
         let mutex_name = wide(&instance_name());
         let _mutex = CreateMutexW(null(), 0, mutex_name.as_ptr());
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            if new_folder_asked {
+                send_new_folder(cursor);
+            }
             return;
         }
         // OLE, not just COM: drag and drop needs it.
@@ -655,11 +987,13 @@ fn main() {
         settings::register_class();
         frame::register_class();
 
-        // Hidden top-level window: receives tray, menu and store messages.
+        // Hidden top-level window: receives tray, menu and store messages. Its
+        // title is the instance's name, for a second deskfolds to find it.
+        let title = wide(&instance_name());
         let main = CreateWindowExW(
             WS_EX_TOOLWINDOW,
             class.as_ptr(),
-            class.as_ptr(),
+            title.as_ptr(),
             WS_POPUP,
             0,
             0,
@@ -672,16 +1006,25 @@ fn main() {
         );
         MAIN.set(main);
         let (data, notices) = Store::open(config::path(), main);
+        let first_start = data.first_start;
         store::init(data);
         add_tray_icon(main);
         rebuild_panels(main);
         if !notices.is_empty() {
             tray_notice(main, &notices.join("\n"));
         }
+        // What deskfolds added to Windows opens this deskfolds.exe.
+        integration::refresh();
+        watch::sync(main);
+        if new_folder_asked {
+            PostMessageW(main, WM_APP_NEW_FOLDER_AT, cursor.x as isize as usize, cursor.y as isize);
+        } else if first_start {
+            welcome::show();
+        }
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            if settings::translate(&msg) {
+            if settings::translate(&msg) || welcome::translate(&msg) {
                 continue;
             }
             TranslateMessage(&msg);

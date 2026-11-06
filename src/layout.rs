@@ -434,9 +434,216 @@ pub fn free_spot(taken: &[Rect], w: i32, h: i32, area: Rect, gap: i32) -> (i32, 
     (area.x + gap, area.y + gap)
 }
 
+/// The folders snapped side by side with `labels[i]` in a row: tops aligned
+/// and `gap` between them, from the first one on the left. `movable[j]`
+/// false (a folder in the arrangement) ends the row there.
+pub fn snapped_row(labels: &[Rect], movable: &[bool], i: usize, gap: i32) -> Vec<usize> {
+    const SLACK: i32 = 2;
+    let beside = |a: &Rect, b: &Rect| (b.y - a.y).abs() <= SLACK && (b.x - (a.right() + gap)).abs() <= SLACK;
+    let mut row = vec![i];
+    // To the left, up to the first folder of the row.
+    while let Some(j) = (0..labels.len()).find(|&j| movable[j] && !row.contains(&j) && beside(&labels[j], &labels[row[0]])) {
+        row.insert(0, j);
+    }
+    // To the right.
+    while let Some(j) =
+        (0..labels.len()).find(|&j| movable[j] && !row.contains(&j) && row.last().is_some_and(|&l| beside(&labels[l], &labels[j])))
+    {
+        row.push(j);
+    }
+    row
+}
+
+/// What happens to the folders snapped to `labels[grown]` once its label
+/// takes `size` (`labels` are the labels before):
+///
+/// - The folders after it in its row (`row`, from `snapped_row`) follow it,
+///   keeping the gap, as text wraps: one that no longer fits on the screen
+///   goes to a new line, under the first folder of the row, and the ones after
+///   it follow it there. `wrapped`: folders put on such lines before, in order;
+///   they come back onto the row when they fit again.
+/// - The folders stacked under the row move to stay under it, with the gap.
+/// - With no room for the new lines at the bottom of the screen, they go
+///   above the row. With no room there either, nothing moves.
+///
+/// The folders of the row before `grown`, and `grown` itself, never move.
+/// Returns the new positions of the folders that move, and the folders now on
+/// new lines (to pass as `wrapped` next time).
+#[allow(clippy::too_many_arguments)]
+pub fn make_room(
+    labels: &[Rect],
+    movable: &[bool],
+    grown: usize,
+    size: (i32, i32),
+    row: &[usize],
+    wrapped: &[usize],
+    area: Rect,
+    gap: i32,
+) -> (Vec<(usize, i32, i32)>, Vec<usize>) {
+    let Some(at) = row.iter().position(|&i| i == grown) else { return (Vec::new(), Vec::new()) };
+    let mut now = labels.to_vec();
+    now[grown].w = size.0;
+    now[grown].h = size.1;
+    let x0 = labels[row[0]].x;
+    let y0 = labels[row[0]].y;
+    // The flow: the row, then the folders that were on new lines.
+    let mut flow: Vec<usize> = row.to_vec();
+    for &j in wrapped {
+        if movable[j] && !flow.contains(&j) {
+            flow.push(j);
+        }
+    }
+
+    // Which line each folder goes on, and where on it.
+    let mut line_of = vec![0usize; flow.len()];
+    let mut xs = vec![0; flow.len()];
+    let mut line = 0;
+    let mut cursor = x0;
+    for (k, &i) in flow.iter().enumerate() {
+        if k <= at {
+            // Up to the folder that grew, nothing moves.
+            xs[k] = now[i].x;
+            cursor = now[i].right() + gap;
+            continue;
+        }
+        if cursor > x0 && cursor + now[i].w > area.right() - gap {
+            line += 1;
+            cursor = x0;
+        }
+        line_of[k] = line;
+        xs[k] = cursor;
+        cursor += now[i].w + gap;
+    }
+    let lines = line + 1;
+    let height: Vec<i32> = (0..lines)
+        .map(|l| flow.iter().enumerate().filter(|(k, _)| line_of[*k] == l).map(|(_, &i)| now[i].h).max().unwrap_or(0))
+        .collect();
+    // Line tops going down from the row.
+    let mut down = Vec::with_capacity(lines);
+    let mut y = y0;
+    for h in &height {
+        down.push(y);
+        y += h + gap;
+    }
+    let bottom = y - gap;
+
+    let place = |tops: &[i32]| -> Vec<(usize, i32, i32)> { flow.iter().enumerate().map(|(k, &i)| (i, xs[k], tops[line_of[k]])).collect() };
+    let mut placed = place(&down);
+    for &(i, x, y) in &placed {
+        now[i].x = x;
+        now[i].y = y;
+    }
+    // The folders stacked under the flow stay under it: under the lowest folder
+    // of the flow in their column.
+    let mut under: Vec<usize> = Vec::new();
+    for &m in &flow {
+        for j in stacked_below(labels, m, gap) {
+            if movable[j] && !flow.contains(&j) && !under.contains(&j) {
+                under.push(j);
+            }
+        }
+    }
+    // Only the first folder of each stack is placed; the ones under it follow it.
+    let firsts: Vec<usize> =
+        under.iter().copied().filter(|&j| !under.iter().any(|&o| o != j && stacked_below(labels, o, gap).contains(&j))).collect();
+    let mut shifted: Vec<(usize, i32)> = Vec::new();
+    for &j in &firsts {
+        let column = |r: &Rect| r.right().min(labels[j].right()) - r.x.max(labels[j].x) > 10;
+        let Some(new_y) = flow.iter().filter(|&&m| column(&now[m])).map(|&m| now[m].bottom() + gap).max() else { continue };
+        let dy = new_y - labels[j].y;
+        if dy == 0 {
+            continue;
+        }
+        for k in std::iter::once(j).chain(stacked_below(labels, j, gap)) {
+            if movable[k] && !flow.contains(&k) && !shifted.iter().any(|(s, _)| *s == k) {
+                shifted.push((k, dy));
+            }
+        }
+    }
+    let lowest = shifted.iter().map(|&(k, dy)| labels[k].bottom() + dy).max().unwrap_or(bottom).max(bottom);
+    if lines > 1 && lowest > area.bottom() {
+        // No room below: the new lines go above the row, and nothing under it moves.
+        let mut up = vec![y0; lines];
+        for l in 1..lines {
+            up[l] = up[l - 1] - gap - height[l];
+        }
+        if up[lines - 1] < area.y {
+            return (Vec::new(), wrapped.to_vec());
+        }
+        placed = place(&up);
+        shifted.clear();
+    }
+    let mut moves: Vec<(usize, i32, i32)> = placed.into_iter().filter(|&(i, x, y)| (x, y) != (labels[i].x, labels[i].y)).collect();
+    moves.extend(shifted.iter().map(|&(k, dy)| (k, labels[k].x, labels[k].y + dy)));
+    let new_lines = flow.iter().enumerate().filter(|(k, _)| line_of[*k] > 0).map(|(_, &i)| i).collect();
+    (moves, new_lines)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn r(x: i32, y: i32, w: i32, h: i32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn snapped_rows_are_found_from_their_first_folder() {
+        // Three folders side by side with an 8 px gap, a fourth only near them.
+        let labels = [r(20, 60, 120, 33), r(148, 60, 200, 33), r(356, 60, 120, 33), r(500, 60, 100, 33)];
+        let all = [true; 4];
+        assert_eq!(snapped_row(&labels, &all, 1, 8), [0, 1, 2]);
+        assert_eq!(snapped_row(&labels, &all, 3, 8), [3]);
+        // A folder of the arrangement ends the row.
+        assert_eq!(snapped_row(&labels, &[true, true, false, true], 0, 8), [0, 1]);
+    }
+
+    #[test]
+    fn a_wider_folder_pushes_its_row_and_wraps_rather_than_leaving_the_screen() {
+        let area = r(0, 0, 600, 400);
+        let labels = [r(96, 60, 120, 33), r(224, 60, 200, 33), r(432, 60, 120, 33)];
+        let all = [true; 3];
+        let row = snapped_row(&labels, &all, 1, 8);
+        // 20 px wider: the last one follows, still on the screen.
+        let (moves, lines) = make_room(&labels, &all, 1, (220, 33), &row, &[], area, 8);
+        assert_eq!((moves, lines.len()), (vec![(2, 452, 60)], 0));
+        // 100 px wider: it would leave the screen, so it goes under the first one.
+        let (moves, lines) = make_room(&labels, &all, 1, (300, 33), &row, &[], area, 8);
+        assert_eq!(moves, [(2, 96, 101)]);
+        assert_eq!(lines, [2]);
+        // Narrower again: it comes back onto the row.
+        let wrapped = [r(96, 60, 120, 33), r(224, 60, 300, 33), r(96, 101, 120, 33)];
+        let row = snapped_row(&wrapped, &all, 1, 8);
+        let (moves, lines) = make_room(&wrapped, &all, 1, (200, 33), &row, &[2], area, 8);
+        assert_eq!((moves, lines.len()), (vec![(2, 432, 60)], 0));
+    }
+
+    #[test]
+    fn folders_stacked_under_a_row_stay_under_it() {
+        let area = r(0, 0, 560, 400);
+        // A row of three, and a folder snapped under the first one.
+        let labels = [r(96, 60, 120, 33), r(224, 60, 200, 33), r(432, 60, 120, 33), r(96, 101, 120, 33)];
+        let all = [true; 4];
+        let row = snapped_row(&labels, &all, 1, 8);
+        let (moves, _) = make_room(&labels, &all, 1, (300, 33), &row, &[], area, 8);
+        // The last one wraps under the first, and the stacked one goes under it.
+        assert!(moves.contains(&(2, 96, 101)) && moves.contains(&(3, 96, 142)), "{moves:?}");
+        // A taller name moves the folder under it down by as much.
+        let labels = [r(20, 60, 120, 33), r(20, 101, 120, 33)];
+        let row = snapped_row(&labels, &[true; 2], 0, 8);
+        assert_eq!(make_room(&labels, &[true; 2], 0, (120, 52), &row, &[], area, 8).0, [(1, 20, 120)]);
+    }
+
+    #[test]
+    fn with_no_room_below_the_new_line_goes_above() {
+        let area = r(0, 0, 560, 400);
+        let labels = [r(96, 359, 120, 33), r(224, 359, 200, 33), r(432, 359, 120, 33)];
+        let all = [true; 3];
+        let row = snapped_row(&labels, &all, 1, 8);
+        let (moves, lines) = make_room(&labels, &all, 1, (300, 33), &row, &[], area, 8);
+        assert_eq!(moves, [(2, 96, 318)]);
+        assert_eq!(lines, [2]);
+    }
 
     /// Every character is 10 px wide.
     fn mono(t: &str) -> i32 {

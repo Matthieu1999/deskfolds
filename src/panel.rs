@@ -20,7 +20,8 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE};
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
-use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+use windows_sys::Win32::System::Threading::{GetCurrentThreadId, WaitForSingleObject};
 use windows_sys::Win32::System::SystemServices::{MK_CONTROL, MK_LBUTTON};
 use windows_sys::Win32::UI::Controls::{
     TTF_ABSOLUTE, TTF_IDISHWND, TTF_TRACK, TTM_ADDTOOLW, TTM_GETBUBBLESIZE, TTM_SETMAXTIPWIDTH, TTM_TRACKACTIVATE, TTM_TRACKPOSITION,
@@ -28,7 +29,7 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_MENU,
+    GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_MENU, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -36,7 +37,7 @@ use crate::config::{FULL_NAME_LINES, MIN_WIDTH, PANEL_PAD, Panel, Settings, Titl
 use crate::dragdrop::{self, DropHandler};
 use crate::layout;
 use crate::store::{self, WM_APP_REFRESH};
-use crate::ui::{self, MenuEntry};
+use crate::ui;
 use crate::util::{error_box, launch, load_icon, prompt_text, resolve, wide};
 
 const CLASS_NAME: &str = "deskfolds.panel";
@@ -59,14 +60,23 @@ const BIG_ICON: i32 = 24;
 const PIN_ROOM: i32 = 14;
 /// A moved folder snaps to an edge closer than this.
 const SNAP_REACH: i32 = 10;
-const ID_RENAME: usize = 1;
-const ID_REMOVE: usize = 2;
-const ID_SETTINGS: usize = 3;
+/// deskfolds' entries at the end of a shortcut's Windows menu.
+const ID_REMOVE: usize = 1;
+const ID_SETTINGS: usize = 2;
+/// For a shortcut with no Windows menu (a web address, a missing file).
+const ID_RENAME: usize = 3;
+const ID_DELETE: usize = 4;
+/// The main window's timer that waits for Windows' « Create Shortcut » window.
+pub const NEW_LINK_TIMER: usize = 40;
 /// Icon shown next to the name when the panel sets none: any folder works.
 pub const DEFAULT_PANEL_ICON: &str = "%SystemRoot%";
 
 /// Shared by all panels: while false, panels can be moved, resized and edited.
+/// A folder can also be unlocked by itself (`PanelState::solo`).
 pub static LOCKED: AtomicBool = AtomicBool::new(true);
+
+/// Posted to the main window: type the new name of shortcut `wparam` in place.
+pub const WM_APP_RENAME_ITEM: u32 = WM_APP + 7;
 
 /// Posted to the main window to open the menu at the cursor. wparam: the panel id, or 0.
 pub const WM_APP_SHOW_MENU: u32 = WM_APP + 2;
@@ -77,6 +87,18 @@ pub const WM_APP_PUSH: u32 = WM_APP + 3;
 /// new DPI): the arrangement is placed again.
 pub const WM_APP_ARRANGE: u32 = WM_APP + 4;
 
+/// Windows' « Create Shortcut » window, open for a folder.
+struct NewLink {
+    panel_id: u32,
+    dir: std::path::PathBuf,
+    /// What was in the storage folder before (with the empty shortcut).
+    before: Vec<std::path::PathBuf>,
+    /// The empty shortcut deskfolds made for it.
+    placeholder: std::path::PathBuf,
+    wizard: windows_sys::Win32::Foundation::HANDLE,
+    since: u64,
+}
+
 thread_local! {
     /// The shortcut being dragged out of a panel, by id.
     static INTERNAL_DRAG: Cell<Option<u32>> = const { Cell::new(None) };
@@ -86,6 +108,8 @@ thread_local! {
     static PUSH_POSTED: Cell<bool> = const { Cell::new(false) };
     /// A panel is being raised above the others on purpose: it may leave the bottom.
     static RAISING: Cell<bool> = const { Cell::new(false) };
+    /// Windows' « Create Shortcut » window is open for these folders.
+    static NEW_LINKS: std::cell::RefCell<Vec<NewLink>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Asks the main window to update the pushes, once however often it is asked.
@@ -174,6 +198,11 @@ pub struct PanelState {
     /// Target state: open or closed. `progress` animates towards it.
     open: bool,
     pinned: bool,
+    /// Unlocked by itself while the others stay locked: it can be moved,
+    /// resized and edited, and stays open until it is locked again.
+    solo: bool,
+    /// A shortcut's name is being typed in place: kept open meanwhile.
+    renaming: bool,
     /// Selected in the settings window: kept open and outlined.
     highlighted: bool,
     progress: f32,
@@ -268,6 +297,16 @@ fn locked() -> bool {
 impl PanelState {
     fn scale(&self, v: i32) -> i32 {
         (v as f32 * self.dpi as f32 / 96.0).round() as i32
+    }
+
+    /// Locked in place: all folders are, and this one was not unlocked by itself.
+    fn is_locked(&self) -> bool {
+        locked() && !self.solo
+    }
+
+    /// Kept open whatever the mouse does: pinned, unlocked by itself, or selected in Settings.
+    fn held_open(&self) -> bool {
+        self.pinned || self.solo || self.renaming || self.highlighted
     }
 
     fn style(&self) -> TitleStyle {
@@ -473,7 +512,7 @@ impl PanelState {
 
     fn hit(&self, x: i32, y: i32) -> Hit {
         let l = self.layout();
-        if !locked() && self.progress >= 1.0 && !self.cfg.fit_columns && x >= self.size().0 - self.scale(GRIP) {
+        if !self.is_locked() && self.progress >= 1.0 && !self.cfg.fit_columns && x >= self.size().0 - self.scale(GRIP) {
             return Hit::Grip;
         }
         let top = self.title_top(&l);
@@ -721,7 +760,8 @@ fn enable_glass(hwnd: HWND, settings: &Settings) {
 /// Creates a panel owned by the desktop window, so "Show desktop" leaves it visible.
 /// While panels are unlocked, it starts open if every folder opens then.
 pub fn create(cfg: &Panel, settings: &Settings, desktop: HWND, main: HWND) -> HWND {
-    let editing = !locked() && settings.unlocked_open_all;
+    // Pinned folders are open from the start, also after a restart.
+    let editing = (!locked() && settings.unlocked_open_all) || cfg.pinned;
     let state = Box::new(PanelState {
         pos: (cfg.x, cfg.y),
         push: 0,
@@ -747,7 +787,9 @@ pub fn create(cfg: &Panel, settings: &Settings, desktop: HWND, main: HWND) -> HW
         settings: settings.clone(),
         main,
         open: editing,
-        pinned: false,
+        pinned: cfg.pinned,
+        solo: false,
+        renaming: false,
         highlighted: false,
         progress: if editing { 1.0 } else { 0.0 },
         anim_from: 0.0,
@@ -806,6 +848,9 @@ pub fn create(cfg: &Panel, settings: &Settings, desktop: HWND, main: HWND) -> HW
         st.dpi = GetDpiForWindow(hwnd).max(96);
         st.load_resources();
         st.place();
+        if st.open {
+            st.up = st.settings.open_upwards && st.needs_up(hwnd);
+        }
         apply_size(hwnd, st);
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         // A new window starts above the others: put it at the bottom, under
@@ -829,6 +874,7 @@ pub fn update(hwnd: HWND, cfg: &Panel, settings: &Settings) {
         || st.settings.show_folder_icon != settings.show_folder_icon;
     let glass = st.settings.tint != settings.tint || st.settings.tint_opacity != settings.tint_opacity;
     let open_all_changed = st.settings.unlocked_open_all != settings.unlocked_open_all;
+    let pin_changed = st.cfg.pinned != cfg.pinned;
     if st.cfg.title != cfg.title {
         let title = wide(&cfg.title);
         unsafe { SetWindowTextW(hwnd, title.as_ptr()) };
@@ -861,9 +907,19 @@ pub fn update(hwnd: HWND, cfg: &Panel, settings: &Settings) {
     if open_all_changed && !locked() {
         if st.settings.unlocked_open_all {
             set_open(hwnd, st, true);
-        } else if !st.highlighted {
+        } else if !st.held_open() {
             set_open(hwnd, st, false);
         }
+    }
+    // Pinned or unpinned in the config.
+    if pin_changed && st.pinned != st.cfg.pinned {
+        st.pinned = st.cfg.pinned;
+        if st.pinned {
+            set_open(hwnd, st, true);
+        } else if !st.held_open() && !st.tracking_mouse && !st.tracking_nc {
+            set_open(hwnd, st, false);
+        }
+        unsafe { InvalidateRect(hwnd, null(), 0) };
     }
 }
 
@@ -889,10 +945,53 @@ pub fn set_editing(hwnd: HWND, editing: bool) {
         if st.settings.unlocked_open_all {
             set_open(hwnd, st, true);
         }
-    } else if !st.highlighted {
+    } else if !st.held_open() {
         set_open(hwnd, st, false);
     }
     unsafe { InvalidateRect(hwnd, null(), 0) };
+}
+
+/// Unlocked by itself, while the others stay locked.
+pub fn is_solo(hwnd: HWND) -> bool {
+    state(hwnd).is_some_and(|st| st.solo)
+}
+
+/// Unlocks this folder by itself (it opens and stays open), or locks it again.
+pub fn set_solo(hwnd: HWND, on: bool) {
+    let Some(st) = state(hwnd) else { return };
+    if st.solo == on {
+        return;
+    }
+    st.solo = on;
+    if on {
+        set_open(hwnd, st, true);
+    } else if !st.held_open() && (locked() || !st.settings.unlocked_open_all) {
+        set_open(hwnd, st, false);
+    }
+    if st.lifted {
+        draw_label_window(hwnd, st);
+    }
+    unsafe { InvalidateRect(hwnd, null(), 0) };
+}
+
+/// Ends "unlocked by itself" when all folders are locked or unlocked together.
+pub fn clear_solo(hwnd: HWND) {
+    set_solo(hwnd, false);
+}
+
+/// After a move: a folder held open (pinned, or unlocked by itself) opens again.
+pub fn reopen_held(hwnd: HWND) {
+    let Some(st) = state(hwnd) else { return };
+    if st.held_open() && !st.open {
+        set_open(hwnd, st, true);
+    }
+}
+
+/// An open folder (pinned at start) goes above the other folders.
+pub fn raise_if_open(hwnd: HWND) {
+    if state(hwnd).is_some_and(|st| st.open) {
+        raise_above_panels(hwnd);
+    }
 }
 
 pub fn geometry(hwnd: HWND) -> Option<Geometry> {
@@ -968,9 +1067,9 @@ pub fn close_now(hwnd: HWND, moving: bool) {
         KillTimer(hwnd, CLOSE_TIMER);
         KillTimer(hwnd, ANIM_TIMER);
     }
+    // Pinned folders stay pinned: they open again after the move (`reopen_held`).
     st.open = false;
     st.open_pending = false;
-    st.pinned = false;
     st.hover = None;
     st.progress = 0.0;
     st.up = false;
@@ -998,7 +1097,7 @@ pub fn set_highlight(hwnd: HWND, on: bool) {
     st.highlighted = on;
     if on {
         set_open(hwnd, st, true);
-    } else if (locked() || !st.settings.unlocked_open_all) && !st.pinned && !st.tracking_mouse && !st.tracking_nc {
+    } else if (locked() || !st.settings.unlocked_open_all) && !st.pinned && !st.solo && !st.tracking_mouse && !st.tracking_nc {
         set_open(hwnd, st, false);
     }
     unsafe { InvalidateRect(hwnd, null(), 0) };
@@ -1036,9 +1135,21 @@ pub fn drop_files(panel_id: u32, index: usize, files: Vec<String>, effect: u32) 
         return 0;
     }
     let link = effect != DROPEFFECT_MOVE;
+    // Shortcuts of the shared desktop may need Windows' permission to move.
+    let (shared, files): (Vec<String>, Vec<String>) = if link {
+        (Vec::new(), files)
+    } else {
+        files.into_iter().partition(|f| crate::watch::is_shortcut(Path::new(f)) && crate::watch::on_shared_desktop(Path::new(f)))
+    };
     let errors = store::change(|s| s.add_files(panel_id, index, &files, link));
     if !errors.is_empty() {
         error_box(&format!("Some files could not be moved, so they were added as links:\n\n{}", errors.join("\n")));
+    }
+    if !shared.is_empty() {
+        let errors = crate::watch::move_shared_now(crate::main_window(), panel_id, &shared);
+        if !errors.is_empty() {
+            error_box(&format!("Some shortcuts could not be moved; they stay on the desktop:\n\n{}", errors.join("\n")));
+        }
     }
     if link { effect } else { 0 }
 }
@@ -1072,7 +1183,7 @@ fn on_drag_leave(hwnd: HWND) {
     unsafe {
         KillTimer(hwnd, DRAG_OPEN_TIMER);
         st.drag_open_pending = false;
-        if st.drag_opened && !st.pinned && !st.highlighted && (locked() || !st.settings.unlocked_open_all) {
+        if st.drag_opened && !st.held_open() && (locked() || !st.settings.unlocked_open_all) {
             SetTimer(hwnd, CLOSE_TIMER, st.settings.close_delay_ms, None);
         }
         InvalidateRect(hwnd, null(), 0);
@@ -1113,7 +1224,10 @@ fn drag_item_out(hwnd: HWND, st: &PanelState, index: usize) {
 
     INTERNAL_DRAG.set(Some(item.id));
     INTERNAL_DROP_DONE.set(false);
+    // What lands on the desktop now is this shortcut, not a new one to put away.
+    crate::watch::dragging_out(true);
     let dropped = dragdrop::drag_file_out(hwnd, &path, allowed);
+    crate::watch::dragging_out(false);
     INTERNAL_DRAG.set(None);
     if !INTERNAL_DROP_DONE.replace(false)
         && let Some(effect) = dropped
@@ -1130,48 +1244,342 @@ fn drag_item_out(hwnd: HWND, st: &PanelState, index: usize) {
     unsafe { PostMessageW(main, WM_APP_REFRESH, 0, 0) };
 }
 
-/// Right-click menu on a shortcut while unlocked.
-fn item_menu(hwnd: HWND, st: &PanelState, index: usize) {
+/// Right-click on a shortcut: Windows' menu for its file, as on the desktop,
+/// then a « deskfolds » submenu: Remove from folder, Folder settings. Windows' Delete and
+/// Rename are deskfolds' to do:
+/// - a file, folder or shortcut moved into the folder: Delete sends it to the
+///   Recycle Bin; Rename renames it in place, file and name together;
+/// - a link (its original elsewhere): Delete only takes it out of the folder;
+///   Rename only changes its name in the folder. Neither touches the original;
+///   Windows' other entries act on it as they do on the desktop.
+///
+/// When Windows' menu has no Rename or Delete (a web address, a missing file),
+/// deskfolds adds its own. Remove from folder puts a moved file back on the
+/// desktop, and for a link makes a shortcut to the original there, unless the
+/// original is on a desktop already or is missing. What one of Windows'
+/// entries makes next to a moved file (Create shortcut, a zip) joins the
+/// folder.
+fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
+    let Some((panel_id, item)) = store::with(|s| s.item(item_id).map(|(p, it)| (p, it.clone()))) else { return };
+    let path = resolve(&item.path);
+    let file = Path::new(&path);
+    let stored = store::with(|s| s.is_stored(panel_id, &item));
+    // A shortcut whose file is missing gets only deskfolds' entries.
+    let shell = file.exists().then(|| crate::shellmenu::ShellMenu::of_file(main, file)).flatten();
+    let mut ids = crate::shellmenu::ItemIds::default();
+    // deskfolds' own Rename and Delete, only where Windows has none: an entry
+    // with their ids from elsewhere does nothing.
+    let (mut own_rename, mut own_delete) = (false, false);
+    // Kept until the chosen entry has run (see `Chosen`).
+    let tracked = crate::shellmenu::track(main, at, shell.as_ref(), |menu| unsafe {
+        let add = |id: usize, text: &str| {
+            let text = wide(text);
+            AppendMenuW(menu, MF_STRING, id, text.as_ptr());
+        };
+        if let Some(s) = &shell {
+            ids = s.fill_for_item(menu, 0, extended);
+        }
+        (own_rename, own_delete) = (ids.rename.is_empty(), ids.delete.is_empty());
+        if own_rename {
+            add(ID_RENAME, "Rename");
+        }
+        if own_delete {
+            add(ID_DELETE, "Delete");
+        }
+        if GetMenuItemCount(menu) > 0 {
+            AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        }
+        // deskfolds' entries in a submenu of their own, after Windows' ones;
+        // in the menu itself if that submenu cannot be made.
+        const ENTRIES: [(usize, &str); 2] = [(ID_REMOVE, "Remove from folder"), (ID_SETTINGS, "Folder settings…")];
+        let sub = crate::shellmenu::own_submenu();
+        let mut in_sub = !sub.is_null();
+        if in_sub {
+            for (id, text) in ENTRIES {
+                let text = wide(text);
+                AppendMenuW(sub, MF_STRING, id, text.as_ptr());
+            }
+            let name = wide("deskfolds");
+            if AppendMenuW(menu, MF_POPUP, sub as usize, name.as_ptr()) == 0 {
+                // Not in the menu: nothing else would destroy it.
+                DestroyMenu(sub);
+                in_sub = false;
+            }
+        }
+        if !in_sub {
+            for (id, text) in ENTRIES {
+                add(id, text);
+            }
+        }
+    });
+    let chosen = tracked.id;
+    after_menu();
+    let delete = (own_delete && chosen as usize == ID_DELETE) || ids.delete.contains(&chosen);
+    let rename = (own_rename && chosen as usize == ID_RENAME) || ids.rename.contains(&chosen);
+    match chosen as usize {
+        ID_REMOVE => remove_from_folder(item_id, &item, stored),
+        ID_SETTINGS => crate::settings::open_item(panel_id, item_id),
+        _ if delete => {
+            if stored && file.exists() {
+                let outcome = crate::shellmenu::delete_to_recycle_bin(&[file.to_path_buf()]);
+                if file.exists() {
+                    // Windows was told No, or could not: the shortcut stays.
+                    if outcome != crate::shellmenu::Outcome::Cancelled {
+                        error_box(&format!("Windows could not delete '{}'.\n\n{path}", ui::short_name(&item.name, 60)));
+                    }
+                    return;
+                }
+            }
+            // Gone to the Recycle Bin, or a link: it leaves the folder; a
+            // link's original is never touched.
+            if let Err(e) = store::change(|s| s.remove_item(item_id, false)) {
+                error_box(&e);
+            }
+        }
+        _ if rename => unsafe {
+            // Once the menu is gone: the name is typed in place.
+            PostMessageW(main, WM_APP_RENAME_ITEM, item_id as usize, 0);
+        },
+        _ if (crate::shellmenu::FIRST_ID..=crate::shellmenu::LAST_ID).contains(&chosen) => {
+            let Some(shell) = &shell else { return };
+            // What one of Windows' entries makes next to a moved file joins the folder
+            // (not after Open: a program's hidden lock file is not one).
+            let dir = if stored && !shell.opens_only(chosen) { file.parent().map(Path::to_path_buf) } else { None };
+            let before = dir.as_deref().map(crate::shellmenu::listing).unwrap_or_default();
+            shell.invoke(main, &tracked, file.parent(), at);
+            if let Some(dir) = &dir {
+                let made: Vec<String> = crate::shellmenu::made(&before, &crate::shellmenu::listing(dir))
+                    .into_iter()
+                    .filter(|p| !known_file(p) && !hidden_file(p))
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect();
+                if !made.is_empty() && store::with(|s| s.panel(panel_id).is_some()) {
+                    store::change(|s| s.add_files(panel_id, usize::MAX, &made, true));
+                }
+            }
+            // Deleted or moved away by one of Windows' entries: the shortcut goes too.
+            if !file.exists()
+                && store::with(|s| s.item(item_id).is_some())
+                && let Err(e) = store::change(|s| s.remove_item(item_id, false))
+            {
+                error_box(&e);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Remove from folder: a file moved into the folder goes back to the desktop;
+/// a link leaves the folder, and a shortcut to its original appears on the
+/// desktop, unless the original is on the desktop or the shared one already,
+/// or is missing. Nothing is deleted.
+fn remove_from_folder(item_id: u32, item: &crate::config::Item, stored: bool) {
+    if !stored {
+        let Some(desktop) = dragdrop::desktop_dir() else {
+            error_box("The desktop folder was not found.");
+            return;
+        };
+        let target = resolve(&item.path);
+        let original = Path::new(&target);
+        let folder = original.parent().map(|d| d.to_string_lossy().to_lowercase());
+        let (_, shared) = crate::watch::desktops();
+        let on_a_desktop = [Some(desktop.clone()), shared].into_iter().flatten().any(|d| folder.as_deref() == Some(d.to_string_lossy().to_lowercase().as_str()));
+        let wanted = crate::util::is_uri(&target) || (original.exists() && !on_a_desktop);
+        // The desktop watcher leaves it there: deskfolds put it.
+        if wanted && let Err(e) = crate::integration::make_shortcut(&desktop, &item.name, &target, &item.args, item.icon.as_deref()) {
+            error_box(&e);
+            return;
+        }
+    }
+    if let Err(e) = store::change(|s| s.remove_item(item_id, stored)) {
+        error_box(&e);
+    }
+}
+
+/// A hidden or system file (a program's lock file such as ~$report.docx).
+fn hidden_file(p: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const HIDDEN_OR_SYSTEM: u32 = 0x2 | 0x4;
+    std::fs::metadata(p).is_ok_and(|m| m.file_attributes() & HIDDEN_OR_SYSTEM != 0)
+}
+
+/// A file already in a folder, or a copy waiting for Windows' answer: not one
+/// that a command just made.
+fn known_file(p: &Path) -> bool {
+    crate::watch::is_pending_copy(p) || store::with(|s| s.panels.iter().any(|panel| panel.items.iter().any(|it| Path::new(&it.path) == p)))
+}
+
+/// A file made by the « New » menu in a folder's storage folder joins the
+/// folder, its name ready to type. A shortcut waits for Windows' « Create
+/// Shortcut » window to be done: the shortcut it made then joins the folder.
+pub fn adopt_new(main: HWND, panel_id: u32, dir: &Path, mut before: Vec<std::path::PathBuf>, made: crate::shellmenu::Made) {
+    if let Some(wizard) = made.wizard {
+        before.push(made.path.clone());
+        let since = unsafe { GetTickCount64() };
+        NEW_LINKS.with(|n| n.borrow_mut().push(NewLink { panel_id, dir: dir.to_path_buf(), before, placeholder: made.path, wizard, since }));
+        unsafe { SetTimer(main, NEW_LINK_TIMER, 700, None) };
+        return;
+    }
+    let path = made.path.to_string_lossy().to_string();
+    // A link to a file of the storage folder is a file moved into it.
+    store::change(|s| s.add_files(panel_id, usize::MAX, std::slice::from_ref(&path), true));
+    let id = store::with(|s| s.panel(panel_id).and_then(|p| p.items.iter().find(|it| it.path == path).map(|it| it.id)));
+    if let Some(id) = id {
+        unsafe { PostMessageW(main, WM_APP_RENAME_ITEM, id as usize, 0) };
+    }
+}
+
+/// The timer while Windows' « Create Shortcut » window is open. Once it is
+/// closed, the shortcut it made joins the folder; the empty one deskfolds made
+/// for it goes if it is still empty. Waited for 30 minutes at most.
+pub fn check_new_links(main: HWND) {
+    let now = unsafe { GetTickCount64() };
+    let waiting: Vec<NewLink> = NEW_LINKS.with(|n| std::mem::take(&mut *n.borrow_mut()));
+    let mut still = Vec::new();
+    for link in waiting {
+        let running = unsafe { WaitForSingleObject(link.wizard, 0) } == WAIT_TIMEOUT;
+        if running && now.saturating_sub(link.since) < 30 * 60 * 1000 {
+            still.push(link);
+            continue;
+        }
+        unsafe { CloseHandle(link.wizard) };
+        let empty = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() == 0);
+        if empty(&link.placeholder) {
+            let _ = std::fs::remove_file(&link.placeholder);
+        }
+        // Only the shortcuts it made: not the files that came into the folder meanwhile.
+        let made: Vec<String> = crate::shellmenu::made(&link.before, &crate::shellmenu::listing(&link.dir))
+            .into_iter()
+            .chain(std::iter::once(link.placeholder.clone()).filter(|p| p.exists()))
+            .filter(|p| !empty(p) && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) && !known_file(p))
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        if !made.is_empty() && store::with(|s| s.panel(link.panel_id).is_some()) {
+            store::change(|s| s.add_files(link.panel_id, usize::MAX, &made, true));
+        }
+    }
+    let again = !still.is_empty();
+    NEW_LINKS.with(|n| n.borrow_mut().extend(still));
+    if again {
+        unsafe { SetTimer(main, NEW_LINK_TIMER, 700, None) };
+    }
+}
+
+/// Types a folder's new name in place, over its name.
+pub fn rename_in_place(hwnd: HWND) {
+    let Some(st) = state(hwnd) else { return };
+    let l = st.layout();
+    let (w, _) = st.closed_size();
+    let height = st.scale(st.settings.font_size + 12);
+    let width = (w - st.scale(16)).max(st.scale(160));
+    let top = st.shown.1 + st.title_top(&l) + (l.title_h - height) / 2;
+    let left = st.shown.0 + st.scale(8);
+    let rect = RECT { left, top, right: left + width, bottom: top + height };
+    let (id, title, font) = (st.cfg.id, st.cfg.title.clone(), st.title_font);
+    // The folder may be updated while the name box is open: only copies from here on.
+    if let Some(name) = prompt_text(rect, &title, font, None) {
+        let name: String = name.chars().take(crate::config::MAX_TITLE).collect();
+        store::change(|s| s.update_panel(id, |p| p.title = name));
+    }
+}
+
+/// Types a shortcut's new name in place, over its name. A file made in the
+/// storage folder is renamed too, keeping its extension.
+pub fn rename_item_in_place(hwnd: HWND, item_id: u32) {
+    let Some(st) = state(hwnd) else { return };
+    let Some(index) = st.cfg.items.iter().position(|it| it.id == item_id) else { return };
     let item = st.cfg.items[index].clone();
-    let (panel_id, main, font) = (st.cfg.id, st.main, st.font);
-    // Where the rename box goes: over the shortcut's name.
+    // Open, and kept open while the name is typed: the box goes over the name.
+    st.renaming = true;
+    unsafe { KillTimer(hwnd, CLOSE_TIMER) };
+    if !(st.open && st.progress >= 1.0) {
+        set_open(hwnd, st, true);
+        unsafe { KillTimer(hwnd, ANIM_TIMER) };
+        st.progress = 1.0;
+        hide_label_window(st);
+        apply_size(hwnd, st);
+        crate::relayout();
+    }
     let l = st.layout();
     let r = st.item_rect(&l, index);
     let mut origin = POINT { x: r.left, y: r.top + st.scale(8) + l.icon + st.scale(2) };
     unsafe { ClientToScreen(hwnd, &mut origin) };
-    let (height, width) = (st.scale(st.settings.font_size + 10), l.cell_w.max(st.scale(120)));
-    let rect = RECT {
-        left: origin.x - (width - l.cell_w) / 2,
-        top: origin.y,
-        right: origin.x + (width + l.cell_w) / 2,
-        bottom: origin.y + height,
-    };
-
-    let entries: [MenuEntry; 4] = [
-        (ID_RENAME, "Rename", 0),
-        (ID_REMOVE, "Remove from folder", 0),
-        ui::SEPARATOR,
-        (ID_SETTINGS, "Folder settings…", 0),
-    ];
-    let mut at = POINT { x: 0, y: 0 };
-    unsafe { GetCursorPos(&mut at) };
-    // The panel may be updated while the menu or the rename box is open: from
-    // here on, only the copied values are used.
-    match ui::popup_menu(main, &entries, at) {
-        ID_RENAME => {
-            if let Some(name) = prompt_text(rect, &item.name, font) {
-                store::change(|s| s.update_item(item.id, |it| it.name = name));
-            }
+    let (height, width) = (st.scale(st.settings.font_size + 10), l.cell_w.max(st.scale(240)));
+    let rect = RECT { left: origin.x - (width - l.cell_w) / 2, top: origin.y, right: origin.x + (width + l.cell_w) / 2, bottom: origin.y + height };
+    let (panel_id, font) = (st.cfg.id, st.font);
+    rename_item_file(item, panel_id, rect, font);
+    // The folder may have been updated meanwhile: found again.
+    if let Some(st) = state(hwnd) {
+        st.renaming = false;
+        if !cursor_inside(hwnd) {
+            let locked = st.is_locked();
+            on_leave(hwnd, st, locked);
         }
-        ID_REMOVE => {
-            // A file we keep goes back to the desktop; a link is just removed.
-            if let Err(e) = store::change(|s| s.remove_item(item.id, true)) {
-                error_box(&e);
-            }
-        }
-        ID_SETTINGS => crate::settings::open(Some(panel_id), false),
-        _ => {}
     }
+}
+
+/// The name box of `rename_item_in_place`, and the rename.
+fn rename_item_file(item: crate::config::Item, panel_id: u32, rect: RECT, font: HFONT) {
+    let item_id = item.id;
+    let stored = store::with(|s| s.is_stored(panel_id, &item));
+    let path = std::path::PathBuf::from(crate::util::expand_env(&item.path));
+    let file_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| item.name.clone());
+    // A link, or a moved file that is gone: only its name in the folder.
+    if !stored || !path.exists() {
+        if let Some(name) = prompt_text(rect, &item.name, font, None) {
+            store::change(|s| s.update_item(item_id, |it| it.name = name));
+        }
+        return;
+    }
+    // The name without its extension is selected, as in Explorer; a
+    // shortcut's .lnk or .url is not shown at all.
+    let ext = if path.is_dir() { None } else { path.extension().map(|e| e.to_string_lossy().to_string()) };
+    let stem_len = match &ext {
+        Some(e) => file_name.encode_utf16().count() - e.encode_utf16().count() - 1,
+        None => file_name.encode_utf16().count(),
+    };
+    let shown = if crate::watch::is_shortcut(&path) { path.file_stem().map_or_else(|| file_name.clone(), |s| s.to_string_lossy().to_string()) } else { file_name.clone() };
+    let Some(typed) = prompt_text(rect, &shown, font, Some(stem_len)) else { return };
+    // Windows drops trailing dots and spaces from file names: so does this.
+    let mut new_name = typed.clone();
+    loop {
+        let trimmed = new_name.trim().trim_end_matches(['.', ' ']).to_string();
+        if trimmed == new_name {
+            break;
+        }
+        new_name = trimmed;
+    }
+    // The file keeps its type: "Report v1.2" stays a .docx.
+    if let Some(e) = &ext
+        && !new_name.to_lowercase().ends_with(&format!(".{}", e.to_lowercase()))
+    {
+        new_name = format!("{new_name}.{e}");
+    }
+    let bad = new_name.is_empty() || crate::util::reserved_name(&new_name) || new_name.chars().any(|c| c.is_control() || "<>:\"/\\|?*".contains(c));
+    if bad || new_name == file_name {
+        return;
+    }
+    let Some(dir) = path.parent() else { return };
+    let dest = dir.join(&new_name);
+    // Never over another file: MoveFileExW without "replace" fails if the name is taken.
+    let (from, to) = (wide(&path.to_string_lossy()), wide(&dest.to_string_lossy()));
+    if unsafe { windows_sys::Win32::Storage::FileSystem::MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+        let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        let text = if code == 80 || code == 183 {
+            format!("There is already a file named '{}' in this folder.", ui::short_name(&new_name, 80))
+        } else {
+            format!("'{}' could not be renamed (Windows error {code}).", ui::short_name(&file_name, 80))
+        };
+        error_box(&text);
+        return;
+    }
+    let (new_path, shown) = (dest.to_string_lossy().to_string(), dragdrop::display_name(&dest));
+    store::change(|s| {
+        s.update_item(item_id, |it| {
+            it.path = new_path;
+            it.name = shown;
+        })
+    });
 }
 
 fn state<'a>(hwnd: HWND) -> Option<&'a mut PanelState> {
@@ -1242,7 +1650,7 @@ fn draw_label_window(hwnd: HWND, st: &mut PanelState) {
     let s = &st.settings;
     let (text, hover, border, accent) =
         (parse_color(&s.text, 0xF2F2F2), parse_color(&s.hover, 0x2E2E2E), parse_color(&s.border, 0x3A3A3A), parse_color(&s.accent, 0xFFC24C));
-    let outlined = !locked() || st.highlighted;
+    let outlined = !st.is_locked() || st.highlighted;
     unsafe {
         let screen = GetDC(null_mut());
         let mut info: BITMAPINFO = std::mem::zeroed();
@@ -1343,9 +1751,6 @@ fn set_open(hwnd: HWND, st: &mut PanelState, open: bool) {
         KillTimer(hwnd, CLOSE_TIMER);
     }
     st.open_pending = false;
-    if !open {
-        st.pinned = false;
-    }
     if st.open == open {
         return;
     }
@@ -1442,7 +1847,7 @@ fn animate(hwnd: HWND, st: &mut PanelState) {
 /// Opens shortcut `i`, and closes the folder if the settings say so.
 fn open_item(hwnd: HWND, st: &mut PanelState, i: usize) {
     let Some(item) = st.cfg.items.get(i).cloned() else { return };
-    if st.settings.collapse_after_launch && !st.pinned && !st.highlighted {
+    if st.settings.collapse_after_launch && !st.held_open() {
         set_open(hwnd, st, false);
     }
     // Last, and nothing of the panel is used after it: ShellExecute can run a
@@ -1641,12 +2046,12 @@ fn is_own_menu(hwnd: HWND) -> bool {
 /// A menu of deskfolds closed: an open folder the mouse is no longer on closes
 /// after the usual delay, as when the mouse leaves it.
 pub fn after_menu() {
-    let locked = locked();
     for hwnd in crate::panels() {
         if let Some(st) = state(hwnd)
             && st.open
             && !cursor_inside(hwnd)
         {
+            let locked = st.is_locked();
             on_leave(hwnd, st, locked);
         }
     }
@@ -1666,7 +2071,7 @@ fn on_leave(hwnd: HWND, st: &mut PanelState, locked: bool) {
     st.open_pending = false;
     unsafe { KillTimer(hwnd, OPEN_TIMER) };
     let hover_closes = (locked || !st.settings.unlocked_open_all) && st.settings.hover_open;
-    if hover_closes && st.open && !st.pinned && !st.highlighted {
+    if hover_closes && st.open && !st.held_open() {
         unsafe { SetTimer(hwnd, CLOSE_TIMER, st.settings.close_delay_ms, None) };
     }
 }
@@ -1701,6 +2106,15 @@ fn snap_moving(hwnd: HWND, st: &PanelState, r: &mut RECT) {
     crate::show_snap_targets(hwnd, &targets);
 }
 
+/// Pins or unpins the folder, and saves it: it stays pinned after a restart.
+fn set_pinned(hwnd: HWND, st: &mut PanelState, on: bool) {
+    st.pinned = on;
+    st.cfg.pinned = on;
+    unsafe { InvalidateRect(hwnd, null(), 0) };
+    let id = st.cfg.id;
+    store::change(|s| s.update_panel(id, |p| p.pinned = on));
+}
+
 /// Ends a resize with the grip and saves the new width.
 fn finish_resize(st: &mut PanelState) {
     if st.resizing.take().is_some() {
@@ -1726,7 +2140,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
         let st = &mut *ptr;
-        let locked = locked();
+        let locked = st.is_locked();
         let mouse = || ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
 
         match msg {
@@ -1904,7 +2318,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     CLOSE_TIMER => {
                         // Held open while the mouse is on a folder it pushed down: the
                         // folder under the mouse never moves.
-                        if !crate::cursor_in_stack(hwnd) {
+                        if !st.held_open() && !crate::cursor_in_stack(hwnd) {
                             set_open(hwnd, st, false);
                         }
                     }
@@ -1977,16 +2391,21 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     return 0;
                 }
                 match st.hit(x, y) {
-                    Hit::Title if !st.settings.hover_open => set_open(hwnd, st, !st.open),
+                    Hit::Title if !st.settings.hover_open => {
+                        // Closed by its name: a pinned folder is unpinned.
+                        if st.open && st.pinned {
+                            set_pinned(hwnd, st, false);
+                        }
+                        set_open(hwnd, st, !st.open);
+                    }
                     Hit::Title => {
                         // Clicking the name pins the panel open, clicking again unpins it.
                         if st.open {
-                            st.pinned = !st.pinned;
+                            set_pinned(hwnd, st, !st.pinned);
                         } else {
                             set_open(hwnd, st, true);
-                            st.pinned = true;
+                            set_pinned(hwnd, st, true);
                         }
-                        InvalidateRect(hwnd, null(), 0);
                     }
                     // With a double-click to open, a click selects the shortcut.
                     Hit::Item(i) if double => select(hwnd, st, Some(i)),
@@ -2005,14 +2424,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 hide_tip(st);
                 KillTimer(hwnd, TIP_TIMER);
                 match st.hit(x, y) {
-                    Hit::Item(i) if !locked => {
-                        item_menu(hwnd, st, i);
-                        // The mouse may have gone elsewhere while the menu was open.
-                        if let Some(st) = state(hwnd)
-                            && !cursor_inside(hwnd)
-                        {
-                            on_leave(hwnd, st, self::locked());
-                        }
+                    // A shortcut: Windows' menu for its file, locked or not.
+                    Hit::Item(i) => {
+                        let (main, item) = (st.main, st.cfg.items.get(i).map_or(0, |it| it.id));
+                        let extended = GetKeyState(VK_SHIFT as i32) < 0;
+                        let mut at = POINT { x: 0, y: 0 };
+                        GetCursorPos(&mut at);
+                        // The folder may be updated while the menu is open: only
+                        // copies from here on. Afterwards, folders the mouse left close.
+                        item_windows_menu(main, item, at, extended);
                     }
                     _ => {
                         PostMessageW(st.main, WM_APP_SHOW_MENU, st.cfg.id as usize, 0);

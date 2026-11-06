@@ -35,8 +35,9 @@ pub fn error_box(text: &str) {
 }
 
 /// Shows a one-line text box over `rect` (screen pixels). Enter confirms,
-/// Esc or clicking elsewhere cancels.
-pub fn prompt_text(rect: RECT, initial: &str, font: HFONT) -> Option<String> {
+/// Esc or clicking elsewhere cancels. `select`: how many characters (UTF-16
+/// units) are selected from the start; all of them by default.
+pub fn prompt_text(rect: RECT, initial: &str, font: HFONT, select: Option<usize>) -> Option<String> {
     let class = wide("EDIT");
     let text = wide(initial);
     unsafe {
@@ -60,7 +61,7 @@ pub fn prompt_text(rect: RECT, initial: &str, font: HFONT) -> Option<String> {
         SendMessageW(edit, WM_SETFONT, font as usize, 1);
         SetForegroundWindow(edit);
         SetFocus(edit);
-        SendMessageW(edit, EM_SETSEL, 0, -1);
+        SendMessageW(edit, EM_SETSEL, 0, select.map_or(-1, |n| n as isize));
 
         let mut confirmed = false;
         let mut msg: MSG = std::mem::zeroed();
@@ -108,8 +109,16 @@ pub fn expand_env(s: &str) -> String {
     String::from_utf16_lossy(&buf[..n as usize - 1])
 }
 
+/// A name Windows keeps for a device (CON, NUL, COM1...), with or without an
+/// extension: a file of that name would not be a file.
+pub fn reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").trim().to_uppercase();
+    let numbered = |prefix: &str| stem.strip_prefix(prefix).is_some_and(|n| matches!(n, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"));
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") || numbered("COM") || numbered("LPT")
+}
+
 /// True for "https://...", "ms-settings:" and the like, but not for "C:\...".
-fn is_uri(s: &str) -> bool {
+pub fn is_uri(s: &str) -> bool {
     match s.find(':') {
         Some(i) if i > 1 => s[..i].chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)),
         _ => false,
@@ -210,9 +219,18 @@ pub fn open_in_notepad(path: &Path) {
     launch("notepad.exe", &format!("\"{}\"", path.display()));
 }
 
+/// The name of the "start with Windows" entry: a test copy (another APPDATA)
+/// has one of its own, so it never changes the usual copy's.
+fn run_value() -> String {
+    match crate::integration::copy_suffix() {
+        Some(s) => format!("{RUN_VALUE}.{s}"),
+        None => RUN_VALUE.to_string(),
+    }
+}
+
 pub fn autostart_enabled() -> bool {
     let key = wide(RUN_KEY);
-    let value = wide(RUN_VALUE);
+    let value = wide(&run_value());
     unsafe {
         RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr(), RRF_RT_REG_SZ, null_mut(), null_mut(), null_mut())
             == 0
@@ -221,11 +239,14 @@ pub fn autostart_enabled() -> bool {
 
 pub fn set_autostart(enabled: bool) {
     let key = wide(RUN_KEY);
-    let value = wide(RUN_VALUE);
+    let value = wide(&run_value());
     unsafe {
         if enabled {
             let Ok(exe) = std::env::current_exe() else { return };
-            let data = wide(&format!("\"{}\"", exe.display()));
+            // A test copy gives its APPDATA, so it starts as itself.
+            let args = crate::integration::launch_args();
+            let command = if args.is_empty() { format!("\"{}\"", exe.display()) } else { format!("\"{}\" {args}", exe.display()) };
+            let data = wide(&command);
             RegSetKeyValueW(
                 HKEY_CURRENT_USER,
                 key.as_ptr(),

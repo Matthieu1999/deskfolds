@@ -314,6 +314,10 @@ pub fn cancel_drag() {
 /// gap. Returns true while it is over the frame (then it does not snap to
 /// other folders).
 pub fn folder_moving(id: u32, label: Rect, cursor: POINT, free: bool) -> bool {
+    // A folder unlocked by itself, outside the arrangement, cannot join it.
+    if !crate::frame_wanted() {
+        return false;
+    }
     let (settings, others, list) = members(Some(id));
     let arranged = list.iter().any(|p| p.id == id && p.arranged);
     // No arrangement to join, and not leaving one.

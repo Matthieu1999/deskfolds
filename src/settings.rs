@@ -1,6 +1,6 @@
 //! The settings window, opened from the tray menu or by double-clicking the
-//! tray icon: folders and their shortcuts, appearance, behavior, layout,
-//! backups.
+//! tray icon: folders and their shortcuts, appearance, behavior, layout, what
+//! deskfolds adds to Windows, help, backups.
 //!
 //! It uses native Windows controls in dark mode. It is built when opened and
 //! destroyed when closed, so it costs nothing while closed. A change applies
@@ -69,14 +69,18 @@ enum Page {
     Appearance,
     Behavior,
     Layout,
+    Windows,
+    Help,
     About,
 }
 
-const PAGES: [(Page, &str); 5] = [
+const PAGES: [(Page, &str); 7] = [
     (Page::Folders, "Folders"),
     (Page::Appearance, "Appearance"),
     (Page::Behavior, "Behavior"),
     (Page::Layout, "Layout"),
+    (Page::Windows, "Windows integration"),
+    (Page::Help, "Help"),
     (Page::About, "About & advanced"),
 ];
 
@@ -189,6 +193,14 @@ const L_JOIN: i32 = 648;
 const L_ARRANGE_ALL: i32 = 649;
 const L_FREE_ALL: i32 = 650;
 const L_LINE: i32 = 651;
+const L_MAKE_ROOM: i32 = 652;
+
+const W_START_MENU: i32 = 700;
+const W_DESKTOP_MENU: i32 = 701;
+const W_NEW_SHORTCUTS: i32 = 702;
+/// The Help page's topic buttons: H_TOPIC + the topic's index.
+const H_TOPIC: i32 = 720;
+const H_VIEW: i32 = 740;
 
 /// The clickable text next to a check box or a radio button: its id + this.
 const CAPTION: i32 = 1000;
@@ -197,7 +209,8 @@ const UPDOWN: i32 = 5000;
 
 const COLOR_BUTTONS: [i32; 5] = [A_TINT, A_ACCENT, A_TEXT, A_HOVER, A_BORDER];
 /// Check boxes that have a caption.
-const CAPTIONED_CHECKS: [i32; 8] = [F_FIT, F_ARRANGED, A_COUNT, A_FOLDER_ICON, L_SNAP, L_JOIN, B_SELECTED_NAME, N_FIT];
+const CAPTIONED_CHECKS: [i32; 12] =
+    [F_FIT, F_ARRANGED, A_COUNT, A_FOLDER_ICON, L_SNAP, L_JOIN, B_SELECTED_NAME, N_FIT, L_MAKE_ROOM, W_START_MENU, W_DESKTOP_MENU, B_AUTOSTART];
 const TITLE_STYLES: [(i32, TitleStyle); 4] = [
     (A_STYLE_CENTERED, TitleStyle::Centered),
     (A_STYLE_LEFT, TitleStyle::Left),
@@ -328,6 +341,9 @@ struct Win {
     anchor: (usize, usize),
     /// The icon shown for new folders in the Behavior page.
     new_icon: HICON,
+    /// Where new desktop shortcuts may go, as in the list of the Windows
+    /// integration page: "" (they stay on the desktop), then folder names.
+    shortcut_targets: Vec<String>,
 }
 
 fn win<'a>(hwnd: HWND) -> Option<&'a mut Win> {
@@ -402,6 +418,7 @@ fn select_row(lv: HWND, index: Option<usize>) {
 }
 
 pub fn register_class() {
+    crate::help::register_class();
     let class = wide(CLASS);
     let wc = WNDCLASSW {
         style: 0,
@@ -478,6 +495,7 @@ pub fn open(panel: Option<u32>, rename: bool) {
         backups: Vec::new(),
         screens: Vec::new(),
         anchor: (0, 0),
+        shortcut_targets: Vec::new(),
     });
     let area = work_area_at_cursor();
     let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
@@ -521,6 +539,25 @@ pub fn open(panel: Option<u32>, rename: bool) {
         w.show_page(Page::Folders);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
+    }
+}
+
+/// Opens the settings window on a folder, with one of its shortcuts selected.
+pub fn open_item(panel: u32, item: u32) {
+    open(Some(panel), false);
+    if let Some(w) = win(WINDOW.get()) {
+        w.item = Some(item);
+        w.request_sync();
+    }
+}
+
+/// Opens the settings window on its Help page.
+pub fn open_help() {
+    open(None, false);
+    if let Some(w) = win(WINDOW.get())
+        && w.page != Page::Help
+    {
+        w.show_page(Page::Help);
     }
 }
 
@@ -887,6 +924,7 @@ impl Win {
             self.new_icon = null_mut();
         }
         self.list_sigs = Default::default();
+        self.shortcut_targets.clear();
         self.dirty = None;
         self.syncing = false;
     }
@@ -903,6 +941,8 @@ impl Win {
             Page::Appearance => self.build_appearance(),
             Page::Behavior => self.build_behavior(),
             Page::Layout => self.build_layout(),
+            Page::Windows => self.build_windows(),
+            Page::Help => self.build_help(),
             Page::About => self.build_about(),
         }
         self.syncing = false;
@@ -1034,8 +1074,7 @@ impl Win {
         self.label("Lock folders in place", lx, 320, 200);
         self.help("Unlocked: move and resize folders, drag shortcuts", lx, 342, 300);
         self.check(cx + 100, 320, B_LOCK);
-        self.label("Start with Windows", lx, 366, 200);
-        self.check(cx + 100, 366, B_AUTOSTART);
+        self.help("Start with Windows, the Start menu and the desktop menu: Windows integration.", lx, 372, 664);
 
         self.create("STATIC", "", SS_NOPREFIX, 0, (lx, 400, 664, 1), L_LINE);
         let title = self.label("New folders", lx, 408, 200);
@@ -1062,56 +1101,92 @@ impl Win {
         let (lx, cx) = (200, 410);
         self.label("Snap when moving", lx, 56, 200);
         self.check_text(cx, 56, L_SNAP, "Snap to other folders and to the screen edges", 300);
-        self.help("Hold Alt while dragging to place a folder freely.", lx, 78, 420);
-        self.label("Gap between folders", lx, 104, 200);
-        self.help("For snapping, pushing and arranging", lx, 126, 205);
-        self.number(cx, 106, 64, L_GAP);
-        self.label("px", cx + 72, 106, 30);
-        self.label("When a folder opens", lx, 150, 200);
-        self.radio(cx, 150, L_PUSH, "Push the folders next to it", 178);
-        self.radio(cx + 184, 150, L_COVER, "Cover them", 90);
-        self.help("Folders stacked right under or above it slide away while it is open, and come back when it closes.", lx, 172, 600);
-        self.label("Open direction", lx, 196, 200);
-        self.radio(cx, 196, L_AUTO, "Automatic", 80);
-        self.radio(cx + 114, 196, L_DOWN, "Always down", 96);
-        self.help("Automatic: folders that touch open the same way, upwards when there is no room below them.", lx, 218, 600);
-        self.label("While unlocked", lx, 242, 200);
-        self.radio(cx, 242, L_CLOSED, "Folders stay closed, open on hover", 210);
-        self.radio(cx + 244, 242, L_OPEN_ALL, "All folders open", 120);
-        self.help("Closed folders are easier to arrange.", lx, 264, 420);
-        self.label("Cell width", lx, 288, 200);
-        self.help("For folders sized by columns", lx, 310, 205);
-        self.slider(cx, 288, 330, L_CELL);
-        self.create("STATIC", "", SS_NOPREFIX, 0, (lx, 326, 664, 1), L_LINE);
-        let title = self.label("Arrangement", lx, 334, 200);
+        self.check_text(cx, 80, L_MAKE_ROOM, "Snapped folders make room when one gets bigger", 320);
+        self.help("Hold Alt while dragging to place a folder freely. Making room, one that no longer fits goes to a new line.", lx, 104, 664);
+        self.label("Gap between folders", lx, 130, 200);
+        self.help("For snapping, pushing and arranging", lx, 152, 205);
+        self.number(cx, 132, 64, L_GAP);
+        self.label("px", cx + 72, 132, 30);
+        self.label("When a folder opens", lx, 176, 200);
+        self.radio(cx, 176, L_PUSH, "Push the folders next to it", 178);
+        self.radio(cx + 184, 176, L_COVER, "Cover them", 90);
+        self.help("Folders stacked right under or above it slide away while it is open, and come back when it closes.", lx, 198, 600);
+        self.label("Open direction", lx, 222, 200);
+        self.radio(cx, 222, L_AUTO, "Automatic", 80);
+        self.radio(cx + 114, 222, L_DOWN, "Always down", 96);
+        self.help("Automatic: folders that touch open the same way, upwards when there is no room below them.", lx, 244, 600);
+        self.label("While unlocked", lx, 268, 200);
+        self.radio(cx, 268, L_CLOSED, "Folders stay closed, open on hover", 210);
+        self.radio(cx + 244, 268, L_OPEN_ALL, "All folders open", 120);
+        self.help("Closed folders are easier to arrange.", lx, 290, 420);
+        self.label("Cell width", lx, 314, 200);
+        self.help("For folders sized by columns", lx, 336, 205);
+        self.slider(cx, 314, 330, L_CELL);
+        self.create("STATIC", "", SS_NOPREFIX, 0, (lx, 352, 664, 1), L_LINE);
+        let title = self.label("Arrangement", lx, 360, 200);
         send(title, WM_SETFONT, self.strong as usize, 0);
-        self.help("The folders in it move and stay together.", cx, 337, 454);
-        self.label("Shape", lx, 366, 200);
-        self.radio(cx, 366, L_SHAPE_ROW, "Row", 46);
-        self.radio(cx + 70, 366, L_SHAPE_COLUMN, "Column", 62);
-        self.radio(cx + 156, 366, L_SHAPE_GRID, "Grid", 46);
-        self.label("of", 640, 366, 18);
-        self.number(660, 366, 64, L_COUNT);
-        self.combo(732, 366, 132, L_BY, &["columns", "rows"]);
-        self.label("Place on the screen", lx, 402, 200);
-        self.help("Or drag its frame while unlocked", lx, 424, 205);
-        self.anchor_buttons(cx, 400);
-        self.label("Offset X", 490, 402, 52);
-        self.number(544, 402, 64, L_OFFSET_X);
-        self.label("Y", 618, 402, 14);
-        self.number(634, 402, 64, L_OFFSET_Y);
+        self.help("The folders in it move and stay together.", cx, 363, 454);
+        self.label("Shape", lx, 392, 200);
+        self.radio(cx, 392, L_SHAPE_ROW, "Row", 46);
+        self.radio(cx + 70, 392, L_SHAPE_COLUMN, "Column", 62);
+        self.radio(cx + 156, 392, L_SHAPE_GRID, "Grid", 46);
+        self.label("of", 640, 392, 18);
+        self.number(660, 392, 64, L_COUNT);
+        self.combo(732, 392, 132, L_BY, &["columns", "rows"]);
+        self.label("Place on the screen", lx, 428, 200);
+        self.help("Or drag its frame while unlocked", lx, 450, 205);
+        self.anchor_buttons(cx, 426);
+        self.label("Offset X", 490, 428, 52);
+        self.number(544, 428, 64, L_OFFSET_X);
+        self.label("Y", 618, 428, 14);
+        self.number(634, 428, 64, L_OFFSET_Y);
         let screens = arrange::screens();
         let labels: Vec<&str> = screens.iter().map(|s| s.label.as_str()).collect();
-        self.combo(710, 402, 154, L_SCREEN, &labels);
+        self.combo(710, 428, 154, L_SCREEN, &labels);
         self.screens = screens.iter().map(|s| s.device.clone()).collect();
-        self.path(490, 428, 374, L_NOW);
-        self.label("Folders in it", lx, 466, 200);
-        self.create("STATIC", "", SS_NOPREFIX | SS_CENTERIMAGE, 0, (cx, 466, 60, 24), L_MEMBERS);
-        self.button("Choose…", 474, 464, 90, L_CHOOSE);
-        self.check_text(580, 466, L_JOIN, "New folders join it", 150);
-        self.button("Arrange all folders", cx, 502, 160, L_ARRANGE_ALL);
-        self.button("Free all folders", cx + 166, 502, 140, L_FREE_ALL);
-        self.help("Drag a folder out of the frame to free it, or into the frame to add it.", lx, 538, 664);
+        self.path(490, 454, 374, L_NOW);
+        self.label("Folders in it", lx, 492, 200);
+        self.create("STATIC", "", SS_NOPREFIX | SS_CENTERIMAGE, 0, (cx, 492, 60, 24), L_MEMBERS);
+        self.button("Choose…", 474, 490, 90, L_CHOOSE);
+        self.check_text(580, 492, L_JOIN, "New folders join it", 150);
+        self.button("Arrange all folders", cx, 528, 160, L_ARRANGE_ALL);
+        self.button("Free all folders", cx + 166, 528, 140, L_FREE_ALL);
+        self.help("Drag a folder out of the frame to free it, or into the frame to add it.", lx, 564, 664);
+    }
+
+    /// What deskfolds adds to Windows, each only once turned on here.
+    fn build_windows(&mut self) {
+        self.heading("Windows integration");
+        let (lx, cx) = (200, 410);
+        self.help("What deskfolds adds to Windows, for you only. Turn these off before you delete deskfolds.exe.", lx, 52, 664);
+        self.label("Start menu and search", lx, 86, 200);
+        self.check_text(cx, 86, W_START_MENU, "Show deskfolds in the Start menu and in Windows search", 440);
+        self.help("A shortcut in your own Start menu folder. No administrator rights are needed.", lx, 110, 664);
+        self.label("Start with Windows", lx, 144, 200);
+        self.check_text(cx, 144, B_AUTOSTART, "Start deskfolds when you sign in", 300);
+        self.label("Desktop menu", lx, 182, 200);
+        self.check_text(cx, 182, W_DESKTOP_MENU, "Add \"New deskfolds folder\" to the desktop's right-click menu", 440);
+        self.help("On Windows 11, it is under \"Show more options\", or straight away with Shift + right-click.", lx, 206, 664);
+        self.label("New desktop shortcuts", lx, 244, 200);
+        self.combo(cx, 244, 330, W_NEW_SHORTCUTS, &[]);
+        self.help("Only shortcuts that appear from now on, from an installer for example.", lx, 268, 664);
+        self.help("A shortcut for all users needs your permission, each time: click the notification.", lx, 288, 664);
+    }
+
+    /// What deskfolds can do, and the keys: text only (see `help`).
+    fn build_help(&mut self) {
+        self.heading("Help");
+        let lx = 200;
+        self.help("What deskfolds can do, and how. The README on GitHub says the same, in more detail.", lx, 50, 664);
+        let mut x = lx;
+        for (i, topic) in crate::help::TOPICS.iter().enumerate() {
+            let w = 14 + topic.button.chars().count() as i32 * 7;
+            self.button(topic.button, x, 74, w, H_TOPIC + i as i32);
+            x += w + 6;
+        }
+        let view = self.create(crate::help::CLASS, "", WS_TABSTOP | WS_VSCROLL, 0, (lx, 112, 664, 498), H_VIEW);
+        ui::dark_control(view, false);
+        crate::help::set_fonts(view, self.font, self.strong, self.dpi);
     }
 
     fn build_about(&mut self) {
@@ -1159,6 +1234,8 @@ impl Win {
             Page::Appearance => self.sync_appearance(&settings),
             Page::Behavior => self.sync_behavior(&settings),
             Page::Layout => self.sync_layout(&settings),
+            Page::Windows => self.sync_windows(&settings, &panels),
+            Page::Help => {}
             Page::About => self.sync_about(),
         }
         self.syncing = false;
@@ -1394,7 +1471,6 @@ impl Win {
         self.enable(B_CLOSE, s.hover_open);
         self.set_check(B_COLLAPSE, s.collapse_after_launch);
         self.set_check(B_LOCK, LOCKED.load(std::sync::atomic::Ordering::Relaxed));
-        self.set_check(B_AUTOSTART, util::autostart_enabled());
         let root = storage_root(&s.storage_dir).display().to_string();
         let shown = if s.storage_dir.trim().is_empty() { format!("{root}  (default)") } else { root };
         self.set_text(B_STORAGE, &shown);
@@ -1425,6 +1501,7 @@ impl Win {
 
     fn sync_layout(&mut self, s: &Settings) {
         self.set_check(L_SNAP, s.snap);
+        self.set_check(L_MAKE_ROOM, s.snap_make_room);
         self.set_edit(L_GAP, &s.gap.to_string());
         self.set_radio(L_PUSH, s.push_below);
         self.set_radio(L_COVER, !s.push_below);
@@ -1459,6 +1536,39 @@ impl Win {
         self.enable(L_ARRANGE_ALL, all > 0);
         self.enable(L_FREE_ALL, n > 0);
         self.set_check(L_JOIN, s.new_folders_join);
+    }
+
+    fn sync_windows(&mut self, s: &Settings, panels: &[config::Panel]) {
+        self.set_check(W_START_MENU, crate::integration::start_menu_enabled());
+        self.set_check(B_AUTOSTART, util::autostart_enabled());
+        self.set_check(W_DESKTOP_MENU, crate::integration::desktop_menu_enabled());
+        // Stay on the desktop, one of the folders, or a new folder.
+        let mut targets: Vec<String> = vec![String::new()];
+        targets.extend(panels.iter().map(|p| p.title.clone()));
+        let chosen = s.new_shortcuts_folder.clone();
+        let new_name = if chosen.is_empty() { "New apps".to_string() } else { chosen.clone() };
+        let new_folder = !targets.iter().any(|t| !t.is_empty() && t.eq_ignore_ascii_case(&new_name));
+        if new_folder {
+            targets.push(new_name.clone());
+        }
+        let combo = self.get(W_NEW_SHORTCUTS);
+        if targets != self.shortcut_targets {
+            send(combo, CB_RESETCONTENT, 0, 0);
+            for (i, t) in targets.iter().enumerate() {
+                let label = if t.is_empty() {
+                    "Stay on the desktop".to_string()
+                } else if new_folder && i == targets.len() - 1 {
+                    format!("Go into a new folder \"{}\"", ui::short_name(t, 40))
+                } else {
+                    format!("Go into \"{}\"", ui::short_name(t, 40))
+                };
+                let text = wide(&label);
+                send(combo, CB_ADDSTRING, 0, text.as_ptr() as isize);
+            }
+            self.shortcut_targets = targets;
+        }
+        let index = if chosen.is_empty() { 0 } else { self.shortcut_targets.iter().position(|t| t.eq_ignore_ascii_case(&chosen)).unwrap_or(0) };
+        send(combo, CB_SETCURSEL, index, 0);
     }
 
     fn sync_about(&mut self) {
@@ -1678,6 +1788,24 @@ impl Win {
                 let on = self.checked(L_SNAP);
                 store::change(|s| s.update_settings(|st| st.snap = on));
             }
+            L_MAKE_ROOM => {
+                let on = self.checked(L_MAKE_ROOM);
+                store::change(|s| s.update_settings(|st| st.snap_make_room = on));
+            }
+            W_START_MENU => {
+                if let Err(e) = crate::integration::set_start_menu(self.checked(W_START_MENU)) {
+                    error_box(&e);
+                }
+            }
+            W_DESKTOP_MENU => {
+                if let Err(e) = crate::integration::set_desktop_menu(self.checked(W_DESKTOP_MENU)) {
+                    error_box(&e);
+                }
+            }
+            id if (H_TOPIC..H_TOPIC + crate::help::TOPICS.len() as i32).contains(&id) => {
+                crate::help::show_topic(self.get(H_VIEW), (id - H_TOPIC) as usize);
+                return;
+            }
             L_PUSH | L_COVER => store::change(|s| s.update_settings(|st| st.push_below = id == L_PUSH)),
             L_AUTO | L_DOWN => store::change(|s| s.update_settings(|st| st.open_upwards = id == L_AUTO)),
             L_CLOSED | L_OPEN_ALL => store::change(|s| s.update_settings(|st| st.unlocked_open_all = id == L_OPEN_ALL)),
@@ -1893,6 +2021,13 @@ impl Win {
             (L_BY, CBN_SELCHANGE) => {
                 let rows = send(self.get(L_BY), CB_GETCURSEL, 0, 0) == 1;
                 store::change(|s| s.update_settings(|st| st.arrange_by = if rows { "rows" } else { "columns" }.into()));
+                self.request_sync();
+            }
+            (W_NEW_SHORTCUTS, CBN_SELCHANGE) => {
+                let index = usize::try_from(send(self.get(W_NEW_SHORTCUTS), CB_GETCURSEL, 0, 0)).ok();
+                if let Some(target) = index.and_then(|i| self.shortcut_targets.get(i)).cloned() {
+                    store::change(|s| s.update_settings(|st| st.new_shortcuts_folder = target));
+                }
                 self.request_sync();
             }
             (L_SCREEN, CBN_SELCHANGE) => {

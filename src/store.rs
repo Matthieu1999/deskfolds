@@ -62,6 +62,8 @@ pub struct Store {
     /// A save is waiting for the user to choose between the file and the screen.
     conflict: bool,
     last_backup: Option<Instant>,
+    /// There was no config and no backup: deskfolds starts for the first time.
+    pub first_start: bool,
 }
 
 thread_local! {
@@ -254,6 +256,8 @@ fn sync_settings(t: &mut Table, s: &Settings) {
     put(t, "arrange_offset_x", V::Int(s.arrange_offset_x as i64), s.arrange_offset_x == d.arrange_offset_x);
     put(t, "arrange_offset_y", V::Int(s.arrange_offset_y as i64), s.arrange_offset_y == d.arrange_offset_y);
     put(t, "new_folders_join", V::Bool(s.new_folders_join), s.new_folders_join == d.new_folders_join);
+    put(t, "snap_make_room", V::Bool(s.snap_make_room), s.snap_make_room == d.snap_make_room);
+    put(t, "new_shortcuts_folder", V::Str(&s.new_shortcuts_folder), s.new_shortcuts_folder == d.new_shortcuts_folder);
 }
 
 fn sync_panel(t: &mut Table, p: &Panel) {
@@ -264,6 +268,12 @@ fn sync_panel(t: &mut Table, p: &Panel) {
     put(t, "columns", V::Int(p.columns as i64), p.columns == DEFAULT_COLUMNS);
     put(t, "fit_columns", V::Bool(p.fit_columns), !p.fit_columns);
     put(t, "arranged", V::Bool(p.arranged), !p.arranged);
+    // Only pinned folders say so; unpinning takes the line away.
+    if p.pinned {
+        put(t, "pinned", V::Bool(true), false);
+    } else {
+        t.remove("pinned");
+    }
     put_opt(t, "icon", p.icon.as_deref());
     put_opt(t, "storage", p.storage.as_deref());
 }
@@ -313,6 +323,7 @@ impl Store {
             refresh_posted: false,
             conflict: false,
             last_backup: None,
+            first_start: false,
         }
     }
 
@@ -339,6 +350,7 @@ impl Store {
                     Some(label) => notices.push(format!("config.toml was missing: restored the backup from {label}.")),
                     None => {
                         let _ = store.load_text(config::DEFAULT_CONFIG);
+                        store.first_start = true;
                     }
                 }
                 if let Err(e) = store.write(true) {
@@ -602,6 +614,11 @@ impl Store {
         self.panels.iter().find(|p| p.id == id)
     }
 
+    /// The first folder with this name, ignoring case.
+    pub fn panel_named(&self, title: &str) -> Option<u32> {
+        self.panels.iter().find(|p| p.title.eq_ignore_ascii_case(title.trim())).map(|p| p.id)
+    }
+
     fn panel_index(&self, id: u32) -> Option<usize> {
         self.panels.iter().position(|p| p.id == id)
     }
@@ -664,6 +681,7 @@ impl Store {
             storage: Some(storage),
             fit_columns: self.settings.new_folder_fit_columns,
             arranged: false,
+            pinned: false,
             items: Vec::new(),
         });
         self.push(Change::Added(id));
@@ -719,6 +737,11 @@ impl Store {
         f(&mut self.panels[i]);
         self.panels[i].clamp();
         if self.panels[i].title != before.title {
+            // New desktop shortcuts keep going into it under its new name.
+            if self.settings.new_shortcuts_folder.eq_ignore_ascii_case(&before.title) {
+                self.settings.new_shortcuts_folder = self.panels[i].title.clone();
+                self.push(Change::Settings);
+            }
             // Nothing was dropped in it yet: its storage folder can follow the new
             // name. Once it holds files, it never changes.
             let unused = self.panels[i].storage.as_deref().is_some_and(|s| !Path::new(&expand_env(s)).exists());
@@ -1120,6 +1143,47 @@ icon = \"shell32.dll,3\"
         assert_eq!(titles, [("C", false), ("A", true), ("B", true)]);
         assert_eq!(config.settings.arrange_spec().anchor, (2, 2));
         assert_eq!(config.settings.arrange_offset_x, -20);
+    }
+
+    #[test]
+    fn pins_are_saved_and_read_back() {
+        let mut store = store_from("[[panel]]
+title = \"A\"
+
+[[panel]]
+title = \"B\"
+");
+        assert!(!saved_text(&mut store).contains("pinned"));
+        let b = store.panels[1].id;
+        store.update_panel(b, |p| p.pinned = true);
+        let text = saved_text(&mut store);
+        let config = config::parse(&text).unwrap();
+        assert!(!config.panels[0].pinned && config.panels[1].pinned, "{text}");
+        // Unpinned again: the line goes away.
+        store.update_panel(b, |p| p.pinned = false);
+        assert!(!saved_text(&mut store).contains("pinned"));
+    }
+
+    #[test]
+    fn the_folder_for_new_shortcuts_follows_its_new_name() {
+        let mut store = store_from("[settings]
+new_shortcuts_folder = \"New apps\"
+
+[[panel]]
+title = \"New apps\"
+");
+        assert_eq!(store.panel_named("new APPS"), Some(store.panels[0].id));
+        let id = store.panels[0].id;
+        store.update_panel(id, |p| p.title = "Installed".into());
+        let config = config::parse(&saved_text(&mut store)).unwrap();
+        assert_eq!(config.settings.new_shortcuts_folder, "Installed");
+        // The other settings of this version are written only once changed.
+        let mut plain = store_from("[settings]
+font_size = 13
+");
+        assert!(!saved_text(&mut plain).contains("snap_make_room"));
+        plain.update_settings(|s| s.snap_make_room = false);
+        assert!(!config::parse(&saved_text(&mut plain)).unwrap().settings.snap_make_room);
     }
 
     #[test]
