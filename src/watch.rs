@@ -45,8 +45,12 @@ pub const PUT_AWAY_TIMER: usize = 30;
 /// How long after a shortcut appears it is moved.
 const WAIT: Duration = Duration::from_secs(2);
 
+/// A file the watching thread found: its path, its old path when it was
+/// renamed, and whether it is on the shared desktop.
+type Found = (PathBuf, Option<PathBuf>, bool);
+
 /// New files found by the watching thread, for the main thread.
-static FOUND: Mutex<Vec<(PathBuf, bool)>> = Mutex::new(Vec::new());
+static FOUND: Mutex<Vec<Found>> = Mutex::new(Vec::new());
 /// Files deskfolds itself put on the desktop: never taken again.
 static PUT_BACK: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -83,8 +87,11 @@ struct Asking {
 thread_local! {
     static WATCHER: RefCell<Option<Watcher>> = const { RefCell::new(None) };
     static WAITING: RefCell<Vec<Waiting>> = const { RefCell::new(Vec::new()) };
-    /// Shortcuts of the shared desktop Windows refused to move: (file, folder).
+    /// Shortcuts of the shared desktop Windows refused to move, waiting for a
+    /// click on their notification (or the tray menu): (file, folder).
     static REFUSED: RefCell<Vec<(PathBuf, u32)>> = const { RefCell::new(Vec::new()) };
+    /// Shortcuts of the shared desktop dropped on a folder: asked about at once.
+    static DROPPED: RefCell<Vec<(PathBuf, u32)>> = const { RefCell::new(Vec::new()) };
     /// Windows is asking for permission right now.
     static ASKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The copies made in folders while Windows is asked: not new files.
@@ -155,6 +162,39 @@ fn add_refused(more: Vec<(PathBuf, u32)>) {
     });
 }
 
+/// How many shortcuts for all users wait for their question (tray menu).
+pub fn refused_waiting() -> usize {
+    REFUSED.with(|r| r.borrow().len())
+}
+
+/// The shared desktop is a folder only Windows or an administrator owns. A
+/// folder of the user (a test copy's) never gets Windows' permission prompt:
+/// someone could change it while the prompt is open.
+fn owned_by_windows(dir: &Path) -> bool {
+    use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+    const OWNERS: [&str; 3] = ["S-1-5-18", "S-1-5-32-544", "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"];
+    let path = wide(&dir.to_string_lossy());
+    unsafe {
+        let (mut owner, mut descriptor): (PSID, PSECURITY_DESCRIPTOR) = (null_mut(), null_mut());
+        if GetNamedSecurityInfoW(path.as_ptr(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &mut owner, null_mut(), null_mut(), null_mut(), &mut descriptor) != 0 {
+            return false;
+        }
+        let mut text: *mut u16 = null_mut();
+        let sid = if !owner.is_null() && ConvertSidToStringSidW(owner, &mut text) != 0 && !text.is_null() {
+            let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+            LocalFree(text as HLOCAL);
+            Some(sid)
+        } else {
+            None
+        };
+        LocalFree(descriptor as HLOCAL);
+        sid.is_some_and(|s| OWNERS.contains(&s.as_str()))
+    }
+}
+
 /// The notification that asks to click it, for the shortcuts waiting.
 fn notify_refused(main: HWND) {
     let (count, first, panel) = REFUSED.with(|r| {
@@ -192,7 +232,8 @@ pub fn move_shared_now(main: HWND, panel: u32, files: &[String]) -> Vec<String> 
         crate::store::change(|s| s.add_files(panel, usize::MAX, &moved, true));
     }
     if !refused.is_empty() {
-        add_refused(refused);
+        // Only these, the ones dropped: not the ones waiting for their notification.
+        DROPPED.with(|d| d.borrow_mut().extend(refused));
         // Once the drop is over: Windows' prompt must not hold up the drag.
         unsafe { PostMessageW(main, WM_APP_ASK_SHARED, 0, 0) };
     }
@@ -268,6 +309,8 @@ pub fn sync(main: HWND) {
 struct Watched {
     dir: PathBuf,
     shared: bool,
+    /// The old name of a rename whose new name is still to come.
+    renamed_from: Option<String>,
     handle: HANDLE,
     event: HANDLE,
     /// Boxed: Windows writes into it while the read is pending, so it must
@@ -314,7 +357,15 @@ fn watch_loop(dirs: &[(PathBuf, bool)], main: HWND, stop: HANDLE) {
             continue;
         }
         let event = unsafe { CreateEventW(null(), 1, 0, null()) };
-        let mut w = Watched { dir: dir.clone(), shared: *shared, handle, event, overlapped: Box::new(unsafe { std::mem::zeroed() }), buffer: vec![0u32; 4096] };
+        let mut w = Watched {
+            dir: dir.clone(),
+            shared: *shared,
+            renamed_from: None,
+            handle,
+            event,
+            overlapped: Box::new(unsafe { std::mem::zeroed() }),
+            buffer: vec![0u32; 4096],
+        };
         if !event.is_null() && w.read() {
             watched.push(w);
         } else {
@@ -338,10 +389,10 @@ fn watch_loop(dirs: &[(PathBuf, bool)], main: HWND, stop: HANDLE) {
         let done = unsafe { GetOverlappedResult(w.handle, &*w.overlapped, &mut bytes, 0) } != 0;
         let mut found = Vec::new();
         if done && bytes > 0 {
-            for name in notified_names(&w.buffer, bytes as usize) {
+            for (name, old) in notified_names(&w.buffer, bytes as usize, &mut w.renamed_from) {
                 let path = w.dir.join(name);
                 if is_shortcut(&path) {
-                    found.push((path, w.shared));
+                    found.push((path, old.map(|o| w.dir.join(o)), w.shared));
                 }
             }
         }
@@ -366,18 +417,17 @@ fn watch_loop(dirs: &[(PathBuf, bool)], main: HWND, stop: HANDLE) {
     }
 }
 
-/// The names of the files added (or renamed to) in a ReadDirectoryChangesW
-/// buffer: entries of NextEntryOffset, Action, FileNameLength (u32 each), then
-/// the name. Read field by field, never past `bytes`.
-fn notified_names(buffer: &[u32], bytes: usize) -> Vec<String> {
+/// The files added, or renamed to, in a ReadDirectoryChangesW buffer: their
+/// name, and their old name when renamed. Entries are NextEntryOffset, Action,
+/// FileNameLength (u32 each), then the name; read field by field, never past
+/// `bytes`. `renamed_from` carries a rename's old name over to the next buffer.
+fn notified_names(buffer: &[u32], bytes: usize, renamed_from: &mut Option<String>) -> Vec<(String, Option<String>)> {
     const HEADER: usize = 12;
     let mut names = Vec::new();
     let bytes = bytes.min(buffer.len() * 4);
     let base = buffer.as_ptr() as *const u8;
     let u32_at = |at: usize| unsafe { std::ptr::read_unaligned(base.add(at) as *const u32) };
     let mut offset = 0usize;
-    // A shortcut renamed to another name is not a new shortcut.
-    let mut renamed_shortcut = false;
     while offset + HEADER <= bytes {
         let (next, action, len) = (u32_at(offset) as usize, u32_at(offset + 4), u32_at(offset + 8) as usize / 2);
         if offset + HEADER + len * 2 > bytes {
@@ -388,13 +438,14 @@ fn notified_names(buffer: &[u32], bytes: usize) -> Vec<String> {
                 (0..len).map(|k| unsafe { std::ptr::read_unaligned(base.add(offset + HEADER + 2 * k) as *const u16) }).collect();
             String::from_utf16_lossy(&units)
         };
-        if action == FILE_ACTION_RENAMED_OLD_NAME {
-            renamed_shortcut = is_shortcut(Path::new(&name()));
-        } else if action == FILE_ACTION_ADDED || (action == FILE_ACTION_RENAMED_NEW_NAME && !renamed_shortcut) {
-            names.push(name());
-        }
-        if action != FILE_ACTION_RENAMED_OLD_NAME {
-            renamed_shortcut = false;
+        match action {
+            FILE_ACTION_RENAMED_OLD_NAME => *renamed_from = Some(name()),
+            FILE_ACTION_RENAMED_NEW_NAME => names.push((name(), renamed_from.take())),
+            FILE_ACTION_ADDED => {
+                *renamed_from = None;
+                names.push((name(), None));
+            }
+            _ => *renamed_from = None,
         }
         if next == 0 || next % 4 != 0 {
             break;
@@ -406,12 +457,24 @@ fn notified_names(buffer: &[u32], bytes: usize) -> Vec<String> {
 
 /// The watching thread found files: they are put away 2 seconds later.
 pub fn on_found(main: HWND) {
-    let found: Vec<(PathBuf, bool)> = FOUND.lock().map(|mut l| std::mem::take(&mut *l)).unwrap_or_default();
+    let found: Vec<Found> = FOUND.lock().map(|mut l| std::mem::take(&mut *l)).unwrap_or_default();
     let now = Instant::now();
     let mut any = false;
     WAITING.with(|w| {
         let mut w = w.borrow_mut();
-        for (path, shared) in found {
+        for (path, old, shared) in found {
+            if let Some(old) = old {
+                // A new shortcut renamed while it waits (Create Shortcut names
+                // it last): it keeps waiting under its new name.
+                if let Some(waiting) = w.iter_mut().find(|x| x.path == old) {
+                    waiting.path = path;
+                    continue;
+                }
+                // A shortcut the user renamed on the desktop is not a new one.
+                if is_shortcut(&old) {
+                    continue;
+                }
+            }
             if during_drag_out(now) || was_put_back(&path) || w.iter().any(|x| x.path == path) {
                 continue;
             }
@@ -501,15 +564,32 @@ pub fn on_timer(main: HWND) {
 /// with Windows' own prompt. A shortcut still there afterwards (refused, or
 /// "No") stays where it was, and its copy is taken away again.
 pub fn ask_for_shared(main: HWND) {
-    // One question at a time: the others wait for their own click.
-    if ASKING.get() {
-        return;
+    if !ASKING.get() {
+        let refused: Vec<(PathBuf, u32)> = REFUSED.with(|r| std::mem::take(&mut *r.borrow_mut()));
+        ask_windows(main, refused);
     }
-    let refused: Vec<(PathBuf, u32)> = REFUSED.with(|r| std::mem::take(&mut *r.borrow_mut()));
+}
+
+/// Shortcuts for all users dropped on a folder: Windows is asked about these
+/// only, once the drop is over.
+pub fn ask_dropped(main: HWND) {
+    if !ASKING.get() {
+        let dropped: Vec<(PathBuf, u32)> = DROPPED.with(|d| std::mem::take(&mut *d.borrow_mut()));
+        ask_windows(main, dropped);
+    }
+}
+
+fn ask_windows(main: HWND, list: Vec<(PathBuf, u32)>) {
+    let waiting_before = refused_waiting();
     let mut asking = Vec::new();
-    for (shared, panel) in refused {
+    let mut kept = Vec::new();
+    for (shared, panel) in list {
         // Checked again: the file and its folder, as they are now.
         let Some(shared) = shared_shortcut(&shared) else { continue };
+        if !shared.parent().is_some_and(owned_by_windows) {
+            kept.push(crate::dragdrop::display_name(&shared));
+            continue;
+        }
         let Some(dir) = crate::store::with(|s| s.panel(panel).is_some().then(|| s.storage_of(panel))) else { continue };
         if let Ok(copy) = crate::dragdrop::copy_into(&shared, &dir) {
             asking.push(Asking { shared, copy, panel });
@@ -519,10 +599,10 @@ pub fn ask_for_shared(main: HWND) {
         let originals: Vec<PathBuf> = asking.iter().map(|a| a.shared.clone()).collect();
         ASKING.set(true);
         COPIES.with(|c| c.borrow_mut().extend(asking.iter().map(|a| a.copy.clone())));
-        crate::shellmenu::recycle_with_windows(main, &originals, true);
-        COPIES.with(|c| c.borrow_mut().clear());
+        // Not owned by the hidden main window: Windows' dialog gets a taskbar button.
+        crate::shellmenu::recycle_with_windows(null_mut(), &originals, true);
         ASKING.set(false);
-        let mut kept = Vec::new();
+        let mut lost = Vec::new();
         for a in asking {
             if a.shared.exists() {
                 // Our own copy goes; the original stays.
@@ -531,20 +611,32 @@ pub fn ask_for_shared(main: HWND) {
             } else if crate::store::with(|s| s.panel(a.panel).is_some()) {
                 let copy = a.copy.to_string_lossy().to_string();
                 crate::store::change(|s| s.add_files(a.panel, usize::MAX, &[copy], true));
-            } else if let Some(desktop) = crate::dragdrop::desktop_dir() {
+            } else {
                 // Its folder was deleted meanwhile: the shortcut goes on the desktop.
-                let _ = crate::dragdrop::move_into(&a.copy, &desktop);
+                let back = crate::dragdrop::desktop_dir().map(|d| crate::dragdrop::move_into(&a.copy, &d));
+                if !matches!(back, Some(Ok(_))) {
+                    lost.push(a.copy.display().to_string());
+                }
             }
         }
-        if !kept.is_empty() {
-            let names: Vec<String> = kept.iter().map(|n| format!("« {} »", crate::ui::short_name(n, 60))).collect();
-            let text = format!("{} stays on the desktop: Windows did not allow the move.", names.join(", "));
+        COPIES.with(|c| c.borrow_mut().clear());
+        if !lost.is_empty() {
+            let text = format!("Its folder was deleted. The shortcut is kept here: {}", lost.join(", "));
             crate::notify(main, "Shortcut for all users", &text, None);
         }
     }
-    // Shortcuts that came while Windows was asking: their own question.
-    if REFUSED.with(|r| !r.borrow().is_empty()) {
+    if !kept.is_empty() {
+        let names: Vec<String> = kept.iter().map(|n| format!("« {} »", crate::ui::short_name(n, 60))).collect();
+        let text = format!("{} stays on the desktop: Windows did not allow the move.", names.join(", "));
+        crate::notify(main, "Shortcut for all users", &text, None);
+    }
+    // Shortcuts that came while Windows was asking get their own question;
+    // shortcuts dropped meanwhile are asked about now.
+    if refused_waiting() > waiting_before {
         notify_refused(main);
+    }
+    if DROPPED.with(|d| !d.borrow().is_empty()) {
+        unsafe { PostMessageW(main, WM_APP_ASK_SHARED, 0, 0) };
     }
 }
 
@@ -580,6 +672,27 @@ mod tests {
         all.extend(entry(FILE_ACTION_RENAMED_NEW_NAME, "new.lnk", true));
         let mut buffer = vec![0u32; all.len().div_ceil(4)];
         unsafe { std::ptr::copy_nonoverlapping(all.as_ptr(), buffer.as_mut_ptr() as *mut u8, all.len()) };
-        assert_eq!(notified_names(&buffer, all.len()), ["a.lnk", "b.url"]);
+        let mut from = None;
+        let names = notified_names(&buffer, all.len(), &mut from);
+        let owned = |a: &str, b: Option<&str>| (a.to_string(), b.map(String::from));
+        assert_eq!(names, [owned("a.lnk", None), owned("b.url", Some("x.tmp")), owned("new.lnk", Some("old.lnk"))]);
+        // A rename's old name at the end of one buffer, its new name in the next.
+        let old = entry(FILE_ACTION_RENAMED_OLD_NAME, "New shortcut.lnk", true);
+        let mut first = vec![0u32; old.len().div_ceil(4)];
+        unsafe { std::ptr::copy_nonoverlapping(old.as_ptr(), first.as_mut_ptr() as *mut u8, old.len()) };
+        assert!(notified_names(&first, old.len(), &mut from).is_empty());
+        let new = entry(FILE_ACTION_RENAMED_NEW_NAME, "Paint.lnk", true);
+        let mut second = vec![0u32; new.len().div_ceil(4)];
+        unsafe { std::ptr::copy_nonoverlapping(new.as_ptr(), second.as_mut_ptr() as *mut u8, new.len()) };
+        assert_eq!(notified_names(&second, new.len(), &mut from), [owned("Paint.lnk", Some("New shortcut.lnk"))]);
+    }
+
+    #[test]
+    fn only_folders_windows_owns_get_its_permission_prompt() {
+        assert!(owned_by_windows(Path::new(&crate::util::expand_env("%SystemRoot%"))));
+        let mine = std::env::temp_dir().join(format!("deskfolds-owner-{}", std::process::id()));
+        std::fs::create_dir_all(&mine).unwrap();
+        assert!(!owned_by_windows(&mine));
+        std::fs::remove_dir_all(&mine).unwrap();
     }
 }

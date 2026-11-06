@@ -56,6 +56,7 @@ const ID_DELETE_FOLDER: usize = 106;
 const ID_RENAME_FOLDER: usize = 107;
 const ID_UNLOCK_ONE: usize = 108;
 const ID_ITEM_MORE: usize = 109;
+const ID_SHARED: usize = 110;
 /// The « New » submenu's entries: NEW_BASE + their index.
 const NEW_BASE: usize = 0x800;
 
@@ -697,6 +698,13 @@ fn show_menu(main: HWND, panel: Option<u32>, item: Option<u32>) {
         }
     }
     let lock_label = if any_unlocked() { "Lock all folders" } else { "Unlock all folders (move and edit)" };
+    // Shortcuts for all users wait for their question: here too, in case
+    // another notification hid it.
+    let waiting = watch::refused_waiting();
+    let shared_label = format!("Move {waiting} shortcut(s) for all users…");
+    if waiting > 0 {
+        entries.extend([(ID_SHARED, shared_label.as_str(), 0), ui::SEPARATOR]);
+    }
     if labels.is_some() {
         entries.extend([(ID_LOCK, lock_label, 0), ui::SEPARATOR, (ID_SETTINGS, "Settings…", 0), (ID_NEW_FOLDER, "New folder", 0)]);
     } else {
@@ -735,6 +743,7 @@ fn show_menu(main: HWND, panel: Option<u32>, item: Option<u32>) {
         return;
     }
     match chosen {
+        ID_SHARED => watch::ask_for_shared(main),
         ID_ITEM_MORE => {
             if let Some(id) = item {
                 panel::item_windows_menu(main, id, at);
@@ -868,7 +877,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 0
             }
             watch::WM_APP_ASK_SHARED => {
-                watch::ask_for_shared(hwnd);
+                watch::ask_dropped(hwnd);
                 0
             }
             WM_DISPLAYCHANGE => {

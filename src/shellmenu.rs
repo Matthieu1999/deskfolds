@@ -245,14 +245,18 @@ impl ShellMenu {
         let query = self.menu.vtbl::<ContextMenuVtbl>().query_context_menu;
         let filled = unsafe { query(self.menu.0, menu, index, FIRST_ID, LAST_ID, CMF_NORMAL) >= 0 };
         if filled && self.keep_file {
-            const KEEP: [&str; 13] =
-                ["open", "opennew", "openas", "edit", "print", "printto", "runas", "runasuser", "copy", "copyaspath", "properties", "pintostartscreen", "pintohome"];
+            const KEEP: [&str; 16] = [
+                "open", "opennew", "opennewwindow", "opennewtab", "explore", "openas", "edit", "print", "printto", "runas", "runasuser", "copy",
+                "copyaspath", "properties", "pintostartscreen", "pintohome",
+            ];
             unsafe {
-                // Submenus (Send to, Open with...) and entries with no known verb go.
+                // Windows' submenus (Send to, Open with...) and its entries with no
+                // known verb go; ours (ids below FIRST_ID) and the lines stay.
                 for pos in (0..GetMenuItemCount(menu).max(0)).rev() {
                     let id = GetMenuItemID(menu, pos);
-                    let separator = id == 0;
-                    if !separator && !self.verb(id).is_some_and(|v| (FIRST_ID..=LAST_ID).contains(&id) && KEEP.contains(&v.as_str())) {
+                    let submenu = id == u32::MAX;
+                    let windows_entry = (FIRST_ID..=LAST_ID).contains(&id);
+                    if submenu || (windows_entry && !self.verb(id).is_some_and(|v| KEEP.contains(&v.as_str()))) {
                         DeleteMenu(menu, pos as u32, MF_BYPOSITION);
                     }
                 }
@@ -261,8 +265,8 @@ impl ShellMenu {
                 let mut pos = 0;
                 while pos < GetMenuItemCount(menu).max(0) {
                     let line = GetMenuItemID(menu, pos) == 0;
-                    if line && previous_line {
-                        DeleteMenu(menu, pos as u32, MF_BYPOSITION);
+                    // A line Windows would not take away is stepped over.
+                    if line && previous_line && DeleteMenu(menu, pos as u32, MF_BYPOSITION) != 0 {
                         continue;
                     }
                     previous_line = line;
