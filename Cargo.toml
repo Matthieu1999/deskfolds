@@ -1,6 +1,6 @@
 [package]
 name = "deskfolds"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 description = "Tiny foldable shortcut panels for the Windows desktop"
 license = "MIT"
