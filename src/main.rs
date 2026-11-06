@@ -730,7 +730,8 @@ fn show_menu(main: HWND, panel: Option<u32>) {
             let text = wide(text);
             AppendMenuW(menu, MF_STRING | flags, *id, text.as_ptr());
         }
-    }) as usize;
+    })
+    .id as usize;
     // The mouse may have left the folder while the menu was open.
     panel::after_menu();
     if let (Some(kind), Some(id), Some(dir)) = (chosen.checked_sub(NEW_BASE).and_then(|i| kinds.get(i)), panel, &storage) {

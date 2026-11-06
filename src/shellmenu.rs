@@ -376,15 +376,32 @@ unsafe fn tidy_lines(menu: HMENU) {
     }
 }
 
+/// The entry chosen in a popup menu: our id, the id of Windows' entry
+/// (FIRST_ID and above), or 0. The menu lives as long as this, as in Explorer,
+/// where it goes after the command ran: some of Windows' entries (Send to,
+/// Open with) find what they do in it when they run.
+pub struct Chosen {
+    pub id: u32,
+    menu: HMENU,
+}
+
+impl Drop for Chosen {
+    fn drop(&mut self) {
+        if !self.menu.is_null() {
+            unsafe { DestroyMenu(self.menu) };
+        }
+    }
+}
+
 /// Shows a popup menu at `at`: `build` fills it (our entries with ids below
 /// FIRST_ID, Windows' with `ShellMenu::fill_for_item`), and the messages of
-/// `shell`'s submenus are forwarded to it. Returns our chosen id, or the id of
-/// Windows' entry (FIRST_ID and above), or 0.
-pub fn track(owner: HWND, at: POINT, shell: Option<&ShellMenu>, build: impl FnOnce(HMENU)) -> u32 {
+/// `shell`'s submenus are forwarded to it. Keep what it returns until the
+/// chosen entry has run.
+pub fn track(owner: HWND, at: POINT, shell: Option<&ShellMenu>, build: impl FnOnce(HMENU)) -> Chosen {
     unsafe {
         let menu = CreatePopupMenu();
         if menu.is_null() {
-            return 0;
+            return Chosen { id: 0, menu };
         }
         build(menu);
         let _active = shell.map(|s| s.activate(menu));
@@ -392,8 +409,7 @@ pub fn track(owner: HWND, at: POINT, shell: Option<&ShellMenu>, build: impl FnOn
         SetForegroundWindow(owner);
         let choice = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, at.x, at.y, 0, owner, null());
         PostMessageW(owner, WM_NULL, 0, 0);
-        DestroyMenu(menu);
-        choice.max(0) as u32
+        Chosen { id: choice.max(0) as u32, menu }
     }
 }
 

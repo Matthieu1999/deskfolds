@@ -1270,7 +1270,8 @@ fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
     // deskfolds' own Rename and Delete, only where Windows has none: an entry
     // with their ids from elsewhere does nothing.
     let (mut own_rename, mut own_delete) = (false, false);
-    let chosen = crate::shellmenu::track(main, at, shell.as_ref(), |menu| unsafe {
+    // Kept until the chosen entry has run (see `Chosen`).
+    let tracked = crate::shellmenu::track(main, at, shell.as_ref(), |menu| unsafe {
         let add = |id: usize, text: &str| {
             let text = wide(text);
             AppendMenuW(menu, MF_STRING, id, text.as_ptr());
@@ -1291,6 +1292,7 @@ fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
         add(ID_REMOVE, "Remove from folder");
         add(ID_SETTINGS, "Folder settings…");
     });
+    let chosen = tracked.id;
     after_menu();
     let delete = (own_delete && chosen as usize == ID_DELETE) || ids.delete.contains(&chosen);
     let rename = (own_rename && chosen as usize == ID_RENAME) || ids.rename.contains(&chosen);
