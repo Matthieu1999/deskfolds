@@ -286,6 +286,10 @@ impl ShellMenu {
     /// Runs the entry chosen in its popup menu, which must still be there.
     pub fn invoke(&self, owner: HWND, chosen: &Chosen, dir: Option<&Path>, at: POINT) -> bool {
         let id = chosen.id;
+        // Only one of Windows' entries: any other id would be read as a verb's address.
+        if !(FIRST_ID..=LAST_ID).contains(&id) {
+            return false;
+        }
         let dir_w = dir.map(|d| wide(&d.to_string_lossy()));
         let info = InvokeInfo {
             size: std::mem::size_of::<InvokeInfo>() as u32,
