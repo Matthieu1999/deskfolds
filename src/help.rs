@@ -81,8 +81,8 @@ pub const TOPICS: &[Topic] = &[
                 "They go into a folder by themselves if you choose one in Windows integration. For a shortcut for all users, click the notification, then answer Windows.",
             ),
             ("Reorder them", "While the folder is unlocked, drag them within it, or onto another folder."),
-            ("Take one out", "Right-click it > Remove from folder: back on the desktop. Or, while the folder is unlocked, drag it onto the desktop."),
-            ("Its menu", "Right-click it: Windows' menu for its file, then Remove from folder and Folder settings. With [Shift], Windows' extended entries."),
+            ("Take one out", "Right-click it > deskfolds > Remove from folder: back on the desktop. Or, while the folder is unlocked, drag it onto the desktop."),
+            ("Its menu", "Right-click it: Windows' menu for its file, then deskfolds > Remove from folder or Folder settings. With [Shift], Windows' extended entries."),
             (
                 "Delete and Rename",
                 "For a file moved into the folder: Delete sends it to the Recycle Bin, Rename renames it. For a link: Delete only takes it out of the folder and Rename only changes its name here; neither touches the original. Windows' other entries act on the original, as on the desktop.",

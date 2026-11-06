@@ -1245,7 +1245,7 @@ fn drag_item_out(hwnd: HWND, st: &PanelState, index: usize) {
 }
 
 /// Right-click on a shortcut: Windows' menu for its file, as on the desktop,
-/// then deskfolds' Remove from folder and Folder settings. Windows' Delete and
+/// then a « deskfolds » submenu: Remove from folder, Folder settings. Windows' Delete and
 /// Rename are deskfolds' to do:
 /// - a file, folder or shortcut moved into the folder: Delete sends it to the
 ///   Recycle Bin; Rename renames it in place, file and name together;
@@ -1289,8 +1289,19 @@ fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
         if GetMenuItemCount(menu) > 0 {
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
         }
-        add(ID_REMOVE, "Remove from folder");
-        add(ID_SETTINGS, "Folder settings…");
+        // deskfolds' entries in a submenu of their own, after Windows' ones.
+        let sub = crate::shellmenu::own_submenu();
+        if sub.is_null() {
+            add(ID_REMOVE, "Remove from folder");
+            add(ID_SETTINGS, "Folder settings…");
+        } else {
+            for (id, text) in [(ID_REMOVE, "Remove from folder"), (ID_SETTINGS, "Folder settings…")] {
+                let text = wide(text);
+                AppendMenuW(sub, MF_STRING, id, text.as_ptr());
+            }
+            let name = wide("deskfolds");
+            AppendMenuW(menu, MF_POPUP, sub as usize, name.as_ptr());
+        }
     });
     let chosen = tracked.id;
     after_menu();

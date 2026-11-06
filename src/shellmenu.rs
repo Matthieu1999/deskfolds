@@ -13,7 +13,7 @@
 //!
 //! windows-sys has no COM interfaces, so the vtables needed are declared here.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
@@ -185,6 +185,20 @@ thread_local! {
     /// The Windows menu on screen: its IContextMenu3 (or 2), which one, and
     /// the popup menu it is in (ours: its own messages are not forwarded).
     static ACTIVE: Cell<(*mut c_void, u8, HMENU)> = const { Cell::new((null_mut(), 0, null_mut())) };
+    /// deskfolds' own submenus in the menu on screen: Windows' menu is not
+    /// asked about them.
+    static OWN: RefCell<Vec<HMENU>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A submenu of deskfolds' own, for a menu shown by `track` next to Windows'
+/// entries: Windows' menu is never asked to fill or answer for it. It goes
+/// with the menu it is put in. Null if it could not be made.
+pub fn own_submenu() -> HMENU {
+    let menu = unsafe { CreatePopupMenu() };
+    if !menu.is_null() {
+        OWN.with(|o| o.borrow_mut().push(menu));
+    }
+    menu
 }
 
 /// A Windows menu of a folder or a file, ready to go into a popup menu.
@@ -339,8 +353,14 @@ pub fn handle_menu_message(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<L
     }
     let (handler, kind, top) = ACTIVE.get();
     // Only Windows' own submenus go to it: the top menu holds deskfolds'
-    // entries too, and is filled by deskfolds.
-    if handler.is_null() || (msg == WM_INITMENUPOPUP && wparam as HMENU == top) {
+    // entries too, and is filled by deskfolds, as are deskfolds' submenus.
+    let own = |m: HMENU| OWN.with(|o| o.borrow().contains(&m));
+    let ours = match msg {
+        WM_INITMENUPOPUP => wparam as HMENU == top || own(wparam as HMENU),
+        WM_MENUCHAR => own(lparam as HMENU),
+        _ => false,
+    };
+    if handler.is_null() || ours {
         return None;
     }
     unsafe {
@@ -408,11 +428,14 @@ pub fn track(owner: HWND, at: POINT, shell: Option<&ShellMenu>, build: impl FnOn
         if menu.is_null() {
             return Chosen { id: 0, menu };
         }
+        // This menu's own submenus only (a menu from an earlier one may still be open).
+        let earlier_own = OWN.with(|o| std::mem::take(&mut *o.borrow_mut()));
         build(menu);
         let _active = shell.map(|s| s.activate(menu));
         // The owner must be in front, or the menu does not close when clicking elsewhere.
         SetForegroundWindow(owner);
         let choice = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, at.x, at.y, 0, owner, null());
+        OWN.with(|o| *o.borrow_mut() = earlier_own);
         PostMessageW(owner, WM_NULL, 0, 0);
         Chosen { id: choice.max(0) as u32, menu }
     }
