@@ -9,8 +9,8 @@ Panels are locked in place: they don't move unless you unlock them, all of
 them or one by one.
 
 - **Native and light**: one small program, with no framework or runtime to
-  install: [download](#option-a-download-it) one file and run it. About 750 KB
-  on disk, about 5 MB of memory, and no CPU use while idle (it only wakes up
+  install: [download](#option-a-download-it) one file and run it. About 950 KB
+  on disk, under 10 MB of memory, and no CPU use while idle (it only wakes up
   when you use it). See [Size and memory](#size-and-memory).
 - **Locked in place**: panels don't move while locked, and other programs
   cannot move them either.
@@ -511,20 +511,25 @@ change always reaches the right one and the config file stays clean.
 
 ## Size and memory
 
-Measured on Windows 11 at 100 % scaling with 12 folders and 82
-shortcuts. "Memory" is what Task Manager shows (the private working set); the
-working set also counts the Windows libraries shared with other programs.
+Measured on Windows 11 at 100 % scaling. "Memory" is what Task Manager shows
+(the private working set); the working set also counts the Windows libraries
+shared with other programs. The first row is deskfolds 0.6.0 with 18 folders
+and 114 shortcuts; the others are deskfolds 0.5.0 with 12 folders and 82
+shortcuts.
 
 | Situation | Memory | Working set |
 |---|---|---|
-| At rest, folders closed | 4.4 MB | 28 MB |
+| At rest, folders closed (0.6.0) | 8.7 MB | 32 MB |
+| At rest, folders closed (0.5.0) | 4.4 MB | 28 MB |
 | Settings window open, any page | 4.6 MB | 32 MB |
 | Unlocked, with the arrangement's frame | 5.0 MB | 33 MB |
 | After closing the settings window | 5.0 MB | 33 MB |
 
-`deskfolds.exe` is about 750 KB, with the C runtime inside it. At rest it uses no CPU (0 ms over 10
-seconds): it only runs when you move the mouse over a folder, open the menu
-or the settings window, or when Windows tells it the screens changed.
+`deskfolds.exe` is about 950 KB, with the C runtime inside it. At rest it uses no CPU (0 ms over 10
+seconds, also with new desktop shortcuts put away, whose thread sleeps until
+Windows tells it a file appeared): it only runs when you move the mouse over a
+folder, open the menu or the settings window, or when Windows tells it
+something changed.
 
 ## Making a release
 
