@@ -1289,18 +1289,27 @@ fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
         if GetMenuItemCount(menu) > 0 {
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
         }
-        // deskfolds' entries in a submenu of their own, after Windows' ones.
+        // deskfolds' entries in a submenu of their own, after Windows' ones;
+        // in the menu itself if that submenu cannot be made.
+        const ENTRIES: [(usize, &str); 2] = [(ID_REMOVE, "Remove from folder"), (ID_SETTINGS, "Folder settings…")];
         let sub = crate::shellmenu::own_submenu();
-        if sub.is_null() {
-            add(ID_REMOVE, "Remove from folder");
-            add(ID_SETTINGS, "Folder settings…");
-        } else {
-            for (id, text) in [(ID_REMOVE, "Remove from folder"), (ID_SETTINGS, "Folder settings…")] {
+        let mut in_sub = !sub.is_null();
+        if in_sub {
+            for (id, text) in ENTRIES {
                 let text = wide(text);
                 AppendMenuW(sub, MF_STRING, id, text.as_ptr());
             }
             let name = wide("deskfolds");
-            AppendMenuW(menu, MF_POPUP, sub as usize, name.as_ptr());
+            if AppendMenuW(menu, MF_POPUP, sub as usize, name.as_ptr()) == 0 {
+                // Not in the menu: nothing else would destroy it.
+                DestroyMenu(sub);
+                in_sub = false;
+            }
+        }
+        if !in_sub {
+            for (id, text) in ENTRIES {
+                add(id, text);
+            }
         }
     });
     let chosen = tracked.id;

@@ -188,14 +188,17 @@ thread_local! {
     /// deskfolds' own submenus in the menu on screen: Windows' menu is not
     /// asked about them.
     static OWN: RefCell<Vec<HMENU>> = const { RefCell::new(Vec::new()) };
+    /// A menu of `track` is being filled.
+    static BUILDING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// A submenu of deskfolds' own, for a menu shown by `track` next to Windows'
-/// entries: Windows' menu is never asked to fill or answer for it. It goes
-/// with the menu it is put in. Null if it could not be made.
+/// A submenu of deskfolds' own, made while `track` fills its menu, next to
+/// Windows' entries: Windows' menu is never asked to fill or answer for it.
+/// It goes with the menu it is put in. Null if it could not be made.
 pub fn own_submenu() -> HMENU {
     let menu = unsafe { CreatePopupMenu() };
-    if !menu.is_null() {
+    // Outside `track`, no Windows menu is on screen: nothing to keep apart.
+    if !menu.is_null() && BUILDING.get() {
         OWN.with(|o| o.borrow_mut().push(menu));
     }
     menu
@@ -430,7 +433,9 @@ pub fn track(owner: HWND, at: POINT, shell: Option<&ShellMenu>, build: impl FnOn
         }
         // This menu's own submenus only (a menu from an earlier one may still be open).
         let earlier_own = OWN.with(|o| std::mem::take(&mut *o.borrow_mut()));
+        let was_building = BUILDING.replace(true);
         build(menu);
+        BUILDING.set(was_building);
         let _active = shell.map(|s| s.activate(menu));
         // The owner must be in front, or the menu does not close when clicking elsewhere.
         SetForegroundWindow(owner);
