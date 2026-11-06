@@ -9,9 +9,9 @@
 //! Shortcuts installed « for all users » are on the shared desktop, which
 //! usually only an administrator can change. deskfolds tries to move them like
 //! the others; when Windows refuses, a click on the notification asks Windows
-//! for permission, each time: a copy is made in the folder, and a second
-//! deskfolds started with administrator rights only removes the original from
-//! the shared desktop (see `remove_shared`), then quits.
+//! for permission, each time: a copy is made in the folder, and Windows' own
+//! file operation sends the original to the Recycle Bin, with Windows' own
+//! permission prompt. No code of deskfolds ever runs as administrator.
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -23,26 +23,19 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, HANDLE, HWND, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ACTION_ADDED, FILE_ACTION_RENAMED_NEW_NAME, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
-    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    ReadDirectoryChangesW,
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadDirectoryChangesW,
 };
-use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
-use windows_sys::Win32::System::Threading::{CreateEventW, GetExitCodeProcess, INFINITE, SetEvent, WaitForMultipleObjects, WaitForSingleObject};
-use windows_sys::Win32::UI::Shell::{FOLDERID_PublicDesktop, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
-use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, PostMessageW, SW_HIDE, SetTimer, WM_APP};
+use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects};
+use windows_sys::Win32::UI::Shell::FOLDERID_PublicDesktop;
+use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, PostMessageW, SetTimer, WM_APP};
 
 use crate::util::wide;
 
 /// Posted to the main window: new files appeared on a desktop.
 pub const WM_APP_DESKTOP_FILE: u32 = WM_APP + 30;
-/// Posted to the main window: the second deskfolds asked for the shared
-/// desktop is done (or was refused).
-pub const WM_APP_SHARED_DONE: u32 = WM_APP + 31;
 /// The main window's timer that puts the new shortcuts away.
 pub const PUT_AWAY_TIMER: usize = 30;
-/// The argument the second deskfolds is started with, then the file names.
-pub const REMOVE_SHARED_ARG: &str = "--remove-shared";
 /// How long after a shortcut appears it is moved.
 const WAIT: Duration = Duration::from_secs(2);
 
@@ -74,7 +67,7 @@ struct Waiting {
 }
 
 /// A shortcut of the shared desktop copied into a folder while Windows is
-/// asked to remove the original.
+/// asked to move the original to the Recycle Bin.
 struct Asking {
     shared: PathBuf,
     copy: PathBuf,
@@ -86,7 +79,8 @@ thread_local! {
     static WAITING: RefCell<Vec<Waiting>> = const { RefCell::new(Vec::new()) };
     /// Shortcuts of the shared desktop Windows refused to move: (file, folder).
     static REFUSED: RefCell<Vec<(PathBuf, u32)>> = const { RefCell::new(Vec::new()) };
-    static ASKING: RefCell<Vec<Asking>> = const { RefCell::new(Vec::new()) };
+    /// Windows is asking for permission right now.
+    static ASKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While a shortcut is dragged out of a folder (and a moment after), what
     /// appears on the desktop is that shortcut.
     static OUTBOUND: RefCell<Option<(Instant, Option<Instant>)>> = const { RefCell::new(None) };
@@ -118,11 +112,11 @@ pub fn on_shared_desktop(path: &Path) -> bool {
 
 /// Shortcuts of the shared desktop dropped on a folder: moved like the
 /// others when Windows allows it; otherwise Windows is asked at once, as when
-/// the notification is clicked. Returns the errors of the others.
+/// the notification is clicked. Returns the errors. Only shortcuts are given.
 pub fn move_shared_now(main: HWND, panel: u32, files: &[String]) -> Vec<String> {
     let dir = crate::store::with(|s| s.storage_of(panel));
     let (mut moved, mut refused, mut errors) = (Vec::new(), Vec::new(), Vec::new());
-    for file in files {
+    for file in files.iter().filter(|f| is_shortcut(Path::new(f))) {
         match crate::dragdrop::move_file(Path::new(file), &dir) {
             Ok(dest) => moved.push(dest.to_string_lossy().to_string()),
             Err((_, code)) if code == ERROR_ACCESS_DENIED => refused.push((PathBuf::from(file), panel)),
@@ -139,7 +133,7 @@ pub fn move_shared_now(main: HWND, panel: u32, files: &[String]) -> Vec<String> 
     errors
 }
 
-fn is_shortcut(path: &Path) -> bool {
+pub fn is_shortcut(path: &Path) -> bool {
     path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk") || e.eq_ignore_ascii_case("url"))
 }
 
@@ -306,26 +300,30 @@ fn watch_loop(dirs: &[(PathBuf, bool)], main: HWND, stop: HANDLE) {
     }
 }
 
-/// The names of the files added (or renamed to) in a ReadDirectoryChangesW buffer.
+/// The names of the files added (or renamed to) in a ReadDirectoryChangesW
+/// buffer: entries of NextEntryOffset, Action, FileNameLength (u32 each), then
+/// the name. Read field by field, never past `bytes`.
 fn notified_names(buffer: &[u32], bytes: usize) -> Vec<String> {
+    const HEADER: usize = 12;
     let mut names = Vec::new();
+    let bytes = bytes.min(buffer.len() * 4);
     let base = buffer.as_ptr() as *const u8;
+    let u32_at = |at: usize| unsafe { std::ptr::read_unaligned(base.add(at) as *const u32) };
     let mut offset = 0usize;
-    let header = std::mem::offset_of!(FILE_NOTIFY_INFORMATION, FileName);
-    while offset + header <= bytes {
-        let info = unsafe { &*(base.add(offset) as *const FILE_NOTIFY_INFORMATION) };
-        let len = info.FileNameLength as usize / 2;
-        if offset + header + len * 2 > bytes {
+    while offset + HEADER <= bytes {
+        let (next, action, len) = (u32_at(offset) as usize, u32_at(offset + 4), u32_at(offset + 8) as usize / 2);
+        if offset + HEADER + len * 2 > bytes {
             break;
         }
-        if info.Action == FILE_ACTION_ADDED || info.Action == FILE_ACTION_RENAMED_NEW_NAME {
-            let name = unsafe { std::slice::from_raw_parts(info.FileName.as_ptr(), len) };
-            names.push(String::from_utf16_lossy(name));
+        if action == FILE_ACTION_ADDED || action == FILE_ACTION_RENAMED_NEW_NAME {
+            let units: Vec<u16> =
+                (0..len).map(|k| unsafe { std::ptr::read_unaligned(base.add(offset + HEADER + 2 * k) as *const u16) }).collect();
+            names.push(String::from_utf16_lossy(&units));
         }
-        if info.NextEntryOffset == 0 {
+        if next == 0 || next % 4 != 0 {
             break;
         }
-        offset += info.NextEntryOffset as usize;
+        offset += next;
     }
     names
 }
@@ -401,6 +399,10 @@ pub fn on_timer(main: HWND) {
         };
         crate::notify(main, "New shortcut put away", &text, None);
     }
+    if !errors.is_empty() {
+        crate::notify(main, "A new shortcut was not moved", &errors.join("\n"), None);
+    }
+    // Last: a later notification would replace this question.
     if !refused.is_empty() {
         let text = match refused.as_slice() {
             [one] => format!(
@@ -412,9 +414,6 @@ pub fn on_timer(main: HWND) {
         REFUSED.with(|r| *r.borrow_mut() = refused.into_iter().map(|p| (p, panel)).collect());
         crate::notify(main, "Shortcut for all users", &text, Some(crate::Balloon::Shared));
     }
-    if !errors.is_empty() {
-        crate::notify(main, "A new shortcut was not moved", &errors.join("\n"), None);
-    }
 }
 
 /// The notification about shortcuts for all users went away unclicked.
@@ -422,18 +421,17 @@ pub fn forget_refused() {
     REFUSED.with(|r| r.borrow_mut().clear());
 }
 
-/// The notification about shortcuts for all users was clicked: copies them
-/// into their folder and asks Windows to let a second deskfolds remove them
-/// from the shared desktop.
+/// The notification about shortcuts for all users was clicked (or they were
+/// dropped on a folder): each is copied into its folder, then Windows' own
+/// file operation sends the original to the Recycle Bin, asking for permission
+/// with Windows' own prompt. A shortcut still there afterwards (refused, or
+/// "No") stays where it was, and its copy is taken away again.
 pub fn ask_for_shared(main: HWND) {
     // One question at a time: the others wait for their own click.
-    if ASKING.with(|a| !a.borrow().is_empty()) {
+    if ASKING.get() {
         return;
     }
     let refused: Vec<(PathBuf, u32)> = REFUSED.with(|r| std::mem::take(&mut *r.borrow_mut()));
-    if refused.is_empty() {
-        return;
-    }
     let mut asking = Vec::new();
     for (shared, panel) in refused {
         if !shared.is_file() {
@@ -447,59 +445,14 @@ pub fn ask_for_shared(main: HWND) {
     if asking.is_empty() {
         return;
     }
-    let names: Vec<String> = asking.iter().filter_map(|a| a.shared.file_name().map(|n| n.to_string_lossy().to_string())).collect();
-    ASKING.with(|a| *a.borrow_mut() = asking);
-    let Some(exe) = crate::integration::exe_path() else { return finish_shared(main) };
-    let main_raw = main as isize;
-    let spawned = std::thread::Builder::new()
-        .name("shared desktop".into())
-        .spawn(move || {
-            let code = run_elevated(&exe, &names);
-            unsafe { PostMessageW(main_raw as HWND, WM_APP_SHARED_DONE, code.map_or(usize::MAX, |c| c as usize), 0) };
-        })
-        .is_ok();
-    if !spawned {
-        finish_shared(main);
-    }
-}
-
-/// Starts deskfolds with administrator rights to remove `names` from the
-/// shared desktop, and waits for it. Its exit code, or None if Windows (or
-/// the user) refused.
-fn run_elevated(exe: &str, names: &[String]) -> Option<u32> {
-    let params: String = std::iter::once(REMOVE_SHARED_ARG.to_string()).chain(names.iter().map(|n| format!("\"{n}\""))).collect::<Vec<_>>().join(" ");
-    let (verb, file, params) = (wide("runas"), wide(exe), wide(&params));
-    unsafe {
-        CoInitializeEx(null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32);
-        let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
-        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-        info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
-        info.lpVerb = verb.as_ptr();
-        info.lpFile = file.as_ptr();
-        info.lpParameters = params.as_ptr();
-        info.nShow = SW_HIDE;
-        let result = if ShellExecuteExW(&mut info) != 0 && !info.hProcess.is_null() {
-            WaitForSingleObject(info.hProcess, INFINITE);
-            let mut code = 1u32;
-            GetExitCodeProcess(info.hProcess, &mut code);
-            CloseHandle(info.hProcess);
-            Some(code)
-        } else {
-            None
-        };
-        CoUninitialize();
-        result
-    }
-}
-
-/// The second deskfolds is done: each shortcut gone from the shared desktop
-/// stays in its folder; the copy of one still there is taken away again.
-pub fn finish_shared(main: HWND) {
-    let asking: Vec<Asking> = ASKING.with(|a| std::mem::take(&mut *a.borrow_mut()));
+    let originals: Vec<PathBuf> = asking.iter().map(|a| a.shared.clone()).collect();
+    ASKING.set(true);
+    crate::shellmenu::recycle_with_windows(&originals, true);
+    ASKING.set(false);
     let mut kept = Vec::new();
     for a in asking {
         if a.shared.exists() {
-            // Not removed (refused, or "No"): our copy goes, the original stays.
+            // Our own copy goes; the original stays.
             let _ = std::fs::remove_file(&a.copy);
             kept.push(crate::dragdrop::display_name(&a.shared));
         } else {
@@ -508,56 +461,15 @@ pub fn finish_shared(main: HWND) {
         }
     }
     if !kept.is_empty() {
-        let text = format!("{} stays on the desktop: Windows did not allow the move.", kept.iter().map(|n| format!("« {} »", crate::ui::short_name(n, 60))).collect::<Vec<_>>().join(", "));
+        let names: Vec<String> = kept.iter().map(|n| format!("« {} »", crate::ui::short_name(n, 60))).collect();
+        let text = format!("{} stays on the desktop: Windows did not allow the move.", names.join(", "));
         crate::notify(main, "Shortcut for all users", &text, None);
     }
-}
-
-/// A name the second deskfolds may remove from the shared desktop: a plain
-/// .lnk or .url file name, nothing that could reach another folder.
-fn removable_name(name: &str) -> bool {
-    let path = Path::new(name);
-    !name.is_empty()
-        && name.chars().count() <= 255
-        && !name.chars().any(|c| c.is_control() || matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
-        && !name.starts_with('.')
-        && !name.ends_with('.')
-        && !name.ends_with(' ')
-        && path.file_name().is_some_and(|f| f == name)
-        && is_shortcut(path)
-}
-
-/// The second deskfolds, started with administrator rights: removes these
-/// shortcuts from the shared desktop, and nothing else. Returns its exit code.
-pub fn remove_shared(names: &[String]) -> i32 {
-    let Some(dir) = shared_desktop() else { return 2 };
-    let mut failed = 0;
-    for name in names {
-        let path = dir.join(name);
-        let plain_file = std::fs::symlink_metadata(&path).is_ok_and(|m| {
-            use std::os::windows::fs::MetadataExt;
-            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-            m.is_file() && m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
-        });
-        if !removable_name(name) || !plain_file || std::fs::remove_file(&path).is_err() {
-            failed += 1;
-        }
-    }
-    if failed == 0 { 0 } else { 1 }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_plain_shortcut_names_may_be_removed_from_the_shared_desktop() {
-        assert!(removable_name("Photo Editor.lnk"));
-        assert!(removable_name("Site.URL"));
-        for bad in ["", "..\\Windows\\a.lnk", "a\\b.lnk", "C:x.lnk", "a.lnk:stream", "notes.txt", "app.exe", ".lnk", "a.lnk.", "a.lnk ", "x\u{0}.lnk", "a/b.lnk"] {
-            assert!(!removable_name(bad), "{bad:?}");
-        }
-    }
 
     #[test]
     fn added_and_renamed_files_are_read_from_the_notifications() {

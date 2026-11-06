@@ -1127,8 +1127,11 @@ pub fn drop_files(panel_id: u32, index: usize, files: Vec<String>, effect: u32) 
     }
     let link = effect != DROPEFFECT_MOVE;
     // Shortcuts of the shared desktop may need Windows' permission to move.
-    let (shared, files): (Vec<String>, Vec<String>) =
-        if link { (Vec::new(), files) } else { files.into_iter().partition(|f| crate::watch::on_shared_desktop(Path::new(f))) };
+    let (shared, files): (Vec<String>, Vec<String>) = if link {
+        (Vec::new(), files)
+    } else {
+        files.into_iter().partition(|f| crate::watch::is_shortcut(Path::new(f)) && crate::watch::on_shared_desktop(Path::new(f)))
+    };
     let mut errors = store::change(|s| s.add_files(panel_id, index, &files, link));
     if !shared.is_empty() {
         errors.extend(crate::watch::move_shared_now(crate::main_window(), panel_id, &shared));
@@ -1281,7 +1284,10 @@ pub fn item_windows_menu(main: HWND, item_id: u32, at: POINT) {
     let Some((panel_id, item)) = store::with(|s| s.item(item_id).map(|(p, it)| (p, it.clone()))) else { return };
     let path = resolve(&item.path);
     let file = Path::new(&path);
-    let Some(menu) = (file.exists()).then(|| crate::shellmenu::ShellMenu::of_file(main, file)).flatten() else {
+    let stored = store::with(|s| s.is_stored(panel_id, &item));
+    // A link's file is the original: Windows' menu must not delete it.
+    let menu = file.exists().then(|| crate::shellmenu::ShellMenu::of_file(main, file)).flatten().map(|m| if stored { m } else { m.keeping_the_file() });
+    let Some(menu) = menu else {
         error_box(&format!("Windows has no menu for '{}': its file was not found.\n\n{path}", ui::short_name(&item.name, 60)));
         return;
     };
@@ -1297,7 +1303,6 @@ pub fn item_windows_menu(main: HWND, item_id: u32, at: POINT) {
             error_box(&e);
         }
     }
-    let _ = panel_id;
 }
 
 /// A file made by the « New » menu in a folder's storage folder joins the
@@ -1338,10 +1343,12 @@ pub fn check_new_links(main: HWND) {
         if empty(&link.placeholder) {
             let _ = std::fs::remove_file(&link.placeholder);
         }
+        // Only the shortcuts it made: not the files that came into the folder meanwhile.
+        let known = |p: &Path| store::with(|s| s.panels.iter().any(|panel| panel.items.iter().any(|it| Path::new(&it.path) == p)));
         let made: Vec<String> = crate::shellmenu::made(&link.before, &crate::shellmenu::listing(&link.dir))
             .into_iter()
             .chain(std::iter::once(link.placeholder.clone()).filter(|p| p.exists()))
-            .filter(|p| !empty(p))
+            .filter(|p| !empty(p) && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) && !known(p))
             .map(|p| p.to_string_lossy().to_string())
             .collect();
         if !made.is_empty() && store::with(|s| s.panel(link.panel_id).is_some()) {
@@ -1427,24 +1434,32 @@ fn rename_item_file(item: crate::config::Item, panel_id: u32, rect: RECT, font: 
         None => file_name.encode_utf16().count(),
     };
     let Some(typed) = prompt_text(rect, &file_name, font, Some(stem_len)) else { return };
-    let mut new_name = typed.trim().trim_end_matches('.').to_string();
+    // Windows drops trailing dots and spaces from file names: so does this.
+    let mut new_name = typed.trim_end_matches(['.', ' ']).trim().to_string();
     if let Some(e) = &ext
         && std::path::Path::new(&new_name).extension().is_none()
     {
         new_name = format!("{new_name}.{e}");
     }
-    let bad = new_name.is_empty() || new_name.chars().any(|c| c.is_control() || "<>:\"/\\|?*".contains(c));
+    let stem = new_name.split('.').next().unwrap_or("").trim().to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT")) && stem.len() == 4 && stem.ends_with(|c: char| c.is_ascii_digit()));
+    let bad = new_name.is_empty() || reserved || new_name.chars().any(|c| c.is_control() || "<>:\"/\\|?*".contains(c));
     if bad || new_name == file_name {
         return;
     }
     let Some(dir) = path.parent() else { return };
     let dest = dir.join(&new_name);
-    if dest.exists() {
-        error_box(&format!("There is already a file named '{}' in this folder.", ui::short_name(&new_name, 80)));
-        return;
-    }
-    if let Err(e) = std::fs::rename(&path, &dest) {
-        error_box(&format!("'{}' could not be renamed: {e}", ui::short_name(&file_name, 80)));
+    // Never over another file: MoveFileExW without "replace" fails if the name is taken.
+    let (from, to) = (wide(&path.to_string_lossy()), wide(&dest.to_string_lossy()));
+    if unsafe { windows_sys::Win32::Storage::FileSystem::MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+        let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        let text = if code == 80 || code == 183 {
+            format!("There is already a file named '{}' in this folder.", ui::short_name(&new_name, 80))
+        } else {
+            format!("'{}' could not be renamed (Windows error {code}).", ui::short_name(&file_name, 80))
+        };
+        error_box(&text);
         return;
     }
     let (new_path, shown) = (dest.to_string_lossy().to_string(), dragdrop::display_name(&dest));

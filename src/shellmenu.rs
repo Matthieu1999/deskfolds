@@ -19,17 +19,19 @@ use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, S_OK, WPARAM};
 use windows_sys::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, KEY_READ, REG_BINARY, REG_EXPAND_SZ, REG_MULTI_SZ, REG_SZ, RRF_NOEXPAND, RRF_RT_ANY, RegCloseKey,
     RegEnumKeyExW, RegGetValueW, RegOpenKeyExW,
 };
 use windows_sys::Win32::UI::Shell::{
     FOLDERID_CommonTemplates, FOLDERID_Templates, ILCreateFromPathW, ILFree, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOCLOSEPROCESS, SHBindToParent,
-    SHELLEXECUTEINFOW, SHLoadIndirectString, ShellExecuteExW,
+    SHCreateItemFromParsingName, SHELLEXECUTEINFOW, SHLoadIndirectString, ShellExecuteExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, DestroyMenu, HMENU, PostMessageW, SW_SHOWNORMAL, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_NULL,
+    CreatePopupMenu, DeleteMenu, DestroyMenu, GetMenuItemCount, GetMenuItemID, HMENU, MF_BYPOSITION, PostMessageW, SW_SHOWNORMAL,
+    SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_NULL,
 };
 use windows_sys::core::{GUID, HRESULT};
 
@@ -39,6 +41,11 @@ const IID_ICONTEXT_MENU: GUID = GUID::from_u128(0x000214e4_0000_0000_c000_000000
 const IID_ICONTEXT_MENU2: GUID = GUID::from_u128(0x000214f4_0000_0000_c000_000000000046);
 const IID_ICONTEXT_MENU3: GUID = GUID::from_u128(0xbcfce0a0_ec17_11d0_8d10_00a0c90f2719);
 const IID_ISHELL_FOLDER: GUID = GUID::from_u128(0x000214e6_0000_0000_c000_000000000046);
+const CLSID_FILE_OPERATION: GUID = GUID::from_u128(0x3ad05575_8857_4850_9277_11b85bdb8e09);
+const IID_IFILE_OPERATION: GUID = GUID::from_u128(0x947aab5f_0a5c_4c13_b4d6_4bf7836fc9f8);
+const IID_ISHELL_ITEM: GUID = GUID::from_u128(0x43826d1e_e718_42ee_bc55_a1e261c37bfe);
+/// GCS_VERBW: a menu entry's verb, as UTF-16.
+const GCS_VERBW: u32 = 4;
 const CMF_NORMAL: u32 = 0;
 const CMIC_MASK_UNICODE: u32 = 0x4000;
 const CMIC_MASK_PTINVOKE: u32 = 0x2000_0000;
@@ -59,7 +66,33 @@ struct ContextMenuVtbl {
     base: UnknownVtbl,
     query_context_menu: unsafe extern "system" fn(*mut c_void, HMENU, u32, u32, u32, u32) -> HRESULT,
     invoke_command: unsafe extern "system" fn(*mut c_void, *const InvokeInfo) -> HRESULT,
-    get_command_string: usize,
+    get_command_string: unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32, *mut u8, u32) -> HRESULT,
+}
+
+/// IFileOperation, in vtable order.
+#[repr(C)]
+struct FileOperationVtbl {
+    base: UnknownVtbl,
+    advise: usize,
+    unadvise: usize,
+    set_operation_flags: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT,
+    set_progress_message: usize,
+    set_progress_dialog: usize,
+    set_properties: usize,
+    set_owner_window: usize,
+    apply_properties_to_item: usize,
+    apply_properties_to_items: usize,
+    rename_item: usize,
+    rename_items: usize,
+    move_item: usize,
+    move_items: usize,
+    copy_item: usize,
+    copy_items: usize,
+    delete_item: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT,
+    delete_items: usize,
+    new_item: usize,
+    perform_operations: unsafe extern "system" fn(*mut c_void) -> HRESULT,
+    get_any_operations_aborted: usize,
 }
 
 #[repr(C)]
@@ -153,12 +186,31 @@ pub struct ShellMenu {
     menu: Com,
     /// IContextMenu3 or IContextMenu2, for the submenus (« New », « Send to »).
     handler: Option<(Com, u8)>,
+    /// Without the entries that delete, cut or rename the file.
+    keep_file: bool,
 }
 
 impl ShellMenu {
     fn new(menu: Com) -> Self {
         let handler = menu.query(&IID_ICONTEXT_MENU3).map(|m| (m, 3)).or_else(|| menu.query(&IID_ICONTEXT_MENU2).map(|m| (m, 2)));
-        Self { menu, handler }
+        Self { menu, handler, keep_file: false }
+    }
+
+    /// For a shortcut that is only a link to its file: Windows' menu leaves
+    /// that file alone (no Delete, Cut or Rename), as the file is not the
+    /// folder's but the original.
+    pub fn keeping_the_file(mut self) -> Self {
+        self.keep_file = true;
+        self
+    }
+
+    /// The verb of one of its entries ("delete", "open"...), if it has one.
+    fn verb(&self, id: u32) -> Option<String> {
+        let mut buf = [0u16; 64];
+        let get = self.menu.vtbl::<ContextMenuVtbl>().get_command_string;
+        let ok = unsafe { get(self.menu.0, (id - FIRST_ID) as usize, GCS_VERBW, null_mut(), buf.as_mut_ptr() as *mut u8, buf.len() as u32) } == S_OK;
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
+        (ok && len > 0).then(|| String::from_utf16_lossy(&buf[..len]).to_lowercase())
     }
 
     /// The full Windows menu of the file or folder at `path`.
@@ -188,7 +240,16 @@ impl ShellMenu {
     /// Adds its entries to `menu` at `index`, with ids from FIRST_ID on.
     pub fn fill(&self, menu: HMENU, index: u32) -> bool {
         let query = self.menu.vtbl::<ContextMenuVtbl>().query_context_menu;
-        unsafe { query(self.menu.0, menu, index, FIRST_ID, LAST_ID, CMF_NORMAL) >= 0 }
+        let filled = unsafe { query(self.menu.0, menu, index, FIRST_ID, LAST_ID, CMF_NORMAL) >= 0 };
+        if filled && self.keep_file {
+            for pos in (0..unsafe { GetMenuItemCount(menu) }.max(0)).rev() {
+                let id = unsafe { GetMenuItemID(menu, pos) };
+                if (FIRST_ID..=LAST_ID).contains(&id) && self.verb(id).is_some_and(|v| matches!(v.as_str(), "delete" | "cut" | "rename")) {
+                    unsafe { DeleteMenu(menu, pos as u32, MF_BYPOSITION) };
+                }
+            }
+        }
+        filled
     }
 
     /// Runs one of its entries, chosen in the popup menu.
@@ -377,6 +438,12 @@ fn indirect(text: &str) -> String {
     String::from_utf16_lossy(&buf[..len])
 }
 
+/// A plain file extension: a dot, then a few letters, digits or "_+-". The
+/// registry is the user's to change: nothing else may reach a file name.
+fn plain_ext(ext: &str) -> bool {
+    ext.strip_prefix('.').is_some_and(|e| (1..=16).contains(&e.len()) && e.chars().all(|c| c.is_ascii_alphanumeric() || "_+-".contains(c)))
+}
+
 /// The types Explorer's « New » menu lists, as Explorer last found them, or
 /// as found in the registry when Explorer has not listed them yet.
 fn new_extensions() -> Vec<String> {
@@ -474,7 +541,7 @@ pub fn new_kinds() -> Vec<NewKind> {
     ];
     let mut types: Vec<NewKind> = new_extensions()
         .into_iter()
-        .filter(|e| e.starts_with('.') && !e.eq_ignore_ascii_case(".lnk"))
+        .filter(|e| plain_ext(e) && !e.eq_ignore_ascii_case(".lnk"))
         .filter_map(|e| kind_of(&e))
         .collect();
     types.sort_by_key(|k| k.label.to_lowercase());
@@ -498,6 +565,10 @@ fn new_name(kind: &NewKind) -> String {
 pub fn make_new(dir: &Path, kind: &NewKind) -> Result<Made, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
     let path = crate::dragdrop::free_name(dir, std::ffi::OsStr::new(&new_name(kind)));
+    // Only ever a file of that folder.
+    if path.parent() != Some(dir) {
+        return Err(format!("Cannot make a file named {}.", path.display()));
+    }
     let fail = |e: std::io::Error| format!("Cannot make {}: {e}", path.display());
     let create = |bytes: &[u8]| -> Result<(), String> {
         use std::io::Write;
@@ -529,7 +600,12 @@ pub fn make_new(dir: &Path, kind: &NewKind) -> Result<Made, String> {
 
 /// Opens Windows' « Create Shortcut » window for the empty shortcut `link`.
 fn create_shortcut_window(link: &Path) -> Option<HANDLE> {
-    let exe = wide(&crate::util::expand_env("%SystemRoot%\\System32\\rundll32.exe"));
+    let mut system = [0u16; 260];
+    let n = unsafe { GetSystemDirectoryW(system.as_mut_ptr(), system.len() as u32) } as usize;
+    if n == 0 || n >= system.len() {
+        return None;
+    }
+    let exe = wide(&format!("{}\\rundll32.exe", String::from_utf16_lossy(&system[..n])));
     let params = wide(&format!("appwiz.cpl,NewLinkHere {}", link.display()));
     let dir = link.parent().map(|d| wide(&d.to_string_lossy()));
     unsafe {
@@ -541,6 +617,42 @@ fn create_shortcut_window(link: &Path) -> Option<HANDLE> {
         info.lpDirectory = dir.as_ref().map_or(null(), |d| d.as_ptr());
         info.nShow = SW_SHOWNORMAL;
         (ShellExecuteExW(&mut info) != 0 && !info.hProcess.is_null()).then_some(info.hProcess)
+    }
+}
+
+/// Sends files to the Recycle Bin (`recycle`; otherwise deletes them) with
+/// Windows' own file operation, as Explorer does. When the user may not
+/// change them, Windows asks for permission with its own prompt, and does it
+/// with its own rights: no code of deskfolds runs as administrator. Check
+/// afterwards which files are gone.
+pub fn recycle_with_windows(files: &[PathBuf], recycle: bool) {
+    const FOF_SILENT: u32 = 0x4;
+    const FOF_NOCONFIRMATION: u32 = 0x10;
+    const FOF_ALLOWUNDO: u32 = 0x40;
+    const FOF_NOERRORUI: u32 = 0x400;
+    const FOFX_SHOWELEVATIONPROMPT: u32 = 0x0004_0000;
+    const FOFX_RECYCLEONDELETE: u32 = 0x0008_0000;
+    unsafe {
+        let mut object = null_mut();
+        if CoCreateInstance(&CLSID_FILE_OPERATION, null_mut(), CLSCTX_INPROC_SERVER, &IID_IFILE_OPERATION, &mut object) != S_OK || object.is_null() {
+            return;
+        }
+        let op = Com(object);
+        let vt = op.vtbl::<FileOperationVtbl>();
+        let undo = if recycle { FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE } else { 0 };
+        (vt.set_operation_flags)(op.0, FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOFX_SHOWELEVATIONPROMPT | undo);
+        let mut any = false;
+        for file in files {
+            let path = wide(&file.to_string_lossy());
+            let mut item = null_mut();
+            if SHCreateItemFromParsingName(path.as_ptr(), null_mut(), &IID_ISHELL_ITEM, &mut item) == S_OK && !item.is_null() {
+                let item = Com(item);
+                any |= (vt.delete_item)(op.0, item.0, null_mut()) == S_OK;
+            }
+        }
+        if any {
+            (vt.perform_operations)(op.0);
+        }
     }
 }
 
@@ -582,6 +694,26 @@ mod tests {
         let made = make_new(&base, &zip).unwrap();
         assert_eq!(std::fs::read(&made.path).unwrap(), [0x50, 0x4b, 5, 6]);
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn only_plain_extensions_name_new_files() {
+        assert!(plain_ext(".docx") && plain_ext(".library-ms") && plain_ext(".c++"));
+        for bad in ["docx", ".", ".x\\..\\..\\foo", ".a b", ".a:b", ".abcdefghijklmnopq"] {
+            assert!(!plain_ext(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn windows_file_operation_deletes_a_file() {
+        unsafe { windows_sys::Win32::System::Com::CoInitializeEx(null(), windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32) };
+        let dir = std::env::temp_dir().join(format!("deskfolds-fileop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.lnk");
+        std::fs::write(&file, b"x").unwrap();
+        recycle_with_windows(std::slice::from_ref(&file), false);
+        assert!(!file.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

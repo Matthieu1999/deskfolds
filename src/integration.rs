@@ -33,6 +33,8 @@ const DESKTOP_MENU_KEY: &str = "Software\\Classes\\DesktopBackground\\Shell\\des
 pub const DESKTOP_MENU_TEXT: &str = "New deskfolds folder";
 /// The argument the desktop menu entry starts deskfolds with.
 pub const NEW_FOLDER_ARG: &str = "--new-folder";
+/// Followed by a folder: deskfolds uses it as APPDATA (a test copy's entries).
+pub const APPDATA_ARG: &str = "--appdata";
 
 #[repr(C)]
 struct UnknownVtbl {
@@ -53,7 +55,7 @@ struct ShellLinkVtbl {
     get_working_directory: usize,
     set_working_directory: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
     get_arguments: usize,
-    set_arguments: usize,
+    set_arguments: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
     get_hotkey: usize,
     set_hotkey: usize,
     get_show_cmd: usize,
@@ -125,15 +127,27 @@ pub fn usual_copy() -> bool {
     crate::dragdrop::roaming_app_data().is_none_or(|d| Some(canon(&d)) == our_root)
 }
 
+/// FNV-1a: the same value for the same text in every build of deskfolds.
+fn stable_hash(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
 /// A short name that tells this copy from the usual one, from its config
 /// folder; None for the usual copy.
 pub fn copy_suffix() -> Option<String> {
     if usual_copy() {
         return None;
     }
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(&crate::config::app_dir().to_string_lossy().to_lowercase(), &mut h);
-    Some(format!("{:016x}", std::hash::Hasher::finish(&h)))
+    Some(format!("{:016x}", stable_hash(&crate::config::app_dir().to_string_lossy().to_lowercase())))
+}
+
+/// What deskfolds adds to Windows starts it with these arguments: none for
+/// the usual copy; a test copy gives its APPDATA, so it starts as itself.
+pub fn launch_args() -> String {
+    match (usual_copy(), crate::config::app_dir().parent()) {
+        (false, Some(root)) => format!("{APPDATA_ARG} \"{}\"", root.display()),
+        _ => String::new(),
+    }
 }
 
 // ---- The Start menu ----
@@ -185,9 +199,14 @@ fn write_start_menu(link: &Path, exe: &str) -> Result<(), String> {
     let target = wide(exe);
     let dir = wide(&Path::new(exe).parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default());
     let description = wide("Tiny foldable shortcut panels for the desktop");
+    let args = launch_args();
     unsafe {
         if (vt.set_path)(shell_link.0, target.as_ptr()) != S_OK {
             return Err(fail("path"));
+        }
+        if !args.is_empty() {
+            let args = wide(&args);
+            (vt.set_arguments)(shell_link.0, args.as_ptr());
         }
         (vt.set_working_directory)(shell_link.0, dir.as_ptr());
         (vt.set_description)(shell_link.0, description.as_ptr());
@@ -226,7 +245,13 @@ fn desktop_menu_key() -> String {
 }
 
 fn desktop_menu_command(exe: &str) -> String {
-    format!("\"{exe}\" {NEW_FOLDER_ARG}")
+    let args = launch_args();
+    if args.is_empty() { format!("\"{exe}\" {NEW_FOLDER_ARG}") } else { format!("\"{exe}\" {args} {NEW_FOLDER_ARG}") }
+}
+
+/// The program a command starts: its first quoted part.
+fn command_exe(command: &str) -> Option<&str> {
+    command.strip_prefix('"')?.split('"').next()
 }
 
 fn read_value(key: &str, name: Option<&str>) -> Option<String> {
@@ -295,18 +320,20 @@ pub fn set_desktop_menu(on: bool) -> Result<(), String> {
     }
 }
 
-/// At start: what deskfolds added to Windows opens this deskfolds.exe, even
-/// after it was moved.
+/// At start: what deskfolds added to Windows follows deskfolds.exe when it
+/// was moved. Only then: while the deskfolds it opens is still there, another
+/// copy (an old download, for example) never takes it over.
 pub fn refresh() {
     let Some(exe) = exe_path() else { return };
+    let gone = |target: &str| !Path::new(target).is_file();
     if let Some(link) = start_menu_link()
         && link.is_file()
-        && link_target(&link).is_none_or(|t| !same_path(&t, &exe))
+        && link_target(&link).is_some_and(|t| gone(&t) && !same_path(&t, &exe))
     {
         let _ = write_start_menu(&link, &exe);
     }
     let command = read_value(&format!("{}\\command", desktop_menu_key()), None);
-    if command.is_some_and(|c| c != desktop_menu_command(&exe)) {
+    if command.as_deref().and_then(command_exe).is_some_and(gone) {
         write_desktop_menu(&exe);
     }
 }
@@ -317,6 +344,15 @@ mod tests {
 
     #[test]
     fn the_desktop_menu_starts_this_exe_with_the_new_folder_argument() {
+        // The tests run as the usual copy: no APPDATA is given.
         assert_eq!(desktop_menu_command("C:\\Apps\\deskfolds.exe"), "\"C:\\Apps\\deskfolds.exe\" --new-folder");
+        assert_eq!(command_exe("\"C:\\A b\\deskfolds.exe\" --appdata \"C:\\x\" --new-folder"), Some("C:\\A b\\deskfolds.exe"));
+        assert_eq!(command_exe("deskfolds.exe"), None);
+    }
+
+    #[test]
+    fn copy_names_are_the_same_in_every_build() {
+        assert_eq!(stable_hash(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(stable_hash("a"), 0xaf63_dc4c_8601_ec8c);
     }
 }

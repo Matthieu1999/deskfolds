@@ -835,10 +835,6 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 watch::on_found(hwnd);
                 0
             }
-            watch::WM_APP_SHARED_DONE => {
-                watch::finish_shared(hwnd);
-                0
-            }
             WM_APP_REFRESH => {
                 // While a shortcut is dragged out of a panel, the drag's end posts this again.
                 if !panel::dragging() {
@@ -928,10 +924,14 @@ fn send_new_folder(at: POINT) {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // The second deskfolds asked for with administrator rights: it only
-    // removes shortcuts from the shared desktop, then quits.
-    if args.first().map(String::as_str) == Some(watch::REMOVE_SHARED_ARG) {
-        std::process::exit(watch::remove_shared(&args[1..]));
+    // A copy with its own APPDATA (a test copy), started by what it added to
+    // Windows: it gives its folder, so it starts as itself.
+    if let Some(i) = args.iter().position(|a| a == integration::APPDATA_ARG)
+        && let Some(dir) = args.get(i + 1)
+        && std::path::Path::new(dir).is_absolute()
+    {
+        // Nothing else runs yet: no other thread reads the environment.
+        unsafe { std::env::set_var("APPDATA", dir) };
     }
     let new_folder_asked = args.iter().any(|a| a == integration::NEW_FOLDER_ARG);
     unsafe {

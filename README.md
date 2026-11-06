@@ -261,8 +261,8 @@ update: they are in `%APPDATA%\deskfolds`, not in the program.
 | Take a folder out of the arrangement, or add one | While unlocked, drag it out of the frame (it stays where you drop it) or into it; hold **Alt** to drop it over the frame and keep it out. Or tick **In the arrangement** in Settings > Folders, or use **Choose…** in Settings > Layout |
 | Add a shortcut | Drag a file, folder or shortcut onto a panel (a closed panel opens) or onto the shortcut list in Settings. It is **moved** into the folder's storage folder; hold **Ctrl** to keep it where it is and only add a link. Works even while locked. Settings > **Add…** adds links |
 | Make a new file in a folder | Right-click the folder > **New**: Windows' own menu (folder, shortcut, text document, Word document…, as on the desktop). It is made in the folder's storage folder and joins the folder, its name ready to type. **Shortcut** opens Windows' **Create Shortcut** window |
-| A shortcut's Windows menu | Right-click it > **Show more options**: the menu Windows shows for its file (Open file location, Run as administrator, Properties…) |
-| Put new desktop shortcuts away | Settings > Windows integration > **New desktop shortcuts**: pick a folder, or a new one, **New apps**. A shortcut that appears on the desktop from then on (from an installer, for example) moves into it 2 seconds later, with a notification. A shortcut for all users is on the shared desktop, which usually only an administrator can change: click the notification, and Windows asks for your permission, each time. A shortcut deskfolds puts back on the desktop is never taken again |
+| A shortcut's Windows menu | Right-click it > **Show more options**: the menu Windows shows for its file (Open file location, Run as administrator, Properties…). For a shortcut that only links to a file, that menu has no Delete, Cut or Rename: the file is the original, not the folder's |
+| Put new desktop shortcuts away | Settings > Windows integration > **New desktop shortcuts**: pick a folder, or a new one, **New apps**. A shortcut that appears on the desktop from then on (from an installer, for example) moves into it 2 seconds later, with a notification. A shortcut for all users is on the shared desktop, which usually only an administrator can change: click the notification (or drag it onto a folder), and Windows asks for your permission, each time; the original goes to the Recycle Bin. A shortcut deskfolds puts back on the desktop is never taken again |
 | Edit a shortcut | Settings > Folders: select it, then change its name, arguments or icon |
 | Edit panels on the desktop | Menu > **Unlock all folders (move and edit)**, or Settings > Folders > **Move on the desktop**: every panel gets a blue border and opens when you hover it (Settings > Layout can open them all instead) |
 | Unlock one folder | Right-click it > **Unlock '…' (move and edit)**: only that folder gets a blue border, stays open, and can be moved, resized and edited. Right-click it > **Lock '…'** when you are done. Everything is locked again when deskfolds starts |
@@ -455,11 +455,17 @@ New desktop shortcuts (`src/watch.rs`): only while the option is on, a thread
 waits for Windows to tell it about new files on the desktop and on the shared
 desktop (`ReadDirectoryChangesW`); it uses no CPU meanwhile. When Windows
 refuses to move a shortcut of the shared desktop, a click on the notification
-copies it into the folder, then starts deskfolds again with administrator
-rights (`runas`) and `--remove-shared` and the file names. That copy only
-deletes plain `.lnk` and `.url` files directly in the shared desktop, then
-quits; if it is refused or fails, the copy is taken away and the shortcut
-stays where it was.
+(or dropping it on a folder) copies it into the folder, then hands the
+original to Windows' own file operation (`IFileOperation`), which sends it to
+the Recycle Bin and asks for permission with Windows' own prompt, as Explorer
+does. No code of deskfolds runs as administrator. If Windows is refused, the
+copy is taken away again and the shortcut stays where it was.
+
+A copy of deskfolds started with another `APPDATA` (a test copy) keeps to
+itself: its Start menu shortcut goes under that `APPDATA`, its desktop menu
+entry and its **Start with Windows** entry have names of their own and start
+it with `--appdata "<folder>"`, and it watches a `Desktop` and a `Public
+Desktop` folder of its own.
 
 The data lives in one store (`src/store.rs`) that every change goes through:
 panels, drag and drop and the settings window all call it, and it tells the

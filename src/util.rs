@@ -235,7 +235,10 @@ pub fn set_autostart(enabled: bool) {
     unsafe {
         if enabled {
             let Ok(exe) = std::env::current_exe() else { return };
-            let data = wide(&format!("\"{}\"", exe.display()));
+            // A test copy gives its APPDATA, so it starts as itself.
+            let args = crate::integration::launch_args();
+            let command = if args.is_empty() { format!("\"{}\"", exe.display()) } else { format!("\"{}\" {args}", exe.display()) };
+            let data = wide(&command);
             RegSetKeyValueW(
                 HKEY_CURRENT_USER,
                 key.as_ptr(),
