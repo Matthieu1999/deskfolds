@@ -687,6 +687,14 @@ fn show_menu(main: HWND, panel: Option<u32>, item: Option<u32>) {
     });
     let more = item_name.as_ref().map(|n| format!("Show more options for '{n}'"));
     let mut entries: Vec<MenuEntry> = Vec::new();
+    // Shortcuts for all users wait for their question: here too, at the top,
+    // in case another notification hid it.
+    let waiting = watch::refused_waiting();
+    let shared_label =
+        if waiting == 1 { "Move 1 shortcut for all users…".to_string() } else { format!("Move {waiting} shortcuts for all users…") };
+    if waiting > 0 {
+        entries.extend([(ID_SHARED, shared_label.as_str(), 0), ui::SEPARATOR]);
+    }
     if let Some(more) = &more {
         entries.extend([(ID_ITEM_MORE, more.as_str(), 0), ui::SEPARATOR]);
     }
@@ -700,11 +708,6 @@ fn show_menu(main: HWND, panel: Option<u32>, item: Option<u32>) {
     let lock_label = if any_unlocked() { "Lock all folders" } else { "Unlock all folders (move and edit)" };
     // Shortcuts for all users wait for their question: here too, in case
     // another notification hid it.
-    let waiting = watch::refused_waiting();
-    let shared_label = format!("Move {waiting} shortcut(s) for all users…");
-    if waiting > 0 {
-        entries.extend([(ID_SHARED, shared_label.as_str(), 0), ui::SEPARATOR]);
-    }
     if labels.is_some() {
         entries.extend([(ID_LOCK, lock_label, 0), ui::SEPARATOR, (ID_SETTINGS, "Settings…", 0), (ID_NEW_FOLDER, "New folder", 0)]);
     } else {

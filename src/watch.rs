@@ -96,6 +96,8 @@ thread_local! {
     static ASKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The copies made in folders while Windows is asked: not new files.
     static COPIES: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    /// A question about shortcuts for all users was shown while Windows was asking.
+    static ASKED_MEANWHILE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While a shortcut is dragged out of a folder (and a moment after), what
     /// appears on the desktop is that shortcut.
     static OUTBOUND: RefCell<Option<(Instant, Option<Instant>)>> = const { RefCell::new(None) };
@@ -136,7 +138,9 @@ fn shared_shortcut(path: &Path) -> Option<PathBuf> {
     if canon.parent()? != std::fs::canonicalize(&dir).ok()?.as_path() {
         return None;
     }
-    let real = dir.join(canon.file_name()?);
+    // The resolved path itself: no link left on the way to the file.
+    let text = canon.to_string_lossy();
+    let real = PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text));
     (is_shortcut(&real) && real.is_file() && !reparse_or_missing(&real)).then_some(real)
 }
 
@@ -167,9 +171,14 @@ pub fn refused_waiting() -> usize {
     REFUSED.with(|r| r.borrow().len())
 }
 
-/// The shared desktop is a folder only Windows or an administrator owns. A
-/// folder of the user (a test copy's) never gets Windows' permission prompt:
-/// someone could change it while the prompt is open.
+/// The shared desktop, and every folder above it, are owned by Windows or an
+/// administrator. A folder of the user (a test copy's) never gets Windows'
+/// permission prompt: someone could change it while the prompt is open.
+fn protected_folder(dir: &Path) -> bool {
+    dir.ancestors().all(owned_by_windows)
+}
+
+/// The folder is owned by SYSTEM, the Administrators or TrustedInstaller.
 fn owned_by_windows(dir: &Path) -> bool {
     use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
     use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT};
@@ -197,6 +206,9 @@ fn owned_by_windows(dir: &Path) -> bool {
 
 /// The notification that asks to click it, for the shortcuts waiting.
 fn notify_refused(main: HWND) {
+    if ASKING.get() {
+        ASKED_MEANWHILE.set(true);
+    }
     let (count, first, panel) = REFUSED.with(|r| {
         let r = r.borrow();
         (r.len(), r.first().map(|(p, _)| crate::dragdrop::display_name(p)), r.first().map(|(_, id)| *id))
@@ -388,6 +400,10 @@ fn watch_loop(dirs: &[(PathBuf, bool)], main: HWND, stop: HANDLE) {
         let mut bytes = 0u32;
         let done = unsafe { GetOverlappedResult(w.handle, &*w.overlapped, &mut bytes, 0) } != 0;
         let mut found = Vec::new();
+        // Lost events (too many at once): a rename's old name may be gone too.
+        if !done || bytes == 0 {
+            w.renamed_from = None;
+        }
         if done && bytes > 0 {
             for (name, old) in notified_names(&w.buffer, bytes as usize, &mut w.renamed_from) {
                 let path = w.dir.join(name);
@@ -581,13 +597,14 @@ pub fn ask_dropped(main: HWND) {
 
 fn ask_windows(main: HWND, list: Vec<(PathBuf, u32)>) {
     let waiting_before = refused_waiting();
+    ASKED_MEANWHILE.set(false);
     let mut asking = Vec::new();
-    let mut kept = Vec::new();
+    let (mut kept, mut not_asked) = (Vec::new(), Vec::new());
     for (shared, panel) in list {
         // Checked again: the file and its folder, as they are now.
         let Some(shared) = shared_shortcut(&shared) else { continue };
-        if !shared.parent().is_some_and(owned_by_windows) {
-            kept.push(crate::dragdrop::display_name(&shared));
+        if !shared.parent().is_some_and(protected_folder) {
+            not_asked.push(crate::dragdrop::display_name(&shared));
             continue;
         }
         let Some(dir) = crate::store::with(|s| s.panel(panel).is_some().then(|| s.storage_of(panel))) else { continue };
@@ -625,14 +642,18 @@ fn ask_windows(main: HWND, list: Vec<(PathBuf, u32)>) {
             crate::notify(main, "Shortcut for all users", &text, None);
         }
     }
+    let names = |list: &[String]| list.iter().map(|n| format!("« {} »", crate::ui::short_name(n, 60))).collect::<Vec<_>>().join(", ");
     if !kept.is_empty() {
-        let names: Vec<String> = kept.iter().map(|n| format!("« {} »", crate::ui::short_name(n, 60))).collect();
-        let text = format!("{} stays on the desktop: Windows did not allow the move.", names.join(", "));
+        let text = format!("{} stays on the desktop: Windows did not allow the move.", names(&kept));
         crate::notify(main, "Shortcut for all users", &text, None);
     }
-    // Shortcuts that came while Windows was asking get their own question;
-    // shortcuts dropped meanwhile are asked about now.
-    if refused_waiting() > waiting_before {
+    if !not_asked.is_empty() {
+        let text = format!("{} stays on the desktop: its desktop folder is not one only Windows can change, so Windows was not asked.", names(&not_asked));
+        crate::notify(main, "Shortcut for all users", &text, None);
+    }
+    // Shortcuts that came while Windows was asking get their own question,
+    // unless it was already shown; shortcuts dropped meanwhile are asked about now.
+    if refused_waiting() > waiting_before && !ASKED_MEANWHILE.get() {
         notify_refused(main);
     }
     if DROPPED.with(|d| !d.borrow().is_empty()) {
@@ -689,10 +710,12 @@ mod tests {
 
     #[test]
     fn only_folders_windows_owns_get_its_permission_prompt() {
-        assert!(owned_by_windows(Path::new(&crate::util::expand_env("%SystemRoot%"))));
+        assert!(protected_folder(Path::new(&crate::util::expand_env("%SystemRoot%\\System32"))));
         let mine = std::env::temp_dir().join(format!("deskfolds-owner-{}", std::process::id()));
         std::fs::create_dir_all(&mine).unwrap();
-        assert!(!owned_by_windows(&mine));
+        // Run as administrator, new folders belong to the Administrators.
+        let elevated = owned_by_windows(&mine);
+        assert!(elevated || !protected_folder(&mine));
         std::fs::remove_dir_all(&mine).unwrap();
     }
 }

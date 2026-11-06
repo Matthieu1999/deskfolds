@@ -1303,7 +1303,8 @@ pub fn item_windows_menu(main: HWND, item_id: u32, at: POINT) {
     };
     let chosen = crate::shellmenu::track(main, at, Some((&menu, 0)), |_| {});
     after_menu();
-    if chosen >= crate::shellmenu::FIRST_ID {
+    // Only one of Windows' entries, in the range it was given.
+    if (crate::shellmenu::FIRST_ID..=crate::shellmenu::LAST_ID).contains(&chosen) {
         menu.invoke(main, chosen, file.parent(), at);
         // Deleted, or moved away, with Windows' menu: the shortcut goes too.
         if !file.exists()

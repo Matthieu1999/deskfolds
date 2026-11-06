@@ -52,7 +52,7 @@ const CMIC_MASK_PTINVOKE: u32 = 0x2000_0000;
 
 /// The command ids Windows' menus get: ours stay below.
 pub const FIRST_ID: u32 = 0x1000;
-const LAST_ID: u32 = 0x7fff;
+pub const LAST_ID: u32 = 0x7fff;
 
 #[repr(C)]
 struct UnknownVtbl {
@@ -243,20 +243,24 @@ impl ShellMenu {
     /// Adds its entries to `menu` at `index`, with ids from FIRST_ID on.
     pub fn fill(&self, menu: HMENU, index: u32) -> bool {
         let query = self.menu.vtbl::<ContextMenuVtbl>().query_context_menu;
+        let count_before = unsafe { GetMenuItemCount(menu) }.max(0);
         let filled = unsafe { query(self.menu.0, menu, index, FIRST_ID, LAST_ID, CMF_NORMAL) >= 0 };
+        // Windows' entries are the ones it added, at `index`.
+        let added = unsafe { GetMenuItemCount(menu) }.max(0) - count_before;
+        let windows_part = index as i32..index as i32 + added.max(0);
         if filled && self.keep_file {
             const KEEP: [&str; 16] = [
                 "open", "opennew", "opennewwindow", "opennewtab", "explore", "openas", "edit", "print", "printto", "runas", "runasuser", "copy",
                 "copyaspath", "properties", "pintostartscreen", "pintohome",
             ];
             unsafe {
-                // Windows' submenus (Send to, Open with...) and its entries with no
-                // known verb go; ours (ids below FIRST_ID) and the lines stay.
-                for pos in (0..GetMenuItemCount(menu).max(0)).rev() {
+                // Of what Windows added: its submenus (Send to, Open with...) and
+                // its entries with no allowed verb go (an id past LAST_ID too);
+                // the lines stay for now. Our own entries are not touched.
+                for pos in windows_part.rev() {
                     let id = GetMenuItemID(menu, pos);
-                    let submenu = id == u32::MAX;
-                    let windows_entry = (FIRST_ID..=LAST_ID).contains(&id);
-                    if submenu || (windows_entry && !self.verb(id).is_some_and(|v| KEEP.contains(&v.as_str()))) {
+                    let line = id == 0;
+                    if !line && !self.verb(id).is_some_and(|v| KEEP.contains(&v.as_str())) {
                         DeleteMenu(menu, pos as u32, MF_BYPOSITION);
                     }
                 }
