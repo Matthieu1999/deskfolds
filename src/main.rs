@@ -706,8 +706,6 @@ fn show_menu(main: HWND, panel: Option<u32>, item: Option<u32>) {
         }
     }
     let lock_label = if any_unlocked() { "Lock all folders" } else { "Unlock all folders (move and edit)" };
-    // Shortcuts for all users wait for their question: here too, in case
-    // another notification hid it.
     if labels.is_some() {
         entries.extend([(ID_LOCK, lock_label, 0), ui::SEPARATOR, (ID_SETTINGS, "Settings…", 0), (ID_NEW_FOLDER, "New folder", 0)]);
     } else {
