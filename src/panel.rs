@@ -29,7 +29,7 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_MENU,
+    GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_MENU, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -37,7 +37,7 @@ use crate::config::{FULL_NAME_LINES, MIN_WIDTH, PANEL_PAD, Panel, Settings, Titl
 use crate::dragdrop::{self, DropHandler};
 use crate::layout;
 use crate::store::{self, WM_APP_REFRESH};
-use crate::ui::{self, MenuEntry};
+use crate::ui;
 use crate::util::{error_box, launch, load_icon, prompt_text, resolve, wide};
 
 const CLASS_NAME: &str = "deskfolds.panel";
@@ -60,10 +60,9 @@ const BIG_ICON: i32 = 24;
 const PIN_ROOM: i32 = 14;
 /// A moved folder snaps to an edge closer than this.
 const SNAP_REACH: i32 = 10;
-const ID_RENAME: usize = 1;
-const ID_REMOVE: usize = 2;
-const ID_SETTINGS: usize = 3;
-const ID_MORE: usize = 4;
+/// deskfolds' entries at the end of a shortcut's Windows menu.
+const ID_REMOVE: usize = 1;
+const ID_SETTINGS: usize = 2;
 /// The main window's timer that waits for Windows' « Create Shortcut » window.
 pub const NEW_LINK_TIMER: usize = 40;
 /// Icon shown next to the name when the panel sets none: any folder works.
@@ -1242,77 +1241,107 @@ fn drag_item_out(hwnd: HWND, st: &PanelState, index: usize) {
     unsafe { PostMessageW(main, WM_APP_REFRESH, 0, 0) };
 }
 
-/// Right-click menu on a shortcut while unlocked.
-fn item_menu(hwnd: HWND, st: &PanelState, index: usize) {
-    let item = st.cfg.items[index].clone();
-    let (panel_id, main, font) = (st.cfg.id, st.main, st.font);
-    // Where the rename box goes: over the shortcut's name.
-    let l = st.layout();
-    let r = st.item_rect(&l, index);
-    let mut origin = POINT { x: r.left, y: r.top + st.scale(8) + l.icon + st.scale(2) };
-    unsafe { ClientToScreen(hwnd, &mut origin) };
-    let (height, width) = (st.scale(st.settings.font_size + 10), l.cell_w.max(st.scale(120)));
-    let rect = RECT {
-        left: origin.x - (width - l.cell_w) / 2,
-        top: origin.y,
-        right: origin.x + (width + l.cell_w) / 2,
-        bottom: origin.y + height,
-    };
-
-    let entries: [MenuEntry; 6] = [
-        (ID_RENAME, "Rename", 0),
-        (ID_REMOVE, "Remove from folder", 0),
-        ui::SEPARATOR,
-        (ID_MORE, "Show more options", 0),
-        ui::SEPARATOR,
-        (ID_SETTINGS, "Folder settings…", 0),
-    ];
-    let mut at = POINT { x: 0, y: 0 };
-    unsafe { GetCursorPos(&mut at) };
-    // The panel may be updated while the menu or the rename box is open: from
-    // here on, only the copied values are used.
-    match ui::popup_menu(main, &entries, at) {
-        ID_RENAME => {
-            if let Some(name) = prompt_text(rect, &item.name, font, None) {
-                store::change(|s| s.update_item(item.id, |it| it.name = name));
-            }
-        }
-        ID_REMOVE => {
-            // A file we keep goes back to the desktop; a link is just removed.
-            if let Err(e) = store::change(|s| s.remove_item(item.id, true)) {
-                error_box(&e);
-            }
-        }
-        ID_MORE => item_windows_menu(main, item.id, at),
-        ID_SETTINGS => crate::settings::open(Some(panel_id), false),
-        _ => {}
-    }
-}
-
-/// The Windows menu of a shortcut's file, as on the desktop.
-pub fn item_windows_menu(main: HWND, item_id: u32, at: POINT) {
+/// Right-click on a shortcut: Windows' menu for its file, as on the desktop,
+/// then deskfolds' Remove from folder and Folder settings. Windows' Delete and
+/// Rename are deskfolds' to do:
+/// - a file, folder or shortcut moved into the folder: Delete sends it to the
+///   Recycle Bin; Rename renames it in place, file and name together;
+/// - a link (its original elsewhere): Delete only takes it out of the folder;
+///   Rename only changes its name in the folder. The original is never
+///   deleted or renamed from here.
+///
+/// Remove from folder puts a moved file back on the desktop, and for a link
+/// makes a shortcut to the original there. What one of Windows' entries makes
+/// next to a moved file (Create shortcut, a zip) joins the folder.
+pub fn item_windows_menu(main: HWND, item_id: u32, at: POINT, extended: bool) {
     let Some((panel_id, item)) = store::with(|s| s.item(item_id).map(|(p, it)| (p, it.clone()))) else { return };
     let path = resolve(&item.path);
     let file = Path::new(&path);
     let stored = store::with(|s| s.is_stored(panel_id, &item));
-    // A link's file is the original: Windows' menu must not delete it.
-    let menu = file.exists().then(|| crate::shellmenu::ShellMenu::of_file(main, file)).flatten().map(|m| if stored { m } else { m.keeping_the_file() });
-    let Some(menu) = menu else {
-        error_box(&format!("Windows has no menu for '{}': its file was not found.\n\n{path}", ui::short_name(&item.name, 60)));
-        return;
-    };
-    let chosen = crate::shellmenu::track(main, at, Some((&menu, 0)), |_| {});
-    after_menu();
-    // Only one of Windows' entries, in the range it was given.
-    if (crate::shellmenu::FIRST_ID..=crate::shellmenu::LAST_ID).contains(&chosen) {
-        menu.invoke(main, chosen, file.parent(), at);
-        // Deleted, or moved away, with Windows' menu: the shortcut goes too.
-        if !file.exists()
-            && store::with(|s| s.item(item_id).is_some())
-            && let Err(e) = store::change(|s| s.remove_item(item_id, false))
-        {
-            error_box(&e);
+    // A shortcut whose file is missing gets only deskfolds' entries.
+    let shell = file.exists().then(|| crate::shellmenu::ShellMenu::of_file(main, file)).flatten();
+    let mut ids = crate::shellmenu::ItemIds::default();
+    let chosen = crate::shellmenu::track(main, at, shell.as_ref(), |menu| unsafe {
+        if let Some(s) = &shell {
+            ids = s.fill_for_item(menu, 0, extended);
+            AppendMenuW(menu, MF_SEPARATOR, 0, null());
         }
+        for (id, text) in [(ID_REMOVE, "Remove from folder"), (ID_SETTINGS, "Folder settings…")] {
+            let text = wide(text);
+            AppendMenuW(menu, MF_STRING, id, text.as_ptr());
+        }
+    });
+    after_menu();
+    match chosen as usize {
+        ID_REMOVE => remove_from_folder(item_id, &item, stored),
+        ID_SETTINGS => crate::settings::open_item(panel_id, item_id),
+        _ if Some(chosen) == ids.delete => {
+            if stored {
+                crate::shellmenu::delete_to_recycle_bin(main, &[file.to_path_buf()]);
+                if file.exists() {
+                    // Windows was told No, or could not: the shortcut stays.
+                    return;
+                }
+            }
+            // Gone to the Recycle Bin, or a link: it leaves the folder; a
+            // link's original is never touched.
+            if let Err(e) = store::change(|s| s.remove_item(item_id, false)) {
+                error_box(&e);
+            }
+        }
+        _ if Some(chosen) == ids.rename => unsafe {
+            // Once the menu is gone: the name is typed in place.
+            PostMessageW(main, WM_APP_RENAME_ITEM, item_id as usize, 0);
+        },
+        _ if (crate::shellmenu::FIRST_ID..=crate::shellmenu::LAST_ID).contains(&chosen) => {
+            let Some(shell) = &shell else { return };
+            // What one of Windows' entries makes next to a moved file joins the folder.
+            let dir = if stored { file.parent().map(Path::to_path_buf) } else { None };
+            let before = dir.as_deref().map(crate::shellmenu::listing).unwrap_or_default();
+            shell.invoke(main, chosen, file.parent(), at);
+            if let Some(dir) = &dir {
+                let made: Vec<String> = crate::shellmenu::made(&before, &crate::shellmenu::listing(dir))
+                    .into_iter()
+                    .filter(|p| !crate::watch::is_pending_copy(p))
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect();
+                if !made.is_empty() && store::with(|s| s.panel(panel_id).is_some()) {
+                    store::change(|s| s.add_files(panel_id, usize::MAX, &made, true));
+                }
+            }
+            // Deleted or moved away by one of Windows' entries: the shortcut goes too.
+            if !file.exists()
+                && store::with(|s| s.item(item_id).is_some())
+                && let Err(e) = store::change(|s| s.remove_item(item_id, false))
+            {
+                error_box(&e);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Remove from folder: a file moved into the folder goes back to the desktop;
+/// a link leaves the folder, and a shortcut to its original appears on the
+/// desktop. Nothing is deleted.
+fn remove_from_folder(item_id: u32, item: &crate::config::Item, stored: bool) {
+    if !stored {
+        let Some(desktop) = dragdrop::desktop_dir() else {
+            error_box("The desktop folder was not found.");
+            return;
+        };
+        let target = resolve(&item.path);
+        match crate::integration::make_shortcut(&desktop, &item.name, &target, &item.args, item.icon.as_deref()) {
+            // deskfolds put it there: the desktop watcher does not take it back.
+            Ok(link) => crate::watch::note_put_back(&link),
+            Err(e) => {
+                error_box(&e);
+                return;
+            }
+        }
+    }
+    if let Err(e) = store::change(|s| s.remove_item(item_id, stored)) {
+        error_box(&e);
     }
 }
 
@@ -2334,20 +2363,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 hide_tip(st);
                 KillTimer(hwnd, TIP_TIMER);
                 match st.hit(x, y) {
-                    // Locked, a shortcut's menu is its folder's, with its Windows menu.
-                    Hit::Item(i) if locked => {
-                        let item = st.cfg.items.get(i).map_or(0, |it| it.id);
-                        PostMessageW(st.main, WM_APP_SHOW_MENU, st.cfg.id as usize, item as isize);
-                    }
+                    // A shortcut: Windows' menu for its file, locked or not.
                     Hit::Item(i) => {
-                        item_menu(hwnd, st, i);
-                        // The mouse may have gone elsewhere while the menu was open.
-                        if let Some(st) = state(hwnd)
-                            && !cursor_inside(hwnd)
-                        {
-                            let locked = st.is_locked();
-                            on_leave(hwnd, st, locked);
-                        }
+                        let (main, item) = (st.main, st.cfg.items.get(i).map_or(0, |it| it.id));
+                        let extended = GetKeyState(VK_SHIFT as i32) < 0;
+                        let mut at = POINT { x: 0, y: 0 };
+                        GetCursorPos(&mut at);
+                        // The folder may be updated while the menu is open: only
+                        // copies from here on. Afterwards, folders the mouse left close.
+                        item_windows_menu(main, item, at, extended);
                     }
                     _ => {
                         PostMessageW(st.main, WM_APP_SHOW_MENU, st.cfg.id as usize, 0);

@@ -542,6 +542,15 @@ pub fn open(panel: Option<u32>, rename: bool) {
     }
 }
 
+/// Opens the settings window on a folder, with one of its shortcuts selected.
+pub fn open_item(panel: u32, item: u32) {
+    open(Some(panel), false);
+    if let Some(w) = win(WINDOW.get()) {
+        w.item = Some(item);
+        w.request_sync();
+    }
+}
+
 /// Opens the settings window on its Help page.
 pub fn open_help() {
     open(None, false);

@@ -110,7 +110,7 @@ pub fn expand_env(s: &str) -> String {
 }
 
 /// True for "https://...", "ms-settings:" and the like, but not for "C:\...".
-fn is_uri(s: &str) -> bool {
+pub fn is_uri(s: &str) -> bool {
     match s.find(':') {
         Some(i) if i > 1 => s[..i].chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)),
         _ => false,

@@ -201,36 +201,79 @@ fn link_target(link: &Path) -> Option<String> {
     }
 }
 
+/// Writes a .lnk at `link` to `target` (a file or a folder), with its
+/// arguments, description and icon ("file" or "file,index"; without one, the
+/// target's).
+fn write_link(link: &Path, target: &str, args: &str, description: &str, icon: Option<&str>) -> Result<(), String> {
+    let shell_link = new_shell_link().ok_or("no shell link")?;
+    let vt = shell_link.vtbl::<ShellLinkVtbl>();
+    let target_w = wide(target);
+    let dir = wide(&Path::new(target).parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default());
+    let description = wide(description);
+    let icon = icon.map(|i| match i.rsplit_once(',') {
+        Some((file, n)) if n.trim().parse::<i32>().is_ok() => (crate::util::resolve(file), n.trim().parse().unwrap_or(0)),
+        _ => (crate::util::resolve(i), 0),
+    });
+    unsafe {
+        if (vt.set_path)(shell_link.0, target_w.as_ptr()) != S_OK {
+            return Err("path".into());
+        }
+        if !args.is_empty() {
+            let args = wide(args);
+            (vt.set_arguments)(shell_link.0, args.as_ptr());
+        }
+        (vt.set_working_directory)(shell_link.0, dir.as_ptr());
+        (vt.set_description)(shell_link.0, description.as_ptr());
+        if let Some((file, index)) = &icon {
+            let file = wide(file);
+            (vt.set_icon_location)(shell_link.0, file.as_ptr(), *index);
+        }
+        let file = shell_link.query(&IID_IPERSIST_FILE).ok_or("no file")?;
+        let path = wide(&link.to_string_lossy());
+        if (file.vtbl::<PersistFileVtbl>().save)(file.0, path.as_ptr(), 1) != S_OK {
+            return Err("save".into());
+        }
+    }
+    Ok(())
+}
+
 /// Makes the Start menu shortcut to deskfolds.exe, or replaces it.
 fn write_start_menu(link: &Path, exe: &str) -> Result<(), String> {
     let fail = |what: &str| format!("The Start menu shortcut could not be made ({what}).");
     if let Some(dir) = link.parent() {
         std::fs::create_dir_all(dir).map_err(|e| fail(&e.to_string()))?;
     }
-    let shell_link = new_shell_link().ok_or_else(|| fail("no shell link"))?;
-    let vt = shell_link.vtbl::<ShellLinkVtbl>();
-    let target = wide(exe);
-    let dir = wide(&Path::new(exe).parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default());
-    let description = wide("Tiny foldable shortcut panels for the desktop");
-    let args = launch_args();
-    unsafe {
-        if (vt.set_path)(shell_link.0, target.as_ptr()) != S_OK {
-            return Err(fail("path"));
-        }
-        if !args.is_empty() {
-            let args = wide(&args);
-            (vt.set_arguments)(shell_link.0, args.as_ptr());
-        }
-        (vt.set_working_directory)(shell_link.0, dir.as_ptr());
-        (vt.set_description)(shell_link.0, description.as_ptr());
-        (vt.set_icon_location)(shell_link.0, target.as_ptr(), 0);
-        let file = shell_link.query(&IID_IPERSIST_FILE).ok_or_else(|| fail("no file"))?;
-        let path = wide(&link.to_string_lossy());
-        if (file.vtbl::<PersistFileVtbl>().save)(file.0, path.as_ptr(), 1) != S_OK {
-            return Err(fail("save"));
-        }
+    write_link(link, exe, &launch_args(), "Tiny foldable shortcut panels for the desktop", Some(exe)).map_err(|e| fail(&e))
+}
+
+/// A file name made from a shortcut's name: what Windows refuses becomes "_".
+fn file_name_for(name: &str) -> String {
+    let clean: String = name.chars().map(|c| if "<>:\"/\\|?*".contains(c) || c.is_control() { '_' } else { c }).collect();
+    let clean = clean.trim().trim_end_matches(['.', ' ']).to_string();
+    if clean.is_empty() { "Shortcut".into() } else { clean }
+}
+
+/// Makes a shortcut in `dir` named after `name`, to `target` (a file, a
+/// folder, or a URI such as https://, which gets a .url file), under a free
+/// name. Never replaces a file. Returns where it is.
+pub fn make_shortcut(dir: &Path, name: &str, target: &str, args: &str, icon: Option<&str>) -> Result<PathBuf, String> {
+    let fail = |what: &str| format!("A shortcut to {target} could not be made on the desktop ({what}).");
+    let uri = crate::util::is_uri(target);
+    let file = format!("{}.{}", file_name_for(name), if uri { "url" } else { "lnk" });
+    let path = crate::dragdrop::free_name(dir, std::ffi::OsStr::new(&file));
+    if uri {
+        use std::io::Write;
+        let text = format!("[InternetShortcut]\r\nURL={target}\r\n");
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| fail(&e.to_string()))?;
+        f.write_all(text.as_bytes()).map_err(|e| fail(&e.to_string()))?;
+        return Ok(path);
     }
-    Ok(())
+    // Saving would replace a file that appeared meanwhile: check just before.
+    if path.exists() {
+        return Err(fail("the name is taken"));
+    }
+    write_link(&path, target, args, "", icon).map_err(|e| fail(&e))?;
+    Ok(path)
 }
 
 /// Adds or removes the Start menu shortcut.
@@ -361,6 +404,23 @@ mod tests {
         assert_eq!(desktop_menu_command("C:\\Apps\\deskfolds.exe"), "\"C:\\Apps\\deskfolds.exe\" --new-folder");
         assert_eq!(command_exe("\"C:\\A b\\deskfolds.exe\" --appdata \"C:\\x\" --new-folder"), Some("C:\\A b\\deskfolds.exe"));
         assert_eq!(command_exe("deskfolds.exe"), None);
+    }
+
+    #[test]
+    fn shortcuts_on_the_desktop_get_a_free_file_name() {
+        assert_eq!(file_name_for("Projects: 2026/1"), "Projects_ 2026_1");
+        assert_eq!(file_name_for(" .. "), "Shortcut");
+        unsafe { windows_sys::Win32::System::Com::CoInitializeEx(std::ptr::null(), windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32) };
+        let dir = std::env::temp_dir().join(format!("deskfolds-shortcut-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = crate::util::expand_env("%SystemRoot%\\System32\\notepad.exe");
+        let first = make_shortcut(&dir, "Notes", &target, "", None).unwrap();
+        let second = make_shortcut(&dir, "Notes", &target, "", None).unwrap();
+        assert_eq!((first.file_name().unwrap(), second.file_name().unwrap()), (std::ffi::OsStr::new("Notes.lnk"), std::ffi::OsStr::new("Notes (2).lnk")));
+        assert!(same_path(&link_target(&first).unwrap(), &target));
+        let site = make_shortcut(&dir, "Site", "https://example.com", "", None).unwrap();
+        assert!(std::fs::read_to_string(&site).unwrap().contains("URL=https://example.com"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

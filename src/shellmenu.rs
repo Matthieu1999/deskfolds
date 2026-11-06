@@ -5,9 +5,11 @@
 //!   as Word or zip), made the way Explorer makes them, in the folder's storage
 //!   folder. It is read from the registry when the menu opens. (Explorer's own
 //!   menu object, CLSID_NewMenu, adds nothing outside an Explorer window.)
-//! - A shortcut's full Windows menu: its file's IContextMenu, loaded only while
-//!   the menu is open. Its submenus are filled when they open, through the
-//!   messages of the menu's owner window, which forwards them here.
+//! - A shortcut's Windows menu: its file's IContextMenu, as on the desktop,
+//!   loaded only while the menu is open. Its submenus are filled when they
+//!   open, through the messages of the menu's owner window, which forwards
+//!   them here. Cut is left out; Delete and Rename are deskfolds' to do (see
+//!   `panel::item_windows_menu`).
 //!
 //! windows-sys has no COM interfaces, so the vtables needed are declared here.
 
@@ -47,6 +49,10 @@ const IID_ISHELL_ITEM: GUID = GUID::from_u128(0x43826d1e_e718_42ee_bc55_a1e261c3
 /// GCS_VERBW: a menu entry's verb, as UTF-16.
 const GCS_VERBW: u32 = 4;
 const CMF_NORMAL: u32 = 0;
+/// With a Rename entry, as in Explorer.
+const CMF_CANRENAME: u32 = 0x10;
+/// The entries Explorer shows with Shift + right-click.
+const CMF_EXTENDEDVERBS: u32 = 0x100;
 const CMIC_MASK_UNICODE: u32 = 0x4000;
 const CMIC_MASK_PTINVOKE: u32 = 0x2000_0000;
 
@@ -186,22 +192,20 @@ pub struct ShellMenu {
     menu: Com,
     /// IContextMenu3 or IContextMenu2, for the submenus (« New », « Send to »).
     handler: Option<(Com, u8)>,
-    /// Without the entries that delete, cut or rename the file.
-    keep_file: bool,
+}
+
+/// Where Windows put its Delete and Rename in a shortcut's menu: deskfolds
+/// does those itself.
+#[derive(Default)]
+pub struct ItemIds {
+    pub delete: Option<u32>,
+    pub rename: Option<u32>,
 }
 
 impl ShellMenu {
     fn new(menu: Com) -> Self {
         let handler = menu.query(&IID_ICONTEXT_MENU3).map(|m| (m, 3)).or_else(|| menu.query(&IID_ICONTEXT_MENU2).map(|m| (m, 2)));
-        Self { menu, handler, keep_file: false }
-    }
-
-    /// For a shortcut that is only a link to its file: Windows' menu keeps only
-    /// the entries that leave that file as it is (open, run as administrator,
-    /// copy, properties...), as the file is not the folder's but the original.
-    pub fn keeping_the_file(mut self) -> Self {
-        self.keep_file = true;
-        self
+        Self { menu, handler }
     }
 
     /// The verb of one of its entries ("delete", "open"...), if it has one.
@@ -240,49 +244,36 @@ impl ShellMenu {
         }
     }
 
-    /// Adds its entries to `menu` at `index`, with ids from FIRST_ID on.
-    pub fn fill(&self, menu: HMENU, index: u32) -> bool {
+    /// Adds Windows' menu of a shortcut's file to `menu` at `index`, with ids
+    /// from FIRST_ID on (with `extended`, the entries of Shift + right-click),
+    /// without Cut: moving the file away would leave the folder a broken
+    /// shortcut, and dragging it out does that properly. Returns where its
+    /// Delete and Rename are.
+    pub fn fill_for_item(&self, menu: HMENU, index: u32, extended: bool) -> ItemIds {
+        let mut ids = ItemIds::default();
         let query = self.menu.vtbl::<ContextMenuVtbl>().query_context_menu;
-        let count_before = unsafe { GetMenuItemCount(menu) }.max(0);
-        let filled = unsafe { query(self.menu.0, menu, index, FIRST_ID, LAST_ID, CMF_NORMAL) >= 0 };
-        // Windows' entries are the ones it added, at `index`.
-        let added = unsafe { GetMenuItemCount(menu) }.max(0) - count_before;
-        let windows_part = index as i32..index as i32 + added.max(0);
-        if filled && self.keep_file {
-            const KEEP: [&str; 16] = [
-                "open", "opennew", "opennewwindow", "opennewtab", "explore", "openas", "edit", "print", "printto", "runas", "runasuser", "copy",
-                "copyaspath", "properties", "pintostartscreen", "pintohome",
-            ];
-            unsafe {
-                // Of what Windows added: its submenus (Send to, Open with...) and
-                // its entries with no allowed verb go (an id past LAST_ID too);
-                // the lines stay for now. Our own entries are not touched.
-                for pos in windows_part.rev() {
-                    let id = GetMenuItemID(menu, pos);
-                    let line = id == 0;
-                    if !line && !self.verb(id).is_some_and(|v| KEEP.contains(&v.as_str())) {
+        let flags = CMF_NORMAL | CMF_CANRENAME | if extended { CMF_EXTENDEDVERBS } else { 0 };
+        unsafe {
+            let count_before = GetMenuItemCount(menu).max(0);
+            if query(self.menu.0, menu, index, FIRST_ID, LAST_ID, flags) < 0 {
+                return ids;
+            }
+            // Windows' entries are the ones it added, at `index`.
+            let added = (GetMenuItemCount(menu).max(0) - count_before).max(0);
+            for pos in (index as i32..index as i32 + added).rev() {
+                let id = GetMenuItemID(menu, pos);
+                match self.verb(id).as_deref() {
+                    Some("cut") => {
                         DeleteMenu(menu, pos as u32, MF_BYPOSITION);
                     }
-                }
-                // No line at the top, at the bottom, or twice in a row.
-                let mut previous_line = true;
-                let mut pos = 0;
-                while pos < GetMenuItemCount(menu).max(0) {
-                    let line = GetMenuItemID(menu, pos) == 0;
-                    // A line Windows would not take away is stepped over.
-                    if line && previous_line && DeleteMenu(menu, pos as u32, MF_BYPOSITION) != 0 {
-                        continue;
-                    }
-                    previous_line = line;
-                    pos += 1;
-                }
-                let last = GetMenuItemCount(menu) - 1;
-                if last >= 0 && GetMenuItemID(menu, last) == 0 {
-                    DeleteMenu(menu, last as u32, MF_BYPOSITION);
+                    Some("delete") => ids.delete = Some(id),
+                    Some("rename") => ids.rename = Some(id),
+                    _ => {}
                 }
             }
+            tidy_lines(menu);
         }
-        filled
+        ids
     }
 
     /// Runs one of its entries, chosen in the popup menu.
@@ -357,20 +348,39 @@ pub fn handle_menu_message(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<L
     None
 }
 
-/// Shows a popup menu at `at`: `build` adds our entries to it (ids below
-/// FIRST_ID), and `shell` Windows' entries at `index`. Returns our chosen id,
-/// or the id of Windows' entry (FIRST_ID and above), or 0.
-pub fn track(owner: HWND, at: POINT, shell: Option<(&ShellMenu, u32)>, build: impl FnOnce(HMENU)) -> u32 {
+/// No line at the top of a menu, at the bottom, or twice in a row.
+unsafe fn tidy_lines(menu: HMENU) {
+    unsafe {
+        let mut previous_line = true;
+        let mut pos = 0;
+        while pos < GetMenuItemCount(menu).max(0) {
+            let line = GetMenuItemID(menu, pos) == 0;
+            // A line Windows would not take away is stepped over.
+            if line && previous_line && DeleteMenu(menu, pos as u32, MF_BYPOSITION) != 0 {
+                continue;
+            }
+            previous_line = line;
+            pos += 1;
+        }
+        let last = GetMenuItemCount(menu) - 1;
+        if last >= 0 && GetMenuItemID(menu, last) == 0 {
+            DeleteMenu(menu, last as u32, MF_BYPOSITION);
+        }
+    }
+}
+
+/// Shows a popup menu at `at`: `build` fills it (our entries with ids below
+/// FIRST_ID, Windows' with `ShellMenu::fill_for_item`), and the messages of
+/// `shell`'s submenus are forwarded to it. Returns our chosen id, or the id of
+/// Windows' entry (FIRST_ID and above), or 0.
+pub fn track(owner: HWND, at: POINT, shell: Option<&ShellMenu>, build: impl FnOnce(HMENU)) -> u32 {
     unsafe {
         let menu = CreatePopupMenu();
         if menu.is_null() {
             return 0;
         }
         build(menu);
-        if let Some((s, index)) = shell {
-            s.fill(menu, index);
-        }
-        let _active = shell.map(|(s, _)| s.activate(menu));
+        let _active = shell.map(|s| s.activate(menu));
         // The owner must be in front, or the menu does not close when clicking elsewhere.
         SetForegroundWindow(owner);
         let choice = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, at.x, at.y, 0, owner, null());
@@ -653,17 +663,33 @@ fn create_shortcut_window(link: &Path) -> Option<HANDLE> {
     }
 }
 
+const FOF_SILENT: u32 = 0x4;
+const FOF_NOCONFIRMATION: u32 = 0x10;
+const FOF_ALLOWUNDO: u32 = 0x40;
+/// Windows asks first when it would delete for good rather than recycle.
+const FOF_WANTNUKEWARNING: u32 = 0x4000;
+const FOFX_SHOWELEVATIONPROMPT: u32 = 0x0004_0000;
+const FOFX_RECYCLEONDELETE: u32 = 0x0008_0000;
+
 /// Sends files to the Recycle Bin (`recycle`; otherwise deletes them) with
 /// Windows' own file operation, as Explorer does. When the user may not
 /// change them, Windows asks for permission with its own prompt, and does it
 /// with its own rights: no code of deskfolds runs as administrator. Check
 /// afterwards which files are gone.
 pub fn recycle_with_windows(owner: HWND, files: &[PathBuf], recycle: bool) {
-    const FOF_SILENT: u32 = 0x4;
-    const FOF_NOCONFIRMATION: u32 = 0x10;
-    const FOF_ALLOWUNDO: u32 = 0x40;
-    const FOFX_SHOWELEVATIONPROMPT: u32 = 0x0004_0000;
-    const FOFX_RECYCLEONDELETE: u32 = 0x0008_0000;
+    let undo = if recycle { FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE } else { 0 };
+    // Windows' own dialogs stay: they name the file it asks permission for.
+    file_operation(owner, files, FOF_SILENT | FOF_NOCONFIRMATION | FOFX_SHOWELEVATIONPROMPT | undo);
+}
+
+/// Delete from a shortcut's menu: its file goes to the Recycle Bin, with no
+/// question. When Windows cannot recycle it (too big for the Recycle Bin, a
+/// USB stick, a network drive), it asks before deleting it for good.
+pub fn delete_to_recycle_bin(owner: HWND, files: &[PathBuf]) {
+    file_operation(owner, files,FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING);
+}
+
+fn file_operation(owner: HWND, files: &[PathBuf], flags: u32) {
     unsafe {
         let mut object = null_mut();
         if CoCreateInstance(&CLSID_FILE_OPERATION, null_mut(), CLSCTX_INPROC_SERVER, &IID_IFILE_OPERATION, &mut object) != S_OK || object.is_null() {
@@ -671,9 +697,7 @@ pub fn recycle_with_windows(owner: HWND, files: &[PathBuf], recycle: bool) {
         }
         let op = Com(object);
         let vt = op.vtbl::<FileOperationVtbl>();
-        let undo = if recycle { FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE } else { 0 };
-        // Windows' own dialogs stay: they name the file it asks permission for.
-        (vt.set_operation_flags)(op.0, FOF_SILENT | FOF_NOCONFIRMATION | FOFX_SHOWELEVATIONPROMPT | undo);
+        (vt.set_operation_flags)(op.0, flags);
         if !owner.is_null() {
             (vt.set_owner_window)(op.0, owner);
         }
@@ -707,6 +731,33 @@ pub fn made(before: &[PathBuf], after: &[PathBuf]) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Windows' real menu for a file: no Cut, and its Delete and Rename found.
+    #[test]
+    fn a_shortcuts_menu_has_no_cut_and_finds_delete_and_rename() {
+        unsafe { windows_sys::Win32::System::Com::CoInitializeEx(null(), windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32) };
+        let dir = std::env::temp_dir().join(format!("deskfolds-menu-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "x").unwrap();
+        let shell = ShellMenu::of_file(null_mut(), &file).expect("Windows' menu");
+        let verbs = |extended: bool| unsafe {
+            let menu = CreatePopupMenu();
+            let ids = shell.fill_for_item(menu, 0, extended);
+            let verbs: Vec<String> = (0..GetMenuItemCount(menu)).filter_map(|pos| shell.verb(GetMenuItemID(menu, pos))).collect();
+            DestroyMenu(menu);
+            (ids, verbs)
+        };
+        for extended in [false, true] {
+            let (ids, verbs) = verbs(extended);
+            assert!(!verbs.iter().any(|v| v == "cut"), "{verbs:?}");
+            assert!(verbs.iter().any(|v| v == "properties"), "{verbs:?}");
+            let (delete, rename) = (ids.delete.expect("Delete"), ids.rename.expect("Rename"));
+            assert_eq!((shell.verb(delete).as_deref(), shell.verb(rename).as_deref()), (Some("delete"), Some("rename")));
+        }
+        drop(shell);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn new_files_get_explorer_like_names() {

@@ -55,7 +55,6 @@ const ID_QUIT: usize = 105;
 const ID_DELETE_FOLDER: usize = 106;
 const ID_RENAME_FOLDER: usize = 107;
 const ID_UNLOCK_ONE: usize = 108;
-const ID_ITEM_MORE: usize = 109;
 const ID_SHARED: usize = 110;
 /// The « New » submenu's entries: NEW_BASE + their index.
 const NEW_BASE: usize = 0x800;
@@ -664,15 +663,14 @@ fn tray_data(main: HWND) -> NOTIFYICONDATAW {
     nid
 }
 
-/// The tray menu. Opened from a folder, it starts with Windows' « New » menu
-/// for its storage folder and that folder's commands; from one of its
-/// shortcuts while locked, with that shortcut's Windows menu.
-fn show_menu(main: HWND, panel: Option<u32>, item: Option<u32>) {
+/// The tray menu. Opened from a folder (not from one of its shortcuts, which
+/// has Windows' menu), it starts with the « New » menu for its storage folder
+/// and that folder's commands.
+fn show_menu(main: HWND, panel: Option<u32>) {
     check_config_file();
     let title = panel.and_then(|id| store::with(|s| s.panel(id).map(|p| p.title.clone())));
     // The name from the config, on one line and not too long, for the menu.
     let name = title.as_ref().map(|t| ui::menu_text(&ui::short_name(t, 40)));
-    let item_name = item.and_then(|id| store::with(|s| s.item(id).map(|(_, it)| ui::menu_text(&ui::short_name(&it.name, 40)))));
     let locked = LOCKED.load(Ordering::Relaxed);
     let hwnd = panel.and_then(panel_window);
     let solo = hwnd.is_some_and(panel::is_solo);
@@ -685,7 +683,6 @@ fn show_menu(main: HWND, panel: Option<u32>, item: Option<u32>) {
             if solo { format!("Lock '{t}'") } else { format!("Unlock '{t}' (move and edit)") },
         )
     });
-    let more = item_name.as_ref().map(|n| format!("Show more options for '{n}'"));
     let mut entries: Vec<MenuEntry> = Vec::new();
     // Shortcuts for all users wait for their question: here too, at the top,
     // in case another notification hid it.
@@ -694,9 +691,6 @@ fn show_menu(main: HWND, panel: Option<u32>, item: Option<u32>) {
         if waiting == 1 { "Move 1 shortcut for all users…".to_string() } else { format!("Move {waiting} shortcuts for all users…") };
     if waiting > 0 {
         entries.extend([(ID_SHARED, shared_label.as_str(), 0), ui::SEPARATOR]);
-    }
-    if let Some(more) = &more {
-        entries.extend([(ID_ITEM_MORE, more.as_str(), 0), ui::SEPARATOR]);
     }
     if let Some((edit, rename, delete, unlock)) = &labels {
         entries.extend([(ID_EDIT_FOLDER, edit.as_str(), 0), (ID_RENAME_FOLDER, rename.as_str(), 0), (ID_DELETE_FOLDER, delete.as_str(), 0), ui::SEPARATOR]);
@@ -745,11 +739,6 @@ fn show_menu(main: HWND, panel: Option<u32>, item: Option<u32>) {
     }
     match chosen {
         ID_SHARED => watch::ask_for_shared(main),
-        ID_ITEM_MORE => {
-            if let Some(id) = item {
-                panel::item_windows_menu(main, id, at);
-            }
-        }
         ID_EDIT_FOLDER => open_settings(panel),
         ID_RENAME_FOLDER => {
             if let Some(h) = hwnd {
@@ -818,7 +807,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                         SKIP_CLICK.set(true);
                         open_settings(None);
                     }
-                    WM_RBUTTONUP => show_menu(hwnd, None, None),
+                    WM_RBUTTONUP => show_menu(hwnd, None),
                     // Also from the notification center later: the question stays
                     // until another notification replaces it.
                     BALLOON_CLICK if BALLOON.replace(Balloon::Plain) == Balloon::Shared => watch::ask_for_shared(hwnd),
@@ -827,7 +816,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 0
             }
             WM_APP_SHOW_MENU => {
-                show_menu(hwnd, (wparam != 0).then_some(wparam as u32), (lparam != 0).then_some(lparam as u32));
+                show_menu(hwnd, (wparam != 0).then_some(wparam as u32));
                 0
             }
             WM_APP_NEW_FOLDER_AT => {
@@ -896,7 +885,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                         rebuild_panels(hwnd);
                         settings::on_store_changed();
                     }
-                    TRAY_CLICK_TIMER => show_menu(hwnd, None, None),
+                    TRAY_CLICK_TIMER => show_menu(hwnd, None),
                     watch::PUT_AWAY_TIMER => watch::on_timer(hwnd),
                     panel::NEW_LINK_TIMER => panel::check_new_links(hwnd),
                     _ => {}

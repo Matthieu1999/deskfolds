@@ -52,7 +52,7 @@ pub const TOPICS: &[Topic] = &[
             ("Keep it open", "Click its name: a blue dot shows it is pinned, and it stays pinned after a restart. Click it again to unpin it."),
             ("Launch a shortcut", "Click it, or double-click it if you chose so in Behavior."),
             ("See a full name", "Hover a shortcut for a moment: its full name and what it opens."),
-            ("The menu", "Right-click a folder or the tray icon, or click the tray icon once."),
+            ("The menu", "Right-click a folder (not one of its shortcuts) or the tray icon, or click the tray icon once."),
         ],
     },
     Topic {
@@ -81,8 +81,12 @@ pub const TOPICS: &[Topic] = &[
                 "They go into a folder by themselves if you choose one in Windows integration. For a shortcut for all users, click the notification, then answer Windows.",
             ),
             ("Reorder them", "While the folder is unlocked, drag them within it, or onto another folder."),
-            ("Take one out", "While the folder is unlocked, drag it onto the desktop, or right-click it > Remove from folder."),
-            ("Its Windows menu", "Right-click it > Show more options."),
+            ("Take one out", "Right-click it > Remove from folder: back on the desktop. Or, while the folder is unlocked, drag it onto the desktop."),
+            ("Its menu", "Right-click it: Windows' menu for its file, then Remove from folder and Folder settings. With [Shift], Windows' extended entries."),
+            (
+                "Delete and Rename",
+                "For a file moved into the folder: Delete sends it to the Recycle Bin, Rename renames it. For a link: Delete only takes it out of the folder, Rename only changes its name here; the original is never touched.",
+            ),
         ],
     },
     Topic {
