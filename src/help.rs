@@ -126,7 +126,7 @@ pub const TOPICS: &[Topic] = &[
         rows: &[
             (
                 "Your files",
-                "deskfolds never overwrites a file: a name already taken becomes \"name (2)\". Apart from its own files, it deletes one only when you choose Delete, or the original of a shortcut for all users you move in. It goes to the Recycle Bin; Windows asks first when it can only delete it for good.",
+                "deskfolds never overwrites a file: a name already taken becomes \"name (2)\". Apart from its own files, it deletes one only when you choose Delete (to the Recycle Bin; Windows asks first when it can only delete it for good), or the original of a shortcut for all users you move in (to the Recycle Bin, once it is copied).",
             ),
             ("A mistake?", "About & advanced > Previous versions > Restore…"),
             ("Find deskfolds", "In the Start menu and Windows search, if you chose so in Windows integration."),

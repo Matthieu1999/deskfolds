@@ -46,9 +46,10 @@ them or one by one.
 - **Never overwrites a file**: files dragged into a folder are moved there,
   and a name already taken becomes "name (2)". Apart from its own files
   (backups, its Start menu shortcut), deskfolds deletes a file only when you
-  choose **Delete** on it in a folder, or the original of a shortcut for all
-  users that you move into a folder. It goes to the Recycle Bin; Windows asks
-  first when it can only delete it for good.
+  choose **Delete** on it in a folder (it goes to the Recycle Bin; Windows asks
+  first when it can only delete it for good), or the original of a shortcut
+  for all users that you move into a folder (to the Recycle Bin, once it is
+  copied).
 - **DPI aware**: panels and the settings window scale with each monitor's DPI.
 
 ## Requirements
